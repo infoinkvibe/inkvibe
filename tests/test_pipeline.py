@@ -8,14 +8,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # Lightweight stubs so tests run without external deps installed in CI sandbox.
 sys.modules.setdefault("requests", types.SimpleNamespace(Session=lambda: None))
 sys.modules.setdefault("dotenv", types.SimpleNamespace(load_dotenv=lambda: None))
-img_stub = types.SimpleNamespace(LANCZOS=1)
-sys.modules.setdefault("PIL", types.SimpleNamespace(Image=img_stub, ImageOps=types.SimpleNamespace(exif_transpose=lambda i: i)))
-sys.modules.setdefault("PIL.Image", img_stub)
-sys.modules.setdefault("PIL.ImageOps", types.SimpleNamespace(exif_transpose=lambda i: i))
 
 import pytest
+from PIL import Image
 
 from printify_shopify_sync_pipeline import (
+    Artwork,
+    ArtworkProcessingOptions,
+    PlacementRequirement,
     ProductTemplate,
     TemplateValidationError,
     _compute_backoff,
@@ -23,8 +23,20 @@ from printify_shopify_sync_pipeline import (
     ensure_state_shape,
     load_templates,
     normalize_catalog_variants_response,
+    prepare_artwork_export,
+    process_artwork,
     save_json_atomic,
 )
+
+
+class DummyPrintify:
+    dry_run = True
+
+    def list_variants(self, blueprint_id, provider_id):
+        return [{"id": 1, "is_available": True, "options": {"color": "Black", "size": "M"}, "price": 1200}]
+
+    def upload_image(self, file_path):
+        return {"id": "upload-1"}
 
 
 def test_template_validation_rejects_missing_fields(tmp_path: Path):
@@ -90,3 +102,83 @@ def test_normalize_catalog_variants_response_rejects_malformed_dict():
     with pytest.raises(ValueError) as exc:
         normalize_catalog_variants_response({"unexpected": []})
     assert "dict keys=['unexpected']" in str(exc.value)
+
+
+def _create_artwork(tmp_path: Path, width: int, height: int) -> Artwork:
+    path = tmp_path / "art.png"
+    Image.new("RGBA", (width, height), (255, 0, 0, 128)).save(path)
+    return Artwork(
+        slug="art",
+        src_path=path,
+        title="Art",
+        description_html="<p>Art</p>",
+        tags=[],
+        image_width=width,
+        image_height=height,
+    )
+
+
+def test_strict_default_failure_on_undersized_image(tmp_path: Path):
+    artwork = _create_artwork(tmp_path, 495, 504)
+    template = _template_for_variant_tests()
+    placement = PlacementRequirement("front", 4500, 5400)
+    with pytest.raises(ValueError, match="image too small"):
+        prepare_artwork_export(artwork, template, placement, tmp_path / "exports", ArtworkProcessingOptions())
+
+
+def test_skip_behavior_with_skip_undersized(tmp_path: Path):
+    artwork = _create_artwork(tmp_path, 495, 504)
+    template = _template_for_variant_tests()
+    placement = PlacementRequirement("front", 4500, 5400)
+    result = prepare_artwork_export(
+        artwork,
+        template,
+        placement,
+        tmp_path / "exports",
+        ArtworkProcessingOptions(skip_undersized=True),
+    )
+    assert result is None
+
+
+def test_upscale_behavior_with_allow_upscale(tmp_path: Path):
+    artwork = _create_artwork(tmp_path, 495, 504)
+    template = _template_for_variant_tests()
+    placement = PlacementRequirement("front", 4500, 5400)
+    result = prepare_artwork_export(
+        artwork,
+        template,
+        placement,
+        tmp_path / "exports",
+        ArtworkProcessingOptions(allow_upscale=True, upscale_method="nearest"),
+    )
+    assert result is not None
+    with Image.open(result.export_path) as exported:
+        assert exported.size == (4500, 5400)
+
+
+def test_force_reprocesses_completed_state(tmp_path: Path):
+    artwork = _create_artwork(tmp_path, 1200, 1200)
+    template = ProductTemplate(
+        key="force-template",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_colors=["Black"],
+        enabled_sizes=["M"],
+        placements=[PlacementRequirement("front", 1000, 1000)],
+    )
+    state = ensure_state_shape({"processed": {"art": {"completed": True, "products": []}}})
+    process_artwork(
+        printify=DummyPrintify(),
+        shopify=None,
+        shop_id=None,
+        artwork=artwork,
+        templates=[template],
+        state=state,
+        force=True,
+        export_dir=tmp_path / "exports",
+        state_path=tmp_path / "state.json",
+        artwork_options=ArtworkProcessingOptions(),
+    )
+    assert len(state["processed"]["art"]["products"]) == 1

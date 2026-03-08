@@ -122,6 +122,22 @@ class PreparedArtwork:
     height_px: int
 
 
+@dataclass
+class ArtworkProcessingOptions:
+    allow_upscale: bool = False
+    upscale_method: str = "lanczos"
+    skip_undersized: bool = False
+
+
+@dataclass
+class ArtworkResolution:
+    image: Image.Image
+    action: str
+    upscaled: bool
+    original_size: Tuple[int, int]
+    final_size: Tuple[int, int]
+
+
 # -----------------------------
 # Logging / helpers
 # -----------------------------
@@ -510,25 +526,133 @@ def validate_artwork_for_placement(artwork: Artwork, placement: PlacementRequire
     return True, "ok"
 
 
-def prepare_artwork_export(artwork: Artwork, template: ProductTemplate, placement: PlacementRequirement, export_dir: pathlib.Path) -> PreparedArtwork:
+def _upscale_filter(method: str) -> int:
+    return Image.NEAREST if method == "nearest" else Image.LANCZOS
+
+
+def resolve_artwork_for_placement(
+    artwork: Artwork,
+    placement: PlacementRequirement,
+    *,
+    allow_upscale: bool,
+    upscale_method: str,
+    skip_undersized: bool,
+) -> ArtworkResolution:
+    with Image.open(artwork.src_path) as opened:
+        image = ImageOps.exif_transpose(opened).convert("RGBA")
+    original_size = (image.width, image.height)
+    required_size = (placement.width_px, placement.height_px)
+    too_small = image.width < placement.width_px or image.height < placement.height_px
+
+    logger.info(
+        "Artwork %s placement=%s original=%sx%s required=%sx%s",
+        artwork.src_path.name,
+        placement.placement_name,
+        original_size[0],
+        original_size[1],
+        required_size[0],
+        required_size[1],
+    )
+
+    if too_small and not allow_upscale:
+        if skip_undersized:
+            logger.warning(
+                "Skipping undersized artwork %s for placement %s: %sx%s < %sx%s (action=skip)",
+                artwork.src_path.name,
+                placement.placement_name,
+                original_size[0],
+                original_size[1],
+                required_size[0],
+                required_size[1],
+            )
+            return ArtworkResolution(
+                image=image,
+                action="skip",
+                upscaled=False,
+                original_size=original_size,
+                final_size=original_size,
+            )
+        logger.error(
+            "Undersized artwork action=fail artwork=%s placement=%s original=%sx%s required=%sx%s",
+            artwork.src_path.name,
+            placement.placement_name,
+            original_size[0],
+            original_size[1],
+            required_size[0],
+            required_size[1],
+        )
+        raise ValueError(
+            f"image too small ({original_size[0]}x{original_size[1]}) for "
+            f"placement {placement.placement_name} ({required_size[0]}x{required_size[1]})"
+        )
+
+    scale = max(placement.width_px / image.width, placement.height_px / image.height)
+    upscaled = scale > 1
+    if upscaled and allow_upscale:
+        resized = image.resize((math.ceil(image.width * scale), math.ceil(image.height * scale)), _upscale_filter(upscale_method))
+        left = max(0, (resized.width - placement.width_px) // 2)
+        top = max(0, (resized.height - placement.height_px) // 2)
+        final = resized.crop((left, top, left + placement.width_px, top + placement.height_px))
+        logger.info(
+            "Upscaled artwork from %sx%s to %sx%s for placement %s",
+            original_size[0],
+            original_size[1],
+            placement.width_px,
+            placement.height_px,
+            placement.placement_name,
+        )
+        return ArtworkResolution(
+            image=final,
+            action="upscale",
+            upscaled=True,
+            original_size=original_size,
+            final_size=(final.width, final.height),
+        )
+
+    resized = image.resize((math.ceil(image.width * scale), math.ceil(image.height * scale)), Image.LANCZOS)
+    left = max(0, (resized.width - placement.width_px) // 2)
+    top = max(0, (resized.height - placement.height_px) // 2)
+    final = resized.crop((left, top, left + placement.width_px, top + placement.height_px))
+    logger.info("Artwork resolution action=fit placement=%s final=%sx%s", placement.placement_name, final.width, final.height)
+    return ArtworkResolution(
+        image=final,
+        action="fit",
+        upscaled=False,
+        original_size=original_size,
+        final_size=(final.width, final.height),
+    )
+
+
+def prepare_artwork_export(
+    artwork: Artwork,
+    template: ProductTemplate,
+    placement: PlacementRequirement,
+    export_dir: pathlib.Path,
+    options: ArtworkProcessingOptions,
+) -> Optional[PreparedArtwork]:
     export_path = export_dir / template.key / f"{artwork.slug}-{placement.placement_name}.png"
     export_path.parent.mkdir(parents=True, exist_ok=True)
 
-    valid, reason = validate_artwork_for_placement(artwork, placement)
-    if not valid:
-        raise ValueError(reason)
+    resolution = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        allow_upscale=options.allow_upscale or placement.allow_upscale,
+        upscale_method=options.upscale_method,
+        skip_undersized=options.skip_undersized,
+    )
+    if resolution.action == "skip":
+        return None
 
-    with Image.open(artwork.src_path) as im:
-        im = ImageOps.exif_transpose(im).convert("RGBA")
-        scale = max(placement.width_px / im.width, placement.height_px / im.height)
-        if scale > 1 and not placement.allow_upscale:
-            raise ValueError("upscale required but disabled")
-        resized = im.resize((math.ceil(im.width * scale), math.ceil(im.height * scale)), Image.LANCZOS)
-        left = max(0, (resized.width - placement.width_px) // 2)
-        top = max(0, (resized.height - placement.height_px) // 2)
-        resized.crop((left, top, left + placement.width_px, top + placement.height_px)).save(export_path, "PNG")
-
-    return PreparedArtwork(artwork=artwork, template=template, placement=placement, export_path=export_path, width_px=placement.width_px, height_px=placement.height_px)
+    resolution.image.save(export_path, "PNG")
+    resolution.image.close()
+    return PreparedArtwork(
+        artwork=artwork,
+        template=template,
+        placement=placement,
+        export_path=export_path,
+        width_px=placement.width_px,
+        height_px=placement.height_px,
+    )
 
 
 # -----------------------------
@@ -739,25 +863,47 @@ def create_in_printify(printify: PrintifyClient, shop_id: int, artwork: Artwork,
     return result
 
 
-def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path) -> None:
+def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions) -> None:
     processed = state.setdefault("processed", {})
-    if artwork.slug in processed and not force:
+    existing = processed.get(artwork.slug, {})
+    if existing.get("completed") and not force:
         logger.info("Skipping already processed artwork: %s", artwork.slug)
         return
 
     logger.info("Processing artwork: %s", artwork.src_path.name)
-    processed.setdefault(artwork.slug, {"products": []})
+    record: Dict[str, Any] = {
+        "products": [],
+        "completed": False,
+        "last_run": datetime.now(timezone.utc).isoformat(),
+    }
 
+    all_templates_successful = True
     for template in templates:
         try:
             catalog_variants = printify.list_variants(template.printify_blueprint_id, template.printify_print_provider_id)
             variant_rows = choose_variants_from_catalog(catalog_variants, template)
             if not variant_rows:
-                processed[artwork.slug]["products"].append({"template": template.key, "result": {"status": "no_matching_variants"}})
-                save_json_atomic(state_path, state)
+                all_templates_successful = False
+                record["products"].append({"template": template.key, "result": {"status": "no_matching_variants"}})
                 continue
 
-            prepared_assets = [prepare_artwork_export(artwork, template, placement, export_dir) for placement in template.placements]
+            prepared_assets: List[PreparedArtwork] = []
+            skipped_placements: List[str] = []
+            for placement in template.placements:
+                prepared = prepare_artwork_export(artwork, template, placement, export_dir, artwork_options)
+                if prepared is None:
+                    skipped_placements.append(placement.placement_name)
+                    continue
+                prepared_assets.append(prepared)
+
+            if skipped_placements:
+                all_templates_successful = False
+                record["products"].append({
+                    "template": template.key,
+                    "result": {"status": "skipped_undersized", "placements": skipped_placements},
+                })
+                continue
+
             upload_map = upload_assets_to_printify(printify, state, artwork, template, prepared_assets, state_path)
 
             result: Dict[str, Any] = {}
@@ -765,17 +911,22 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
             if template.publish_to_shopify and shopify is not None:
                 result["shopify"] = create_in_shopify_only(shopify, artwork, template, variant_rows)
 
-            processed[artwork.slug]["products"].append({
+            record["products"].append({
                 "template": template.key,
                 "blueprint_id": template.printify_blueprint_id,
                 "print_provider_id": template.printify_print_provider_id,
                 "result": result,
             })
         except Exception as exc:
+            all_templates_successful = False
             logger.exception("Sync failed for artwork=%s template=%s", artwork.slug, template.key)
-            processed[artwork.slug]["products"].append({"template": template.key, "result": {"error": str(exc)}})
+            record["products"].append({"template": template.key, "result": {"error": str(exc)}})
         save_json_atomic(state_path, state)
         time.sleep(0.25)
+
+    record["completed"] = all_templates_successful
+    processed[artwork.slug] = record
+    save_json_atomic(state_path, state)
 
 
 def resolve_shop_id(printify: PrintifyClient, env_value: str) -> Optional[int]:
@@ -816,6 +967,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="InkVibeAuto Printify + Shopify sync pipeline")
     parser.add_argument("--dry-run", action="store_true", help="Prepare and log payloads without mutating remote APIs")
     parser.add_argument("--force", action="store_true", help="Reprocess artworks already present in state.json")
+    parser.add_argument("--allow-upscale", action="store_true", help="Allow undersized artwork to be upscaled to placement dimensions")
+    parser.add_argument("--upscale-method", choices=["nearest", "lanczos"], default="lanczos", help="Resampling method used when upscaling")
+    parser.add_argument("--skip-undersized", action="store_true", help="Skip undersized artwork/template placements instead of failing")
     parser.add_argument("--templates", default=str(TEMPLATES_CONFIG), help="Path to product_templates.json")
     parser.add_argument("--image-dir", default=str(IMAGE_DIR), help="Image source directory")
     parser.add_argument("--export-dir", default=str(EXPORT_DIR), help="Export output directory")
@@ -826,7 +980,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0) -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0) -> None:
     if not PRINTIFY_API_TOKEN:
         raise RuntimeError("Missing PRINTIFY_API_TOKEN")
     if not image_dir.exists():
@@ -846,6 +1000,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         audit_printify_integration(printify, templates, shop_id)
 
     logger.info("Loaded %s template(s) and %s artwork file(s)", len(templates), len(artworks))
+    artwork_options = ArtworkProcessingOptions(allow_upscale=allow_upscale, upscale_method=upscale_method, skip_undersized=skip_undersized)
     for artwork in artworks:
         process_artwork(
             printify=printify,
@@ -857,6 +1012,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             force=force,
             export_dir=export_dir,
             state_path=state_path,
+            artwork_options=artwork_options,
         )
 
     save_json_atomic(state_path, state)
@@ -870,6 +1026,9 @@ if __name__ == "__main__":
         pathlib.Path(args.templates),
         dry_run=args.dry_run,
         force=args.force,
+        allow_upscale=args.allow_upscale,
+        upscale_method=args.upscale_method,
+        skip_undersized=args.skip_undersized,
         image_dir=pathlib.Path(args.image_dir),
         export_dir=pathlib.Path(args.export_dir),
         state_path=pathlib.Path(args.state_path),
