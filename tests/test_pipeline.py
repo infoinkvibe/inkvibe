@@ -16,10 +16,13 @@ sys.modules.setdefault("PIL.ImageOps", types.SimpleNamespace(exif_transpose=lamb
 import pytest
 
 from printify_shopify_sync_pipeline import (
+    ProductTemplate,
     TemplateValidationError,
     _compute_backoff,
+    choose_variants_from_catalog,
     ensure_state_shape,
     load_templates,
+    normalize_catalog_variants_response,
     save_json_atomic,
 )
 
@@ -46,3 +49,44 @@ def test_ensure_state_shape():
 
 def test_backoff_increases():
     assert _compute_backoff(3) >= _compute_backoff(1)
+
+
+def _template_for_variant_tests() -> ProductTemplate:
+    return ProductTemplate(
+        key="test",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_colors=["Black"],
+        enabled_sizes=["M"],
+    )
+
+
+def test_normalize_catalog_variants_response_accepts_raw_list():
+    variants = [{"id": 1}, {"id": 2}]
+    normalized = normalize_catalog_variants_response(variants)
+    assert normalized == variants
+
+
+def test_choose_variants_from_catalog_accepts_wrapped_dict_shape():
+    template = _template_for_variant_tests()
+    wrapped = {
+        "variants": [
+            {"id": 10, "is_available": True, "options": {"color": "Black", "size": "M"}},
+            {"id": 11, "is_available": True, "options": {"color": "White", "size": "M"}},
+        ]
+    }
+    chosen = choose_variants_from_catalog(wrapped, template)
+    assert [v["id"] for v in chosen] == [10]
+
+
+def test_normalize_catalog_variants_response_rejects_malformed_string():
+    with pytest.raises(ValueError, match="got type=str"):
+        normalize_catalog_variants_response("bad payload")
+
+
+def test_normalize_catalog_variants_response_rejects_malformed_dict():
+    with pytest.raises(ValueError) as exc:
+        normalize_catalog_variants_response({"unexpected": []})
+    assert "dict keys=['unexpected']" in str(exc.value)

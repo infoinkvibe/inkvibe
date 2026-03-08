@@ -292,10 +292,11 @@ class PrintifyClient(BaseApiClient):
         return self.get(f"/catalog/blueprints/{blueprint_id}/print_providers.json")
 
     def list_variants(self, blueprint_id: int, print_provider_id: int, show_out_of_stock: bool = True) -> List[Dict[str, Any]]:
-        return self.get(
+        response = self.get(
             f"/catalog/blueprints/{blueprint_id}/print_providers/{print_provider_id}/variants.json",
             **{"show-out-of-stock": 1 if show_out_of_stock else 0},
         )
+        return normalize_catalog_variants_response(response)
 
     def upload_image(self, *, file_path: Optional[pathlib.Path] = None, image_url: Optional[str] = None) -> Dict[str, Any]:
         if file_path is None and image_url is None:
@@ -591,7 +592,8 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
     return templates
 
 
-def choose_variants_from_catalog(catalog_variants: List[Dict[str, Any]], template: ProductTemplate) -> List[Dict[str, Any]]:
+def choose_variants_from_catalog(catalog_variants: Any, template: ProductTemplate) -> List[Dict[str, Any]]:
+    catalog_variants = normalize_catalog_variants_response(catalog_variants)
     chosen: List[Dict[str, Any]] = []
     for variant in catalog_variants:
         color = _variant_option_value(variant, "color")
@@ -600,6 +602,42 @@ def choose_variants_from_catalog(catalog_variants: List[Dict[str, Any]], templat
         if (not template.enabled_colors or color in template.enabled_colors) and (not template.enabled_sizes or size in template.enabled_sizes) and is_available:
             chosen.append(variant)
     return chosen
+
+
+def normalize_catalog_variants_response(raw_variants: Any) -> List[Dict[str, Any]]:
+    response_type = type(raw_variants).__name__
+    logger.debug("Printify variants response top-level type: %s", response_type)
+
+    if isinstance(raw_variants, list):
+        variants = raw_variants
+    elif isinstance(raw_variants, dict):
+        if "variants" not in raw_variants:
+            raise ValueError(
+                "Malformed Printify variants response: expected list or dict with 'variants' key; "
+                f"got dict keys={sorted(raw_variants.keys())}"
+            )
+        variants = raw_variants["variants"]
+    else:
+        raise ValueError(
+            "Malformed Printify variants response: expected list or dict with 'variants' key; "
+            f"got type={response_type}"
+        )
+
+    if not isinstance(variants, list):
+        raise ValueError(
+            "Malformed Printify variants response: 'variants' must be a list; "
+            f"got type={type(variants).__name__}"
+        )
+
+    non_dict_index = next((idx for idx, row in enumerate(variants) if not isinstance(row, dict)), None)
+    if non_dict_index is not None:
+        raise ValueError(
+            "Malformed Printify variants response: each variant must be an object; "
+            f"got type={type(variants[non_dict_index]).__name__} at index={non_dict_index}"
+        )
+
+    logger.debug("Printify variants found: %s", len(variants))
+    return variants
 
 
 def build_printify_product_payload(artwork: Artwork, template: ProductTemplate, variant_rows: List[Dict[str, Any]], upload_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:

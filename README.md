@@ -87,6 +87,7 @@ Each placement requires:
 ## Troubleshooting
 
 - Templates using `printify_blueprint_id` 6 must use a valid `printify_print_provider_id` (for example, `99` for Printify Choice).
+- Printify variant responses can arrive as either a raw list or a `{"variants": [...]}` wrapper; the pipeline normalizes both, but malformed shapes now raise a clear error that includes the top-level type/keys.
 
 ## Backward compatibility
 
