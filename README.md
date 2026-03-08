@@ -84,6 +84,26 @@ Each placement requires:
 - `width_px`
 - `height_px`
 
+## Artwork sizing behavior
+
+Many Printify placements require large source files (for example, a front print area of `4500x5400`). Small source images may be rejected by strict validation because they cannot satisfy print-area requirements without interpolation.
+
+By default, InkVibeAuto keeps strict validation. You can now choose controlled fallback behavior:
+- `--allow-upscale`: upscale undersized artwork proportionally to cover the required placement area, then crop/fit to exact dimensions.
+- `--upscale-method nearest|lanczos`: choose the upscaling resampling method (default: `lanczos`).
+- `--skip-undersized`: skip undersized artwork/template placements with a warning instead of stopping the run.
+- `--force`: rerun artworks even if previously marked completed in `state.json`.
+
+Example commands:
+
+```bash
+python printify_shopify_sync_pipeline.py --dry-run --skip-undersized
+python printify_shopify_sync_pipeline.py --dry-run --allow-upscale
+python printify_shopify_sync_pipeline.py --max-artworks 1 --force --allow-upscale
+```
+
+> Upscaling low-resolution source art can reduce final print quality, even when the pipeline completes successfully.
+
 ## Troubleshooting
 
 - Templates using `printify_blueprint_id` 6 must use a valid `printify_print_provider_id` (for example, `99` for Printify Choice).
