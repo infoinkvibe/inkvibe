@@ -84,6 +84,10 @@ Each placement requires:
 - `width_px`
 - `height_px`
 
+## Troubleshooting
+
+- Templates using `printify_blueprint_id` 6 must use a valid `printify_print_provider_id` (for example, `99` for Printify Choice).
+
 ## Backward compatibility
 
 `printful_shopify_sync_pipeline.py` remains a wrapper to preserve legacy invocation.

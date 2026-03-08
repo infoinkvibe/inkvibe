@@ -2,7 +2,7 @@
   {
     "key": "tshirt_gildan",
     "printify_blueprint_id": 6,
-    "printify_print_provider_id": 1,
+    "printify_print_provider_id": 99,
     "title_pattern": "{artwork_title} T-Shirt",
     "description_pattern": "<p>{artwork_title} printed on premium cotton.</p>",
     "enabled_colors": ["Black", "White"],
