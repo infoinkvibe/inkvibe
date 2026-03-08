@@ -108,6 +108,34 @@ python printify_shopify_sync_pipeline.py --allow-upscale --force --max-artworks 
 
 > Upscaling low-resolution source art can reduce final print quality, even when the pipeline completes successfully.
 
+
+## Verifying a successful run
+
+After a non-dry-run execution, verify success by checking logs for:
+- upload success lines (placement, strategy, Printify upload image id, and R2 public URL when used),
+- product creation lines (Printify product id, product title, enabled variant count),
+- explicit state persistence messages after upload/template/artwork completion,
+- final per-template summary lines with success/failure, product id, and upload strategy.
+
+Also review `state.json` for updated `processed` and `uploads` records for the latest artwork/template run.
+
+## Title and description generation
+
+- Artwork names are cleaned from filenames/slugs into readable titles (for example converting separators and stripping noisy numeric/version fragments).
+- Templates still control title output via `title_pattern`, now with cleaner fallback title values when source titles are filename-like.
+- Descriptions still support template override via `description_pattern`.
+- If a template uses the basic default description shape, InkVibeAuto now generates a polished generic ecommerce description with:
+  - a concise opening hook,
+  - short product summary copy,
+  - simple feature bullets suitable for POD apparel.
+
+## Current mockup behavior and limitations
+
+- Product create flow continues to use placement image uploads in `print_areas` (existing stable path).
+- Publish flow uses Printify publish flags (`title`, `description`, `images`, `variants`, `tags`) and now supports an optional template-level `publish_mockups` override for image/mockup publish control.
+- Printify mockup/image selection can vary by channel/provider and is not fully deterministic through this path today.
+- TODOs are in code where provider/channel-specific mockup controls can be safely expanded once stable API behavior is confirmed.
+
 ## Troubleshooting
 
 - Templates using `printify_blueprint_id` 6 must use a valid `printify_print_provider_id` (for example, `99` for Printify Choice).

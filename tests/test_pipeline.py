@@ -27,6 +27,10 @@ from printify_shopify_sync_pipeline import (
     choose_variants_from_catalog,
     ensure_state_shape,
     normalize_printify_price,
+    filename_slug_to_title,
+    render_product_description,
+    render_product_title,
+    summarize_upload_strategy,
     load_templates,
     normalize_catalog_variants_response,
     prepare_artwork_export,
@@ -303,3 +307,39 @@ def test_dry_run_r2_url_upload_records_metadata(tmp_path: Path):
     )
     assert result["front"]["upload_strategy"] == "r2_url"
     assert result["front"]["r2_public_url"].startswith("https://pub.example.r2.dev/")
+
+
+def test_filename_slug_to_title_cleanup():
+    assert filename_slug_to_title("my_cool-design_v2_202412121200") == "My Cool Design"
+
+
+def test_render_title_uses_clean_fallback(tmp_path: Path):
+    src = tmp_path / "groovy_cat-print_v2_20241212.png"
+    Image.new("RGBA", (1000, 1000), (255, 0, 0, 255)).save(src)
+    art = Artwork(
+        slug="groovy-cat-print-v2-20241212",
+        src_path=src,
+        title="groovy_cat-print_v2_20241212",
+        description_html="",
+        tags=[],
+        image_width=1000,
+        image_height=1000,
+    )
+    template = _template_for_variant_tests()
+    template.title_pattern = "{artwork_title} Tee"
+    assert render_product_title(template, art) == "Groovy Cat Print Tee"
+
+
+def test_render_description_generic_fallback(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    art.title = "messy_title_20240202"
+    template = _template_for_variant_tests()
+    template.description_pattern = "<p>{artwork_title}</p>"
+    description = render_product_description(template, art)
+    assert "<ul>" in description
+    assert "style upgrade" in description
+
+
+def test_upload_strategy_summary_helper():
+    upload_map = {"front": {"upload_strategy": "direct"}, "back": {"upload_strategy": "r2_url"}}
+    assert summarize_upload_strategy(upload_map) == "direct+r2_url"
