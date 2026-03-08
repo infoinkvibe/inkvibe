@@ -1,0 +1,30 @@
+[
+  {
+    "key": "tshirt_gildan",
+    "printify_blueprint_id": 6,
+    "printify_print_provider_id": 1,
+    "title_pattern": "{artwork_title} T-Shirt",
+    "description_pattern": "<p>{artwork_title} printed on premium cotton.</p>",
+    "enabled_colors": ["Black", "White"],
+    "enabled_sizes": ["S", "M", "L", "XL"],
+    "tags": ["shirt", "graphic"],
+    "shopify_product_type": "Apparel",
+    "publish_to_shopify": false,
+    "push_via_printify": true,
+    "publish_after_create": true,
+    "publish_title": true,
+    "publish_description": true,
+    "publish_images": true,
+    "publish_variants": true,
+    "publish_tags": true,
+    "default_price": "29.99",
+    "placements": [
+      {
+        "placement_name": "front",
+        "width_px": 4500,
+        "height_px": 5400,
+        "allow_upscale": false
+      }
+    ]
+  }
+]

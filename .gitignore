@@ -1,0 +1,14 @@
+# secrets
+.env
+state.json
+
+# python
+__pycache__/
+*.pyc
+
+# exports
+exports/
+
+# OS
+.DS_Store
+Thumbs.db
