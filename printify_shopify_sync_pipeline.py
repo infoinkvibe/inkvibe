@@ -115,6 +115,7 @@ class ProductTemplate:
     publish_title: bool = True
     publish_description: bool = True
     publish_images: bool = True
+    publish_mockups: Optional[bool] = None
     publish_variants: bool = True
     publish_tags: bool = True
     default_price: str = DEFAULT_PRICE_FALLBACK
@@ -162,6 +163,81 @@ def slugify(value: str) -> str:
     value = value.lower().strip()
     value = re.sub(r"[^a-z0-9]+", "-", value)
     return value.strip("-")
+
+
+def _normalize_title_tokens(value: str) -> List[str]:
+    cleaned = re.sub(r"\.[a-zA-Z0-9]{2,5}$", "", value).strip()
+    cleaned = re.sub(r"[_\-]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return [token for token in cleaned.split(" ") if token]
+
+
+def filename_slug_to_title(value: str) -> str:
+    tokens = _normalize_title_tokens(value)
+    if not tokens:
+        return "Untitled Design"
+
+    normalized_tokens: List[str] = []
+    for token in tokens:
+        if re.fullmatch(r"\d{8,}", token):
+            continue
+        if re.fullmatch(r"v\d+", token.lower()):
+            continue
+        normalized_tokens.append(token)
+
+    chosen = normalized_tokens or tokens
+    return " ".join(chosen).title().strip()
+
+
+def looks_like_slug(value: str) -> bool:
+    lowered = value.strip().lower()
+    if not lowered:
+        return True
+    if "_" in lowered or "-" in lowered:
+        return True
+    if re.search(r"\d{5,}", lowered):
+        return True
+    return False
+
+
+def choose_artwork_display_title(artwork: Artwork) -> str:
+    derived = filename_slug_to_title(artwork.src_path.stem or artwork.slug)
+    if not artwork.title.strip() or looks_like_slug(artwork.title):
+        return derived
+    return artwork.title.strip()
+
+
+def build_generic_description_html(artwork_title: str) -> str:
+    return (
+        f"<p><strong>{artwork_title}</strong> adds an easy style upgrade to your everyday wardrobe.</p>"
+        f"<p>This print-on-demand apparel design is made for casual wear, gifting, and year-round outfits. "
+        "Pair it with your favorite layers for a clean, wearable look.</p>"
+        "<ul>"
+        "<li>Comfort-focused fit for daily wear</li>"
+        "<li>High-quality print designed to stay vibrant</li>"
+        "<li>Great for gifting or building a themed collection</li>"
+        "</ul>"
+    )
+
+
+def render_product_title(template: ProductTemplate, artwork: Artwork) -> str:
+    display_title = choose_artwork_display_title(artwork)
+    return template.title_pattern.format(artwork_title=display_title, clean_artwork_title=display_title).strip()
+
+
+def render_product_description(template: ProductTemplate, artwork: Artwork) -> str:
+    display_title = choose_artwork_display_title(artwork)
+    generated = build_generic_description_html(display_title)
+    pattern = (template.description_pattern or "").strip()
+
+    if not pattern or pattern in {"{artwork_title}", "<p>{artwork_title}</p>"}:
+        return generated
+
+    return template.description_pattern.format(
+        artwork_title=display_title,
+        clean_artwork_title=display_title,
+        generated_description=generated,
+    ).strip()
 
 
 def _compute_backoff(attempt: int) -> float:
@@ -508,8 +584,8 @@ def create_in_shopify_only(
     template: ProductTemplate,
     variant_rows: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    title = template.title_pattern.format(artwork_title=artwork.title).strip()
-    description_html = template.description_pattern.format(artwork_title=artwork.title).strip()
+    title = render_product_title(template, artwork)
+    description_html = render_product_description(template, artwork)
     tags = list(dict.fromkeys(DEFAULT_TAGS + artwork.tags + template.tags))
     product_options, variants = build_shopify_product_options(variant_rows)
     handle = slugify(f"{artwork.slug}-{template.key}")
@@ -553,8 +629,7 @@ def discover_artworks(image_dir: pathlib.Path) -> List[Artwork]:
         with Image.open(path) as im:
             width, height = im.size
 
-        stem = path.stem.replace("_", " ").replace("-", " ").strip()
-        title = stem.title()
+        title = filename_slug_to_title(path.stem)
         artworks.append(
             Artwork(
                 slug=slugify(path.stem),
@@ -760,6 +835,7 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
                 publish_title=bool(row.get("publish_title", True)),
                 publish_description=bool(row.get("publish_description", True)),
                 publish_images=bool(row.get("publish_images", True)),
+                publish_mockups=bool(row["publish_mockups"]) if "publish_mockups" in row else None,
                 publish_variants=bool(row.get("publish_variants", True)),
                 publish_tags=bool(row.get("publish_tags", True)),
                 default_price=str(row.get("default_price", DEFAULT_PRICE_FALLBACK)),
@@ -819,8 +895,8 @@ def normalize_catalog_variants_response(raw_variants: Any) -> List[Dict[str, Any
 
 
 def build_printify_product_payload(artwork: Artwork, template: ProductTemplate, variant_rows: List[Dict[str, Any]], upload_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    title = template.title_pattern.format(artwork_title=artwork.title).strip()
-    description_html = template.description_pattern.format(artwork_title=artwork.title).strip()
+    title = render_product_title(template, artwork)
+    description_html = render_product_description(template, artwork)
     tags = list(dict.fromkeys(DEFAULT_TAGS + artwork.tags + template.tags))
 
     variants_payload: List[Dict[str, Any]] = []
@@ -867,10 +943,13 @@ def build_printify_product_payload(artwork: Artwork, template: ProductTemplate, 
 
 
 def build_printify_publish_payload(template: ProductTemplate) -> Dict[str, Any]:
+    # Printify publish image controls can govern storefront mockups/images for supported channels.
+    # TODO: Add provider/channel-specific mockup selection support if Printify API exposes stable controls.
+    images_flag = template.publish_images if template.publish_mockups is None else bool(template.publish_mockups)
     return {
         "title": template.publish_title,
         "description": template.publish_description,
-        "images": template.publish_images,
+        "images": images_flag,
         "variants": template.publish_variants,
         "tags": template.publish_tags,
     }
@@ -880,6 +959,37 @@ def build_printify_publish_payload(template: ProductTemplate) -> Dict[str, Any]:
 # Sync flows
 # -----------------------------
 
+
+
+
+def log_upload_result(placement_name: str, metadata: Dict[str, Any]) -> None:
+    logger.info(
+        "Upload successful placement=%s strategy=%s printify_image_id=%s r2_public_url=%s",
+        placement_name,
+        metadata.get("upload_strategy", "unknown"),
+        metadata.get("id", ""),
+        metadata.get("r2_public_url", "n/a"),
+    )
+
+
+def summarize_upload_strategy(upload_map: Dict[str, Dict[str, Any]]) -> str:
+    strategies = sorted({v.get("upload_strategy", "unknown") for v in upload_map.values()})
+    return "+".join(strategies) if strategies else "none"
+
+
+def log_template_summary(*, artwork_slug: str, template_key: str, success: bool, result: Dict[str, Any], upload_map: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
+    printify_result = result.get("printify", {}) if isinstance(result, dict) else {}
+    product_id = printify_result.get("printify_product_id") or "n/a"
+    upload_strategy = summarize_upload_strategy(upload_map or {})
+    status = "success" if success else "failure"
+    logger.info(
+        "Template summary artwork=%s template=%s status=%s product_id=%s upload_strategy=%s",
+        artwork_slug,
+        template_key,
+        status,
+        product_id,
+        upload_strategy,
+    )
 
 def choose_upload_strategy(file_size: int, requested_strategy: str, r2_config: Optional[R2Config]) -> str:
     if requested_strategy == "direct":
@@ -922,6 +1032,7 @@ def upload_assets_to_printify(
         cached = uploads_state.get(cache_key)
         if cached and cached.get("id"):
             uploaded[asset.placement.placement_name] = cached
+            log_upload_result(asset.placement.placement_name, cached)
             continue
 
         try:
@@ -953,7 +1064,9 @@ def upload_assets_to_printify(
 
             uploads_state[cache_key] = metadata
             uploaded[asset.placement.placement_name] = metadata
+            log_upload_result(asset.placement.placement_name, metadata)
             save_json_atomic(state_path, state)
+            logger.info("State persisted after upload state_path=%s", state_path)
         except DryRunMutationSkipped:
             dry = {
                 "id": f"dry-run-{artwork.slug}-{template.key}-{asset.placement.placement_name}",
@@ -964,12 +1077,14 @@ def upload_assets_to_printify(
                 dry["r2_object_key"] = object_key
                 dry["r2_public_url"] = build_r2_public_url(r2_config.public_base_url if r2_config else "", object_key)
             uploaded[asset.placement.placement_name] = dry
+            log_upload_result(asset.placement.placement_name, dry)
 
     return uploaded
 
 
 def create_in_printify(printify: PrintifyClient, shop_id: int, artwork: Artwork, template: ProductTemplate, variant_rows: List[Dict[str, Any]], upload_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     payload = build_printify_product_payload(artwork, template, variant_rows, upload_map)
+    logger.info("Mockup/image publish behavior template=%s publish_images=%s publish_mockups_override=%s", template.key, template.publish_images, template.publish_mockups)
     try:
         created = printify.create_product(shop_id, payload)
     except DryRunMutationSkipped:
@@ -977,9 +1092,11 @@ def create_in_printify(printify: PrintifyClient, shop_id: int, artwork: Artwork,
 
     product_id = str(created.get("id") or created.get("data", {}).get("id") or "")
     result: Dict[str, Any] = {"printify_product_id": product_id, "created": created}
+    logger.info("Printify product created product_id=%s title=%s enabled_variants=%s", product_id, payload.get("title", ""), len(payload.get("variants", [])))
     if template.publish_after_create and product_id:
         try:
             result["published"] = printify.publish_product(shop_id, product_id, build_printify_publish_payload(template))
+            logger.info("Printify publish completed product_id=%s result=%s", product_id, result["published"])
         except DryRunMutationSkipped:
             result["published"] = {"status": "dry-run"}
     return result
@@ -1001,12 +1118,15 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
 
     all_templates_successful = True
     for template in templates:
+        upload_map: Dict[str, Dict[str, Any]] = {}
         try:
             catalog_variants = printify.list_variants(template.printify_blueprint_id, template.printify_print_provider_id)
             variant_rows = choose_variants_from_catalog(catalog_variants, template)
             if not variant_rows:
                 all_templates_successful = False
-                record["products"].append({"template": template.key, "result": {"status": "no_matching_variants"}})
+                result = {"status": "no_matching_variants"}
+                record["products"].append({"template": template.key, "result": result})
+                log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, upload_map=upload_map)
                 continue
 
             prepared_assets: List[PreparedArtwork] = []
@@ -1020,10 +1140,12 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
 
             if skipped_placements:
                 all_templates_successful = False
+                result = {"status": "skipped_undersized", "placements": skipped_placements}
                 record["products"].append({
                     "template": template.key,
-                    "result": {"status": "skipped_undersized", "placements": skipped_placements},
+                    "result": result,
                 })
+                log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, upload_map=upload_map)
                 continue
 
             upload_map = upload_assets_to_printify(printify, state, artwork, template, prepared_assets, state_path, upload_strategy, r2_config)
@@ -1039,16 +1161,21 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 "print_provider_id": template.printify_print_provider_id,
                 "result": result,
             })
+            log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=True, result=result, upload_map=upload_map)
         except Exception as exc:
             all_templates_successful = False
             logger.exception("Sync failed for artwork=%s template=%s", artwork.slug, template.key)
-            record["products"].append({"template": template.key, "result": {"error": str(exc)}})
+            error_result = {"error": str(exc)}
+            record["products"].append({"template": template.key, "result": error_result})
+            log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": error_result}, upload_map=upload_map)
         save_json_atomic(state_path, state)
+        logger.info("State persisted after template processing state_path=%s", state_path)
         time.sleep(0.25)
 
     record["completed"] = all_templates_successful
     processed[artwork.slug] = record
     save_json_atomic(state_path, state)
+    logger.info("State persisted after artwork completion state_path=%s", state_path)
 
 
 def resolve_shop_id(printify: PrintifyClient, env_value: str) -> Optional[int]:
