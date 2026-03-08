@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import logging
 import math
@@ -12,6 +13,7 @@ import re
 import tempfile
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -19,6 +21,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 from dotenv import load_dotenv
 from PIL import Image, ImageOps
+from r2_uploader import R2Config, build_r2_public_url, load_r2_config_from_env, upload_file_to_r2
 
 load_dotenv()
 
@@ -45,6 +48,7 @@ DEFAULT_PRICE_FALLBACK = os.getenv("DEFAULT_PRICE_FALLBACK", "29.99")
 USER_AGENT = os.getenv("PRINTIFY_USER_AGENT", "InkVibeAuto/1.1")
 RETRY_MAX_ATTEMPTS = int(os.getenv("RETRY_MAX_ATTEMPTS", "5"))
 RETRY_BACKOFF_SECONDS = float(os.getenv("RETRY_BACKOFF_SECONDS", "1.5"))
+PRINTIFY_DIRECT_UPLOAD_LIMIT_BYTES = 5 * 1024 * 1024
 
 logger = logging.getLogger("inkvibeauto")
 
@@ -63,6 +67,10 @@ class TemplateValidationError(ValueError):
 
 
 class StateFileError(RuntimeError):
+    pass
+
+
+class NonRetryableRequestError(RuntimeError):
     pass
 
 
@@ -177,6 +185,47 @@ def _retry_after_seconds(value: Optional[str], attempt: int) -> float:
     return _compute_backoff(attempt)
 
 
+def normalize_printify_price(value: Any) -> int:
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"Invalid Printify price value: {value!r}")
+
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError(f"Printify price must be non-negative: {value!r}")
+        return value
+
+    decimal_value: Decimal
+    if isinstance(value, Decimal):
+        decimal_value = value
+    elif isinstance(value, float):
+        decimal_value = Decimal(str(value))
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("Printify price cannot be empty")
+        try:
+            decimal_value = Decimal(stripped)
+        except InvalidOperation as exc:
+            raise ValueError(f"Invalid Printify price string: {value!r}") from exc
+    else:
+        raise ValueError(f"Unsupported Printify price type: {type(value).__name__}")
+
+    if decimal_value < 0:
+        raise ValueError(f"Printify price must be non-negative: {value!r}")
+
+    minor_units = decimal_value * Decimal("100")
+    normalized = minor_units.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return int(normalized)
+
+
+def file_fingerprint(path: pathlib.Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
 def load_json(path: pathlib.Path, default: Any) -> Any:
     if not path.exists():
         return default
@@ -260,8 +309,13 @@ class BaseApiClient:
                     body = response.json()
                 except Exception:
                     pass
+
+                if response.status_code == 400:
+                    logger.error("Validation failed for %s %s: %s", method.upper(), path, body)
+                    raise NonRetryableRequestError(f"HTTP 400 for {method.upper()} {path}: {body}")
+
                 raise RuntimeError(f"HTTP {response.status_code} for {method.upper()} {path}: {body}")
-            except DryRunMutationSkipped:
+            except (DryRunMutationSkipped, NonRetryableRequestError):
                 raise
             except Exception as exc:
                 last_exc = exc
@@ -321,7 +375,7 @@ class PrintifyClient(BaseApiClient):
         payload: Dict[str, Any] = {}
         if file_path is not None:
             payload["file_name"] = file_path.name
-            if file_path.stat().st_size > 5 * 1024 * 1024:
+            if file_path.stat().st_size > PRINTIFY_DIRECT_UPLOAD_LIMIT_BYTES:
                 logger.warning("Large file detected (>5MB): %s. Printify recommends URL uploads.", file_path.name)
             payload["contents"] = base64.b64encode(file_path.read_bytes()).decode("ascii")
         else:
@@ -774,16 +828,19 @@ def build_printify_product_payload(artwork: Artwork, template: ProductTemplate, 
     for variant in variant_rows:
         variant_id = int(variant["id"])
         enabled_variant_ids.append(variant_id)
-        price_cents = variant.get("price") or variant.get("cost") or variant.get("price_cents")
-        if isinstance(price_cents, str) and price_cents.isdigit():
-            price_value = f"{int(price_cents) / 100:.2f}"
-        elif isinstance(price_cents, int):
-            price_value = f"{price_cents / 100:.2f}"
-        elif price_cents is not None:
-            price_value = str(price_cents)
-        else:
-            price_value = template.default_price
-        variants_payload.append({"id": variant_id, "price": price_value, "is_enabled": True})
+        raw_price = variant.get("price")
+        if raw_price is None:
+            raw_price = variant.get("cost")
+        if raw_price is None:
+            raw_price = variant.get("price_cents")
+        if raw_price is None:
+            raw_price = template.default_price
+
+        normalized_price = normalize_printify_price(raw_price)
+        variants_payload.append({"id": variant_id, "price": normalized_price, "is_enabled": True})
+
+    if variants_payload:
+        logger.debug("Printify variants sample (normalized): %s", variants_payload[0])
 
     print_areas: List[Dict[str, Any]] = []
     for placement in template.placements:
@@ -824,24 +881,89 @@ def build_printify_publish_payload(template: ProductTemplate) -> Dict[str, Any]:
 # -----------------------------
 
 
-def upload_assets_to_printify(printify: PrintifyClient, state: Dict[str, Any], artwork: Artwork, template: ProductTemplate, prepared_assets: List[PreparedArtwork], state_path: pathlib.Path) -> Dict[str, Dict[str, Any]]:
+def choose_upload_strategy(file_size: int, requested_strategy: str, r2_config: Optional[R2Config]) -> str:
+    if requested_strategy == "direct":
+        return "direct"
+    if requested_strategy == "r2_url":
+        if r2_config is None:
+            raise RuntimeError("Upload strategy 'r2_url' requires R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, and R2_PUBLIC_BASE_URL")
+        return "r2_url"
+
+    if file_size <= PRINTIFY_DIRECT_UPLOAD_LIMIT_BYTES:
+        return "direct"
+    if r2_config is not None:
+        return "r2_url"
+    raise RuntimeError(
+        "Large exported asset detected (>5MB) but Cloudflare R2 is not configured. "
+        "Configure R2_* env vars or run with --upload-strategy direct to force direct uploads."
+    )
+
+
+def upload_assets_to_printify(
+    printify: PrintifyClient,
+    state: Dict[str, Any],
+    artwork: Artwork,
+    template: ProductTemplate,
+    prepared_assets: List[PreparedArtwork],
+    state_path: pathlib.Path,
+    upload_strategy: str,
+    r2_config: Optional[R2Config],
+) -> Dict[str, Dict[str, Any]]:
     uploaded: Dict[str, Dict[str, Any]] = {}
     uploads_state = state.setdefault("uploads", {})
 
     for asset in prepared_assets:
-        cache_key = f"{artwork.slug}:{template.key}:{asset.placement.placement_name}:{asset.export_path.stat().st_size}"
+        file_size = asset.export_path.stat().st_size
+        fingerprint = file_fingerprint(asset.export_path)
+        strategy_used = choose_upload_strategy(file_size, upload_strategy, r2_config)
+        object_key = f"inkvibe/{slugify(artwork.slug)}/{slugify(template.key)}/{slugify(asset.placement.placement_name)}-{fingerprint[:12]}{asset.export_path.suffix.lower()}"
+        cache_key = f"{artwork.slug}:{template.key}:{asset.placement.placement_name}:{fingerprint}:{strategy_used}"
+
         cached = uploads_state.get(cache_key)
         if cached and cached.get("id"):
             uploaded[asset.placement.placement_name] = cached
             continue
 
         try:
-            response = printify.upload_image(file_path=asset.export_path)
-            uploads_state[cache_key] = response
-            uploaded[asset.placement.placement_name] = response
+            if strategy_used == "direct":
+                response = printify.upload_image(file_path=asset.export_path)
+                metadata = {
+                    "id": response.get("id"),
+                    "upload_strategy": "direct",
+                    "source_fingerprint": fingerprint,
+                    "file_size": file_size,
+                    "source_file": str(asset.export_path),
+                }
+            else:
+                if r2_config is None:
+                    raise RuntimeError("R2 config is required for r2_url upload strategy")
+                public_url = build_r2_public_url(r2_config.public_base_url, object_key)
+                if not printify.dry_run:
+                    public_url = upload_file_to_r2(asset.export_path, object_key, r2_config)
+                response = printify.upload_image(image_url=public_url)
+                metadata = {
+                    "id": response.get("id"),
+                    "upload_strategy": "r2_url",
+                    "r2_object_key": object_key,
+                    "r2_public_url": public_url,
+                    "source_fingerprint": fingerprint,
+                    "file_size": file_size,
+                    "source_file": str(asset.export_path),
+                }
+
+            uploads_state[cache_key] = metadata
+            uploaded[asset.placement.placement_name] = metadata
             save_json_atomic(state_path, state)
         except DryRunMutationSkipped:
-            uploaded[asset.placement.placement_name] = {"id": f"dry-run-{artwork.slug}-{template.key}-{asset.placement.placement_name}"}
+            dry = {
+                "id": f"dry-run-{artwork.slug}-{template.key}-{asset.placement.placement_name}",
+                "upload_strategy": strategy_used,
+                "source_fingerprint": fingerprint,
+            }
+            if strategy_used == "r2_url":
+                dry["r2_object_key"] = object_key
+                dry["r2_public_url"] = build_r2_public_url(r2_config.public_base_url if r2_config else "", object_key)
+            uploaded[asset.placement.placement_name] = dry
 
     return uploaded
 
@@ -863,7 +985,7 @@ def create_in_printify(printify: PrintifyClient, shop_id: int, artwork: Artwork,
     return result
 
 
-def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions) -> None:
+def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config]) -> None:
     processed = state.setdefault("processed", {})
     existing = processed.get(artwork.slug, {})
     if existing.get("completed") and not force:
@@ -904,7 +1026,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 })
                 continue
 
-            upload_map = upload_assets_to_printify(printify, state, artwork, template, prepared_assets, state_path)
+            upload_map = upload_assets_to_printify(printify, state, artwork, template, prepared_assets, state_path, upload_strategy, r2_config)
 
             result: Dict[str, Any] = {}
             result["printify"] = create_in_printify(printify, shop_id, artwork, template, variant_rows, upload_map) if (template.push_via_printify and shop_id is not None) else {"status": "prepared_only"}
@@ -977,10 +1099,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-level", default="INFO", help="Logging level: DEBUG/INFO/WARNING/ERROR")
     parser.add_argument("--skip-audit", action="store_true", help="Skip Printify catalog/shop preflight audit")
     parser.add_argument("--max-artworks", type=int, default=0, help="Limit number of discovered artworks (0 = no limit)")
+    parser.add_argument("--upload-strategy", choices=["auto", "direct", "r2_url"], default="auto", help="Asset upload strategy: auto (default), direct, or r2_url")
     return parser.parse_args()
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0) -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, upload_strategy: str = "auto") -> None:
     if not PRINTIFY_API_TOKEN:
         raise RuntimeError("Missing PRINTIFY_API_TOKEN")
     if not image_dir.exists():
@@ -995,6 +1118,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
     printify = PrintifyClient(PRINTIFY_API_TOKEN, dry_run=dry_run)
     shop_id = resolve_shop_id(printify, PRINTIFY_SHOP_ID)
     shopify = ShopifyClient(SHOPIFY_ADMIN_TOKEN, dry_run=dry_run) if SHOPIFY_ADMIN_TOKEN else None
+    r2_config = load_r2_config_from_env()
 
     if not skip_audit:
         audit_printify_integration(printify, templates, shop_id)
@@ -1013,6 +1137,8 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             export_dir=export_dir,
             state_path=state_path,
             artwork_options=artwork_options,
+            upload_strategy=upload_strategy,
+            r2_config=r2_config,
         )
 
     save_json_atomic(state_path, state)
@@ -1034,4 +1160,5 @@ if __name__ == "__main__":
         state_path=pathlib.Path(args.state_path),
         skip_audit=args.skip_audit,
         max_artworks=args.max_artworks,
+        upload_strategy=args.upload_strategy,
     )
