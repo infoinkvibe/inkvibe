@@ -12,20 +12,27 @@ sys.modules.setdefault("dotenv", types.SimpleNamespace(load_dotenv=lambda: None)
 import pytest
 from PIL import Image
 
+from r2_uploader import build_r2_public_url
+
 from printify_shopify_sync_pipeline import (
+    BaseApiClient,
     Artwork,
     ArtworkProcessingOptions,
     PlacementRequirement,
     ProductTemplate,
+    PreparedArtwork,
     TemplateValidationError,
+    choose_upload_strategy,
     _compute_backoff,
     choose_variants_from_catalog,
     ensure_state_shape,
+    normalize_printify_price,
     load_templates,
     normalize_catalog_variants_response,
     prepare_artwork_export,
     process_artwork,
     save_json_atomic,
+    DryRunMutationSkipped,
 )
 
 
@@ -180,5 +187,119 @@ def test_force_reprocesses_completed_state(tmp_path: Path):
         export_dir=tmp_path / "exports",
         state_path=tmp_path / "state.json",
         artwork_options=ArtworkProcessingOptions(),
+        upload_strategy="auto",
+        r2_config=None,
     )
     assert len(state["processed"]["art"]["products"]) == 1
+
+
+def test_normalize_printify_price_to_minor_units():
+    assert normalize_printify_price(2499) == 2499
+    assert normalize_printify_price(24.99) == 2499
+    assert normalize_printify_price("24.99") == 2499
+
+
+def test_normalize_printify_price_rejects_invalid_values():
+    with pytest.raises(ValueError):
+        normalize_printify_price("not-a-price")
+
+
+def test_no_retry_on_400_validation_error():
+    class DummyResponse:
+        status_code = 400
+        headers = {}
+        content = b"{}"
+
+        def json(self):
+            return {"errors": ["variants.0.price must be an integer"]}
+
+        @property
+        def text(self):
+            return '{"errors":["variants.0.price must be an integer"]}'
+
+    class DummySession:
+        def __init__(self):
+            self.calls = 0
+            self.headers = {}
+
+        def request(self, **kwargs):
+            self.calls += 1
+            return DummyResponse()
+
+    client = BaseApiClient.__new__(BaseApiClient)
+    client.base_url = "https://example.test"
+    client.dry_run = False
+    client.session = DummySession()
+    with pytest.raises(Exception, match="HTTP 400"):
+        client.post("/products", payload={})
+    assert client.session.calls == 1
+
+
+def test_upload_strategy_selection():
+    assert choose_upload_strategy(1024, "auto", None) == "direct"
+    assert choose_upload_strategy(6 * 1024 * 1024, "auto", object()) == "r2_url"
+    with pytest.raises(RuntimeError):
+        choose_upload_strategy(6 * 1024 * 1024, "auto", None)
+
+
+def test_r2_public_url_generation():
+    url = build_r2_public_url("https://pub.example.r2.dev", "inkvibe/art/key.png")
+    assert url == "https://pub.example.r2.dev/inkvibe/art/key.png"
+
+
+def test_dry_run_r2_url_upload_records_metadata(tmp_path: Path):
+    from printify_shopify_sync_pipeline import upload_assets_to_printify
+    from r2_uploader import R2Config
+
+    class DummyDryRunPrintify:
+        dry_run = True
+
+        def upload_image(self, *, file_path=None, image_url=None):
+            raise DryRunMutationSkipped("dry run")
+
+    export_dir = tmp_path / "exports"
+    export_dir.mkdir()
+    export_path = export_dir / "asset.png"
+    Image.new("RGBA", (5000, 5000), (1, 2, 3, 255)).save(export_path)
+
+    artwork = Artwork(
+        slug="art",
+        src_path=export_path,
+        title="Art",
+        description_html="",
+        tags=[],
+        image_width=5000,
+        image_height=5000,
+    )
+    template = ProductTemplate(
+        key="t",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[PlacementRequirement("front", 5000, 5000)],
+    )
+    prepared = [
+        PreparedArtwork(
+            artwork=artwork,
+            template=template,
+            placement=template.placements[0],
+            export_path=export_path,
+            width_px=5000,
+            height_px=5000,
+        )
+    ]
+
+    state = {"uploads": {}}
+    result = upload_assets_to_printify(
+        DummyDryRunPrintify(),
+        state,
+        artwork,
+        template,
+        prepared,
+        tmp_path / "state.json",
+        "r2_url",
+        R2Config("acct", "ak", "sk", "bucket", "https://pub.example.r2.dev"),
+    )
+    assert result["front"]["upload_strategy"] == "r2_url"
+    assert result["front"]["r2_public_url"].startswith("https://pub.example.r2.dev/")

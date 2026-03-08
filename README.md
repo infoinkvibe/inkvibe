@@ -13,7 +13,8 @@ InkVibeAuto is a Python automation pipeline for print-on-demand stores that conv
 ## Known risks / manual review points
 
 - Provider-specific `print_areas` transforms can differ by blueprint/provider; generated placement transforms should be validated against manually created products per template.
-- Image files >5MB are uploaded as base64 in the current implementation; URL uploads are recommended where possible.
+- Printify variant prices must be sent as integer minor units (for example `2499` for $24.99).
+- Large assets can use Cloudflare R2 URL upload flow to avoid direct base64 upload limits.
 - Variant/color/size filtering depends on provider catalog option naming consistency.
 
 ## Setup
@@ -46,6 +47,7 @@ Common optional:
 - `PRINTIFY_SHOP_ID`
 - `SHOPIFY_ADMIN_TOKEN`
 - `IMAGE_DIR`, `EXPORT_DIR`, `STATE_PATH`, `TEMPLATES_CONFIG`
+- `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_PUBLIC_BASE_URL` (required only for `--upload-strategy r2_url`, and for `auto` when assets exceed 5MB)
 
 ## CLI usage
 
@@ -100,6 +102,8 @@ Example commands:
 python printify_shopify_sync_pipeline.py --dry-run --skip-undersized
 python printify_shopify_sync_pipeline.py --dry-run --allow-upscale
 python printify_shopify_sync_pipeline.py --max-artworks 1 --force --allow-upscale
+python printify_shopify_sync_pipeline.py --dry-run --allow-upscale --force --upload-strategy auto
+python printify_shopify_sync_pipeline.py --allow-upscale --force --max-artworks 1 --upload-strategy r2_url
 ```
 
 > Upscaling low-resolution source art can reduce final print quality, even when the pipeline completes successfully.
@@ -112,3 +116,13 @@ python printify_shopify_sync_pipeline.py --max-artworks 1 --force --allow-upscal
 ## Backward compatibility
 
 `printful_shopify_sync_pipeline.py` remains a wrapper to preserve legacy invocation.
+
+## Upload strategy
+
+Use `--upload-strategy auto|direct|r2_url` (default: `auto`).
+
+- `auto`: files up to 5MB upload directly to Printify; larger files use R2 URL upload when R2 is configured.
+- `direct`: always use direct Printify upload (base64 payload).
+- `r2_url`: always upload to R2 and send Printify the public URL (requires all `R2_*` env vars).
+
+`R2_PUBLIC_BASE_URL` should be your public bucket/domain prefix; `r2.dev` URLs are acceptable for development/testing, while a custom domain is preferred for production reliability and branding.
