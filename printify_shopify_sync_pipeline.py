@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import hashlib
 import json
 import logging
@@ -157,6 +158,42 @@ class RunSummary:
     publish_attempts: int = 0
     publish_verified: int = 0
     verification_warnings: int = 0
+    combinations_processed: int = 0
+    combinations_success: int = 0
+    combinations_failed: int = 0
+    combinations_skipped: int = 0
+
+
+@dataclass
+class FailureReportRow:
+    timestamp: str
+    artwork_filename: str
+    artwork_slug: str
+    template_key: str
+    action_attempted: str
+    blueprint_id: int
+    provider_id: int
+    upload_strategy: str
+    error_type: str
+    error_message: str
+    suggested_next_action: str
+
+
+@dataclass
+class RunReportRow:
+    timestamp: str
+    artwork_filename: str
+    artwork_slug: str
+    template_key: str
+    status: str
+    action: str
+    blueprint_id: int
+    provider_id: int
+    upload_strategy: str
+    product_id: str
+    publish_attempted: bool
+    publish_verified: bool
+    rendered_title: str
 
 
 @dataclass
@@ -804,6 +841,42 @@ def list_state_keys(state: Dict[str, Any]) -> List[str]:
 
 def inspect_state_key(state: Dict[str, Any], state_key: str) -> Optional[Dict[str, Any]]:
     return derive_state_index(state).get(state_key)
+
+
+def _row_status(row: Dict[str, Any]) -> str:
+    result = row.get("result", {}) if isinstance(row.get("result"), dict) else {}
+    if result.get("error"):
+        return "failure"
+    printify_result = result.get("printify", {}) if isinstance(result.get("printify"), dict) else {}
+    if str(printify_result.get("status") or "").lower() == "skipped":
+        return "skipped"
+    status = str(result.get("status") or "").lower()
+    if status.startswith("skipped") or status == "no_matching_variants":
+        return "skipped"
+    return "success"
+
+
+def latest_rows_by_state_key(state: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    return derive_state_index(state)
+
+
+def is_state_key_successful(state: Dict[str, Any], state_key: str) -> bool:
+    row = latest_rows_by_state_key(state).get(state_key)
+    if not row:
+        return False
+    return _row_status(row) == "success"
+
+
+def write_csv_report(path: pathlib.Path, rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+    headers = list(rows[0].keys())
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 # -----------------------------
@@ -1884,7 +1957,7 @@ def upsert_in_printify(
     return result
 
 
-def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, summary: Optional[RunSummary] = None) -> None:
+def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, summary: Optional[RunSummary] = None, failure_rows: Optional[List[FailureReportRow]] = None, run_rows: Optional[List[RunReportRow]] = None) -> None:
     processed = state.setdefault("processed", {})
     existing = processed.get(artwork.slug, {})
     existing_products = existing.get("products", []) if isinstance(existing.get("products", []), list) else []
@@ -1942,6 +2015,22 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     "rendered_title": rendered_title,
                     "result": result,
                 })
+                if run_rows is not None:
+                    run_rows.append(RunReportRow(
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        artwork_filename=artwork.src_path.name,
+                        artwork_slug=artwork.slug,
+                        template_key=template.key,
+                        status="skipped",
+                        action="skip",
+                        blueprint_id=template.printify_blueprint_id,
+                        provider_id=template.printify_print_provider_id,
+                        upload_strategy=upload_strategy,
+                        product_id=existing_product_id,
+                        publish_attempted=False,
+                        publish_verified=False,
+                        rendered_title=rendered_title,
+                    ))
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=True, result=result, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
@@ -1953,6 +2042,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     summary.products_skipped += 1
                 result = {"status": "no_matching_variants"}
                 record["products"].append({"template": template.key, "state_key": state_key, "title_source": title_info.title_source, "rendered_title": rendered_title, "result": result})
+                if run_rows is not None:
+                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", template.printify_blueprint_id, template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title))
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
@@ -1983,6 +2074,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     "rendered_title": rendered_title,
                     "result": result,
                 })
+                if run_rows is not None:
+                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", template.printify_blueprint_id, template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title))
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
@@ -2024,6 +2117,22 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 "result": result,
             }
             record["products"].append(row)
+            if run_rows is not None:
+                run_rows.append(RunReportRow(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    artwork_filename=artwork.src_path.name,
+                    artwork_slug=artwork.slug,
+                    template_key=template.key,
+                    status="success",
+                    action=str(printify_result.get("action", action)),
+                    blueprint_id=template.printify_blueprint_id,
+                    provider_id=template.printify_print_provider_id,
+                    upload_strategy=summarize_upload_strategy(upload_map),
+                    product_id=str(printify_result.get("printify_product_id") or ""),
+                    publish_attempted=bool(row.get("publish_attempted")),
+                    publish_verified=bool(row.get("publish_verified")),
+                    rendered_title=rendered_title,
+                ))
             if summary is not None:
                 printify_action = (result.get("printify", {}) or {}).get("action", action)
                 if printify_action == "create":
@@ -2060,6 +2169,22 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 "rendered_title": rendered_title,
                 "result": error_result,
             })
+            if failure_rows is not None:
+                failure_rows.append(FailureReportRow(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    artwork_filename=artwork.src_path.name,
+                    artwork_slug=artwork.slug,
+                    template_key=template.key,
+                    action_attempted=action,
+                    blueprint_id=template.printify_blueprint_id,
+                    provider_id=template.printify_print_provider_id,
+                    upload_strategy=summarize_upload_strategy(upload_map),
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                    suggested_next_action="Inspect state and rerun with --resume after fixing template or artwork",
+                ))
+            if run_rows is not None:
+                run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "failure", action, template.printify_blueprint_id, template.printify_print_provider_id, summarize_upload_strategy(upload_map), "", False, False, rendered_title))
             log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": error_result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action=action, upload_map=upload_map)
         save_json_atomic(state_path, state)
         logger.info("State persisted after template processing state_path=%s", state_path)
@@ -2119,6 +2244,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-level", default="INFO", help="Logging level: DEBUG/INFO/WARNING/ERROR")
     parser.add_argument("--skip-audit", action="store_true", help="Skip Printify catalog/shop preflight audit")
     parser.add_argument("--max-artworks", type=int, default=0, help="Limit number of discovered artworks (0 = no limit)")
+    parser.add_argument("--batch-size", type=int, default=0, help="Limit number of artwork/template combinations processed this run (0 = no limit)")
+    parser.add_argument("--stop-after-failures", type=int, default=0, help="Stop run after N combination failures (0 = no limit)")
+    parser.add_argument("--fail-fast", action="store_true", help="Stop immediately after the first combination failure")
+    parser.add_argument("--resume", action="store_true", help="Skip combinations already successful in state and continue pending work")
     parser.add_argument("--template-key", action="append", default=[], help="Only process matching template key(s); can be repeated")
     parser.add_argument("--limit-templates", type=int, default=0, help="Limit number of templates after filtering (0 = no limit)")
     parser.add_argument("--list-templates", action="store_true", help="List templates from config and exit")
@@ -2146,6 +2275,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verify-publish", action="store_true", help="Read back created/updated product and verify basic storefront indicators")
     parser.add_argument("--inspect-state-key", default="", help="Read-only inspect state entry by key (artwork_slug:template_key)")
     parser.add_argument("--list-state-keys", action="store_true", help="List known state keys from state.json and exit")
+    parser.add_argument("--list-failures", action="store_true", help="List failed combinations from state and exit")
+    parser.add_argument("--list-pending", action="store_true", help="List combinations not yet successful and exit")
+    parser.add_argument("--export-failure-report", default="", help="Optional CSV export path for failed combinations")
+    parser.add_argument("--export-run-report", default="", help="Optional CSV export path for all processed combinations")
     parser.add_argument("--preview-listing-copy", action="store_true", help="Render listing title/description/tags previews without creating/updating products")
     parser.epilog = (
         "Examples:\n"
@@ -2346,7 +2479,7 @@ def run_catalog_cli(
     return False
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, preview_listing_copy_only: bool = False) -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False) -> None:
     if publish_mode not in {"default", "publish", "skip"}:
         raise RuntimeError(f"Unsupported publish mode: {publish_mode}")
 
@@ -2363,6 +2496,13 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             print(json.dumps(row, indent=2, ensure_ascii=False))
         return
 
+    if list_failures_only:
+        for key, row in latest_rows_by_state_key(state).items():
+            if _row_status(row) != "failure":
+                continue
+            print(f"{key}\t{str((row.get('result', {}) or {}).get('error', ''))[:120]}")
+        return
+
     if not image_dir.exists():
         raise RuntimeError(f"Missing image directory: {image_dir}")
 
@@ -2377,6 +2517,16 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         artworks = artworks[:max_artworks]
     if preview_listing_copy_only:
         preview_listing_copy(artworks=artworks, templates=templates)
+        return
+
+    if list_pending_only:
+        index = latest_rows_by_state_key(state)
+        for artwork in artworks:
+            for template in templates:
+                state_key = f"{artwork.slug}:{template.key}"
+                row = index.get(state_key)
+                if row is None or _row_status(row) != "success":
+                    print(state_key)
         return
 
     if not PRINTIFY_API_TOKEN:
@@ -2413,35 +2563,77 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
 
     logger.info("Loaded %s template(s) and %s artwork file(s)", len(templates), len(artworks))
     summary = RunSummary(artworks_scanned=len(artworks))
+    failure_rows: List[FailureReportRow] = []
+    run_rows: List[RunReportRow] = []
     artwork_options = ArtworkProcessingOptions(allow_upscale=allow_upscale, upscale_method=upscale_method, skip_undersized=skip_undersized)
+    combinations_processed = 0
+    stop_requested = False
     for artwork in artworks:
-        process_artwork(
-            printify=printify,
-            shopify=shopify,
-            shop_id=shop_id,
-            artwork=artwork,
-            templates=templates,
-            state=state,
-            force=force,
-            export_dir=export_dir,
-            state_path=state_path,
-            artwork_options=artwork_options,
-            upload_strategy=upload_strategy,
-            r2_config=r2_config,
-            create_only=create_only,
-            update_only=update_only,
-            rebuild_product=rebuild_product,
-            publish_mode=publish_mode,
-            verify_publish=verify_publish,
-            auto_rebuild_on_incompatible_update=auto_rebuild_on_incompatible_update,
-            summary=summary,
-        )
+        templates_for_artwork: List[ProductTemplate] = []
+        for template in templates:
+            if batch_size > 0 and combinations_processed >= batch_size:
+                stop_requested = True
+                break
+            if resume and is_state_key_successful(state, f"{artwork.slug}:{template.key}"):
+                continue
+            templates_for_artwork.append(template)
+            combinations_processed += 1
+        for template in templates_for_artwork:
+            before_failures = summary.failures
+            process_artwork(
+                printify=printify,
+                shopify=shopify,
+                shop_id=shop_id,
+                artwork=artwork,
+                templates=[template],
+                state=state,
+                force=force,
+                export_dir=export_dir,
+                state_path=state_path,
+                artwork_options=artwork_options,
+                upload_strategy=upload_strategy,
+                r2_config=r2_config,
+                create_only=create_only,
+                update_only=update_only,
+                rebuild_product=rebuild_product,
+                publish_mode=publish_mode,
+                verify_publish=verify_publish,
+                auto_rebuild_on_incompatible_update=auto_rebuild_on_incompatible_update,
+                summary=summary,
+                failure_rows=failure_rows,
+                run_rows=run_rows,
+            )
+            if summary.failures > before_failures:
+                if fail_fast:
+                    stop_requested = True
+                    break
+                if stop_after_failures > 0 and summary.failures >= stop_after_failures:
+                    stop_requested = True
+                    break
+        if stop_requested:
+            break
+
+    summary.combinations_processed = len(run_rows)
+    summary.combinations_success = sum(1 for row in run_rows if row.status == "success")
+    summary.combinations_failed = sum(1 for row in run_rows if row.status == "failure")
+    summary.combinations_skipped = sum(1 for row in run_rows if row.status == "skipped")
+
+    if export_failure_report:
+        write_csv_report(pathlib.Path(export_failure_report), [row.__dict__ for row in failure_rows])
+        logger.info("Failure report exported path=%s rows=%s", export_failure_report, len(failure_rows))
+    if export_run_report:
+        write_csv_report(pathlib.Path(export_run_report), [row.__dict__ for row in run_rows])
+        logger.info("Run report exported path=%s rows=%s", export_run_report, len(run_rows))
 
     save_json_atomic(state_path, state)
     logger.info(
-        "Run summary artworks_scanned=%s templates_processed=%s products_created=%s products_updated=%s products_rebuilt=%s products_skipped=%s failures=%s publish_attempts=%s publish_verified=%s verification_warnings=%s",
+        "Run summary artworks_scanned=%s templates_processed=%s combinations_processed=%s successes=%s failures=%s skipped=%s products_created=%s products_updated=%s products_rebuilt=%s products_skipped=%s publish_attempts=%s publish_verified=%s verification_warnings=%s",
         summary.artworks_scanned,
         summary.templates_processed,
+        summary.combinations_processed,
+        summary.combinations_success,
+        summary.combinations_failed,
+        summary.combinations_skipped,
         summary.products_created,
         summary.products_updated,
         summary.products_rebuilt,
@@ -2451,6 +2643,10 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         summary.publish_verified,
         summary.verification_warnings,
     )
+    if failure_rows:
+        logger.info("Failures encountered (showing up to 5):")
+        for row in failure_rows[:5]:
+            logger.info("- %s:%s action=%s error=%s", row.artwork_slug, row.template_key, row.action_attempted, row.error_message)
     logger.info("Done")
 
 
@@ -2477,6 +2673,10 @@ if __name__ == "__main__":
             state_path=pathlib.Path(args.state_path),
             skip_audit=args.skip_audit,
             max_artworks=args.max_artworks,
+            batch_size=args.batch_size,
+            stop_after_failures=args.stop_after_failures,
+            fail_fast=args.fail_fast,
+            resume=args.resume,
             upload_strategy=args.upload_strategy,
             template_keys=args.template_key,
             limit_templates=args.limit_templates,
@@ -2503,6 +2703,10 @@ if __name__ == "__main__":
             auto_rebuild_on_incompatible_update=args.auto_rebuild_on_incompatible_update,
             inspect_state_key_value=args.inspect_state_key,
             list_state_keys_only=args.list_state_keys,
+            list_failures_only=args.list_failures,
+            list_pending_only=args.list_pending,
+            export_failure_report=args.export_failure_report,
+            export_run_report=args.export_run_report,
             preview_listing_copy_only=args.preview_listing_copy,
         )
     except CatalogCliUsageError as exc:

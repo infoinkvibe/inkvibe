@@ -60,6 +60,9 @@ from printify_shopify_sync_pipeline import (
     title_semantically_includes_product_label,
     validate_printify_payload_consistency,
     assess_update_compatibility,
+    _row_status,
+    write_csv_report,
+    run,
 )
 
 
@@ -1084,3 +1087,135 @@ def test_process_artwork_auto_rebuild_on_incompatible_update(tmp_path: Path):
     latest = state["processed"]["art"]["products"][-1]["result"]["printify"]
     assert latest["action"] == "rebuild"
     assert latest["printify_product_id"] == "recreated-1"
+
+def test_report_row_status_classification():
+    assert _row_status({"result": {"error": "boom"}}) == "failure"
+    assert _row_status({"result": {"printify": {"status": "skipped"}}}) == "skipped"
+    assert _row_status({"result": {"status": "no_matching_variants"}}) == "skipped"
+    assert _row_status({"result": {"printify": {"action": "create"}}}) == "success"
+
+
+def test_write_csv_report_outputs_rows(tmp_path: Path):
+    out = tmp_path / "run.csv"
+    write_csv_report(out, [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}])
+    text = out.read_text(encoding="utf-8")
+    assert "a,b" in text
+    assert "1,x" in text
+
+
+def test_run_batch_size_and_resume_and_reporting(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    state = ensure_state_shape({"processed": {"a1": {"products": [{"state_key": "a1:t1", "result": {"printify": {"action": "create"}}}]}}})
+
+    class DummyPrintifyClient:
+        def __init__(self, *args, **kwargs):
+            self.dry_run = True
+
+    monkeypatch.setattr(pipeline, "PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "load_json", lambda path, default: state)
+    monkeypatch.setattr(pipeline, "load_templates", lambda p: [
+        ProductTemplate(key="t1", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{artwork_title}", description_pattern="{artwork_title}"),
+        ProductTemplate(key="t2", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{artwork_title}", description_pattern="{artwork_title}"),
+    ])
+    monkeypatch.setattr(pipeline, "select_templates", lambda templates, **kwargs: templates)
+    monkeypatch.setattr(pipeline, "discover_artworks", lambda d: [
+        Artwork("a1", tmp_path / "a1.png", "a1", "", [], 1000, 1000),
+        Artwork("a2", tmp_path / "a2.png", "a2", "", [], 1000, 1000),
+    ])
+    monkeypatch.setattr(pipeline, "PrintifyClient", DummyPrintifyClient)
+    monkeypatch.setattr(pipeline, "resolve_shop_id", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "load_r2_config_from_env", lambda: None)
+    monkeypatch.setattr(pipeline, "audit_printify_integration", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "run_catalog_cli", lambda **kwargs: False)
+
+    def fake_process_artwork(**kwargs):
+        template = kwargs["templates"][0]
+        artwork = kwargs["artwork"]
+        kwargs["run_rows"].append(pipeline.RunReportRow(
+            timestamp="now",
+            artwork_filename=artwork.src_path.name,
+            artwork_slug=artwork.slug,
+            template_key=template.key,
+            status="success",
+            action="create",
+            blueprint_id=1,
+            provider_id=1,
+            upload_strategy="auto",
+            product_id="p1",
+            publish_attempted=False,
+            publish_verified=False,
+            rendered_title="x",
+        ))
+
+    monkeypatch.setattr(pipeline, "process_artwork", fake_process_artwork)
+
+    run_report = tmp_path / "run_report.csv"
+    run(
+        tmp_path / "templates.json",
+        image_dir=tmp_path,
+        export_dir=tmp_path / "exp",
+        state_path=tmp_path / "state.json",
+        skip_audit=True,
+        resume=True,
+        batch_size=2,
+        export_run_report=str(run_report),
+    )
+    rows = [r for r in run_report.read_text(encoding="utf-8").splitlines() if r.strip()]
+    assert len(rows) == 3  # header + 2 rows
+
+
+def test_run_stop_after_failures_and_fail_fast(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    monkeypatch.setattr(pipeline, "PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "load_json", lambda path, default: ensure_state_shape({}))
+    monkeypatch.setattr(pipeline, "load_templates", lambda p: [
+        ProductTemplate(key="t1", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{artwork_title}", description_pattern="{artwork_title}"),
+        ProductTemplate(key="t2", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{artwork_title}", description_pattern="{artwork_title}"),
+    ])
+    monkeypatch.setattr(pipeline, "select_templates", lambda templates, **kwargs: templates)
+    monkeypatch.setattr(pipeline, "discover_artworks", lambda d: [Artwork("a1", tmp_path / "a1.png", "a1", "", [], 1000, 1000)])
+    monkeypatch.setattr(pipeline, "PrintifyClient", lambda *args, **kwargs: type("X", (), {"dry_run": True})())
+    monkeypatch.setattr(pipeline, "resolve_shop_id", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "load_r2_config_from_env", lambda: None)
+    monkeypatch.setattr(pipeline, "audit_printify_integration", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "run_catalog_cli", lambda **kwargs: False)
+
+    calls = {"n": 0}
+
+    def fake_process_artwork(**kwargs):
+        calls["n"] += 1
+        kwargs["summary"].failures += 1
+        kwargs["failure_rows"].append(pipeline.FailureReportRow("now", "a1.png", "a1", kwargs["templates"][0].key, "create", 1, 1, "auto", "RuntimeError", "boom", "fix"))
+        kwargs["run_rows"].append(pipeline.RunReportRow("now", "a1.png", "a1", kwargs["templates"][0].key, "failure", "create", 1, 1, "auto", "", False, False, "x"))
+
+    monkeypatch.setattr(pipeline, "process_artwork", fake_process_artwork)
+    run(tmp_path / "templates.json", image_dir=tmp_path, export_dir=tmp_path / "exp", state_path=tmp_path / "state.json", skip_audit=True, stop_after_failures=1)
+    assert calls["n"] == 1
+
+    calls["n"] = 0
+    run(tmp_path / "templates.json", image_dir=tmp_path, export_dir=tmp_path / "exp", state_path=tmp_path / "state.json", skip_audit=True, fail_fast=True)
+    assert calls["n"] == 1
+
+def test_list_failures_and_pending_helpers(tmp_path: Path, monkeypatch, capsys):
+    import printify_shopify_sync_pipeline as pipeline
+
+    state = ensure_state_shape({
+        "processed": {
+            "a1": {"products": [{"state_key": "a1:t1", "result": {"error": "bad asset"}}]},
+            "a2": {"products": [{"state_key": "a2:t1", "result": {"printify": {"action": "create"}}}]},
+        }
+    })
+    monkeypatch.setattr(pipeline, "load_json", lambda path, default: state)
+    monkeypatch.setattr(pipeline, "load_templates", lambda p: [ProductTemplate(key="t1", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{artwork_title}", description_pattern="{artwork_title}")])
+    monkeypatch.setattr(pipeline, "select_templates", lambda templates, **kwargs: templates)
+    monkeypatch.setattr(pipeline, "discover_artworks", lambda d: [Artwork("a1", tmp_path / "a1.png", "a1", "", [], 1, 1), Artwork("a2", tmp_path / "a2.png", "a2", "", [], 1, 1), Artwork("a3", tmp_path / "a3.png", "a3", "", [], 1, 1)])
+
+    run(tmp_path / "templates.json", image_dir=tmp_path, state_path=tmp_path / "state.json", list_failures_only=True)
+    out = capsys.readouterr().out
+    assert "a1:t1" in out
+
+    run(tmp_path / "templates.json", image_dir=tmp_path, state_path=tmp_path / "state.json", list_pending_only=True)
+    out2 = capsys.readouterr().out
+    assert "a1:t1" in out2 and "a3:t1" in out2
