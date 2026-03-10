@@ -90,6 +90,15 @@ class Artwork:
     image_width: int
     image_height: int
     dpi_hint: Optional[int] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TitleResolution:
+    raw_title_source: str
+    cleaned_display_title: str
+    title_source: str
+    quality_reason: str
 
 
 @dataclass
@@ -218,6 +227,102 @@ def filename_slug_to_title(value: str) -> str:
     return " ".join(chosen).title().strip()
 
 
+def _split_keywords(value: Any) -> List[str]:
+    if isinstance(value, list):
+        rows = value
+    elif isinstance(value, str):
+        rows = re.split(r"[,;]", value)
+    else:
+        return []
+    return [str(row).strip() for row in rows if str(row).strip()]
+
+
+def load_artwork_metadata(sidecar_path: pathlib.Path) -> Dict[str, Any]:
+    if not sidecar_path.exists() or not sidecar_path.is_file():
+        return {}
+
+    try:
+        payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Unable to parse metadata sidecar %s: %s", sidecar_path, exc)
+        return {}
+
+    if not isinstance(payload, dict):
+        logger.warning("Ignoring non-object metadata sidecar %s", sidecar_path)
+        return {}
+
+    fields = {
+        "title": "",
+        "subtitle": "",
+        "description": "",
+        "tags": [],
+        "seo_keywords": [],
+        "audience": "",
+        "style_keywords": [],
+        "theme": "",
+        "collection": "",
+        "color_story": "",
+        "occasion": "",
+        "artist_note": "",
+    }
+    for field_name in fields:
+        value = payload.get(field_name)
+        if field_name in {"tags", "seo_keywords", "style_keywords"}:
+            fields[field_name] = _split_keywords(value)
+        elif isinstance(value, str):
+            fields[field_name] = value.strip()
+        elif value is None:
+            fields[field_name] = "" if isinstance(fields[field_name], str) else []
+        else:
+            fields[field_name] = str(value).strip()
+    return fields
+
+
+def filename_title_quality_reason(value: str) -> str:
+    lowered = value.strip().lower()
+    if not lowered:
+        return "empty"
+    if re.fullmatch(r"[a-f0-9]{24,64}", lowered):
+        return "hex_like"
+    if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", lowered):
+        return "uuid_like"
+    tokens = _normalize_title_tokens(lowered)
+    alpha_tokens = [token for token in tokens if re.search(r"[a-z]", token)]
+    if re.search(r"[0-9]{8,}", lowered) and len(alpha_tokens) < 2:
+        return "long_numeric"
+    normalized = re.sub(r"[_\-]+", "", lowered)
+    if len(normalized) >= 18 and re.fullmatch(r"[a-z0-9]+", normalized) and len(alpha_tokens) < 2:
+        return "hashy_slug"
+    return "ok"
+
+
+def _best_metadata_phrase(artwork: Artwork, template: ProductTemplate) -> str:
+    for key in ("theme", "style_keywords", "collection", "subtitle"):
+        value = artwork.metadata.get(key)
+        if isinstance(value, list) and value:
+            return str(value[0]).strip().title()
+        if isinstance(value, str) and value.strip():
+            return value.strip().title()
+    return ""
+
+
+def resolve_artwork_title(template: ProductTemplate, artwork: Artwork) -> TitleResolution:
+    metadata_title = str(artwork.metadata.get("title", "")).strip()
+    if metadata_title:
+        return TitleResolution(metadata_title, metadata_title, "metadata", "metadata_title")
+
+    filename_stem = artwork.src_path.stem or artwork.slug
+    quality_reason = filename_title_quality_reason(filename_stem)
+    cleaned = filename_slug_to_title(filename_stem)
+    if quality_reason == "ok":
+        return TitleResolution(filename_stem, cleaned, "filename", "filename_clean")
+
+    product_label = (template.product_type_label or template.shopify_product_type or "Product").strip()
+    phrase = _best_metadata_phrase(artwork, template)
+    fallback = f"{phrase} {product_label}".strip() if phrase else f"Signature {product_label}".strip()
+    return TitleResolution(filename_stem, fallback, "fallback", quality_reason)
+
+
 def looks_like_slug(value: str) -> bool:
     lowered = value.strip().lower()
     if not lowered:
@@ -230,6 +335,9 @@ def looks_like_slug(value: str) -> bool:
 
 
 def choose_artwork_display_title(artwork: Artwork) -> str:
+    metadata_title = str(artwork.metadata.get("title", "")).strip()
+    if metadata_title:
+        return metadata_title
     derived = filename_slug_to_title(artwork.src_path.stem or artwork.slug)
     if not artwork.title.strip() or looks_like_slug(artwork.title):
         return derived
@@ -394,11 +502,21 @@ def build_generic_description_html(artwork_title: str) -> str:
 
 
 def build_seo_context(template: ProductTemplate, artwork: Artwork) -> Dict[str, str]:
-    display_title = choose_artwork_display_title(artwork)
-    seo_keywords = ", ".join(template.seo_keywords[:8])
-    style_keywords = ", ".join(template.style_keywords[:6])
-    audience = (template.audience or "").strip()
+    title_info = resolve_artwork_title(template, artwork)
+    display_title = title_info.cleaned_display_title
+    metadata = artwork.metadata or {}
+    merged_seo = [*template.seo_keywords, *_split_keywords(metadata.get("seo_keywords"))]
+    merged_style = [*template.style_keywords, *_split_keywords(metadata.get("style_keywords"))]
+    seo_keywords = ", ".join(list(dict.fromkeys(merged_seo))[:8])
+    style_keywords = ", ".join(list(dict.fromkeys(merged_style))[:6])
+    audience = str(metadata.get("audience") or template.audience or "").strip()
     product_type = (template.product_type_label or template.shopify_product_type or "Product").strip()
+    subtitle = str(metadata.get("subtitle", "")).strip()
+    theme = str(metadata.get("theme", "")).strip()
+    collection = str(metadata.get("collection", "")).strip()
+    color_story = str(metadata.get("color_story", "")).strip()
+    occasion = str(metadata.get("occasion", "")).strip()
+    artist_note = str(metadata.get("artist_note", "")).strip()
     return {
         "artwork_title": display_title,
         "clean_artwork_title": display_title,
@@ -406,6 +524,15 @@ def build_seo_context(template: ProductTemplate, artwork: Artwork) -> Dict[str, 
         "audience": audience,
         "product_type_label": product_type,
         "style_keywords": style_keywords,
+        "subtitle": subtitle,
+        "theme": theme,
+        "collection": collection,
+        "color_story": color_story,
+        "occasion": occasion,
+        "artist_note": artist_note,
+        "title_source": title_info.title_source,
+        "title_quality": title_info.quality_reason,
+        "raw_title_source": title_info.raw_title_source,
     }
 
 
@@ -414,14 +541,48 @@ def render_product_title(template: ProductTemplate, artwork: Artwork) -> str:
     return template.title_pattern.format(**context).strip()
 
 
+def _render_listing_tags(template: ProductTemplate, artwork: Artwork) -> List[str]:
+    metadata = artwork.metadata or {}
+    merged = [
+        *DEFAULT_TAGS,
+        *artwork.tags,
+        *template.tags,
+        *_split_keywords(metadata.get("tags")),
+        *_split_keywords(metadata.get("seo_keywords")),
+    ]
+    tags: List[str] = []
+    seen: set[str] = set()
+    for row in merged:
+        cleaned = str(row).strip().lower()
+        if not cleaned:
+            continue
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        if len(cleaned) > 32:
+            continue
+        if cleaned in seen:
+            continue
+        seen.add(cleaned)
+        tags.append(cleaned)
+        if len(tags) >= 20:
+            break
+    return tags
+
+
 def render_product_description(template: ProductTemplate, artwork: Artwork) -> str:
     context = build_seo_context(template, artwork)
     generated = build_generic_description_html(context["artwork_title"])
     pattern = (template.description_pattern or "").strip()
+    metadata = artwork.metadata or {}
+    metadata_description = str(metadata.get("description", "")).strip()
+    if metadata_description:
+        generated = f"<p><strong>{context['artwork_title']}</strong></p><p>{metadata_description}</p>"
 
     if not pattern or pattern in {"{artwork_title}", "<p>{artwork_title}</p>"}:
         audience_line = f"<p>Designed for {context['audience']} who love {context['style_keywords']}.</p>" if context["audience"] and context["style_keywords"] else ""
-        return f"{generated}{audience_line}".strip()
+        theme_line = f"<p>Theme: {context['theme']}.</p>" if context["theme"] else ""
+        occasion_line = f"<p>Perfect for {context['occasion']}.</p>" if context["occasion"] else ""
+        collection_line = f"<p>Part of the {context['collection']} collection.</p>" if context["collection"] else ""
+        return f"{generated}{audience_line}{theme_line}{occasion_line}{collection_line}".strip()
 
     return template.description_pattern.format(
         **context,
@@ -895,7 +1056,7 @@ def create_in_shopify_only(
 ) -> Dict[str, Any]:
     title = render_product_title(template, artwork)
     description_html = render_product_description(template, artwork)
-    tags = list(dict.fromkeys(DEFAULT_TAGS + artwork.tags + template.tags))
+    tags = _render_listing_tags(template, artwork)
     product_options, variants = build_shopify_product_options(variant_rows)
     handle = slugify(f"{artwork.slug}-{template.key}")
 
@@ -938,7 +1099,8 @@ def discover_artworks(image_dir: pathlib.Path) -> List[Artwork]:
         with Image.open(path) as im:
             width, height = im.size
 
-        title = filename_slug_to_title(path.stem)
+        metadata = load_artwork_metadata(path.with_suffix(".json"))
+        title = str(metadata.get("title", "")).strip() or filename_slug_to_title(path.stem)
         artworks.append(
             Artwork(
                 slug=slugify(path.stem),
@@ -948,6 +1110,7 @@ def discover_artworks(image_dir: pathlib.Path) -> List[Artwork]:
                 tags=[],
                 image_width=width,
                 image_height=height,
+                metadata=metadata,
             )
         )
 
@@ -1219,8 +1382,7 @@ def normalize_catalog_variants_response(raw_variants: Any) -> List[Dict[str, Any
 def build_printify_product_payload(artwork: Artwork, template: ProductTemplate, variant_rows: List[Dict[str, Any]], upload_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     title = render_product_title(template, artwork)
     description_html = render_product_description(template, artwork)
-    seo_tags = [*template.seo_keywords[:6], *template.style_keywords[:4]]
-    tags = list(dict.fromkeys(DEFAULT_TAGS + artwork.tags + template.tags + seo_tags))
+    tags = _render_listing_tags(template, artwork)
 
     variants_payload: List[Dict[str, Any]] = []
     enabled_variant_ids: List[int] = []
@@ -1259,6 +1421,24 @@ def build_printify_product_payload(artwork: Artwork, template: ProductTemplate, 
         "print_areas": print_areas,
         "tags": tags,
     }
+
+
+def preview_listing_copy(*, artworks: List[Artwork], templates: List[ProductTemplate]) -> None:
+    for artwork in artworks:
+        for template in templates:
+            context = build_seo_context(template, artwork)
+            title = render_product_title(template, artwork)
+            description = render_product_description(template, artwork)
+            tags = _render_listing_tags(template, artwork)
+            text_preview = re.sub(r"<[^>]+>", "", description)
+            text_preview = re.sub(r"\s+", " ", text_preview).strip()[:160]
+            print(
+                f"{artwork.src_path.name} | {template.key}\n"
+                f"  title: {title}\n"
+                f"  source: {context.get('title_source')} ({context.get('title_quality')})\n"
+                f"  description: {text_preview}\n"
+                f"  tags: {', '.join(tags[:12]) or '-'}"
+            )
 
 
 def build_printify_publish_payload(template: ProductTemplate) -> Dict[str, Any]:
@@ -1576,6 +1756,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
 
     all_templates_successful = True
     for template in templates:
+        title_info = resolve_artwork_title(template, artwork)
+        rendered_title = render_product_title(template, artwork)
         state_key = f"{artwork.slug}:{template.key}"
         matching_rows = [row for row in record["products"] if isinstance(row, dict) and row.get("state_key") == state_key]
         existing_product_id = ""
@@ -1614,6 +1796,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     "last_verified_at": None,
                     "verified_title": None,
                     "verified_variant_count": None,
+                    "title_source": title_info.title_source,
+                    "rendered_title": rendered_title,
                     "result": result,
                 })
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=True, result=result, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
@@ -1626,7 +1810,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 if summary is not None:
                     summary.products_skipped += 1
                 result = {"status": "no_matching_variants"}
-                record["products"].append({"template": template.key, "state_key": state_key, "result": result})
+                record["products"].append({"template": template.key, "state_key": state_key, "title_source": title_info.title_source, "rendered_title": rendered_title, "result": result})
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
@@ -1653,6 +1837,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     "last_verified_at": None,
                     "verified_title": None,
                     "verified_variant_count": None,
+                    "title_source": title_info.title_source,
+                    "rendered_title": rendered_title,
                     "result": result,
                 })
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
@@ -1690,6 +1876,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 "last_verified_at": datetime.now(timezone.utc).isoformat() if verification else None,
                 "verified_title": verification.get("verified_title"),
                 "verified_variant_count": verification.get("verified_variant_count"),
+                "title_source": title_info.title_source,
+                "rendered_title": rendered_title,
                 "result": result,
             }
             record["products"].append(row)
@@ -1725,6 +1913,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 "last_verified_at": None,
                 "verified_title": None,
                 "verified_variant_count": None,
+                "title_source": title_info.title_source,
+                "rendered_title": rendered_title,
                 "result": error_result,
             })
             log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": error_result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action=action, upload_map=upload_map)
@@ -1812,6 +2002,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verify-publish", action="store_true", help="Read back created/updated product and verify basic storefront indicators")
     parser.add_argument("--inspect-state-key", default="", help="Read-only inspect state entry by key (artwork_slug:template_key)")
     parser.add_argument("--list-state-keys", action="store_true", help="List known state keys from state.json and exit")
+    parser.add_argument("--preview-listing-copy", action="store_true", help="Render listing title/description/tags previews without creating/updating products")
     parser.epilog = (
         "Examples:\n"
         "  python printify_shopify_sync_pipeline.py --dry-run --template-key tshirt_gildan --template-key mug_11oz\n"
@@ -2011,7 +2202,7 @@ def run_catalog_cli(
     return False
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False) -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, preview_listing_copy_only: bool = False) -> None:
     if publish_mode not in {"default", "publish", "skip"}:
         raise RuntimeError(f"Unsupported publish mode: {publish_mode}")
 
@@ -2028,8 +2219,6 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             print(json.dumps(row, indent=2, ensure_ascii=False))
         return
 
-    if not PRINTIFY_API_TOKEN:
-        raise RuntimeError("Missing PRINTIFY_API_TOKEN")
     if not image_dir.exists():
         raise RuntimeError(f"Missing image directory: {image_dir}")
 
@@ -2042,6 +2231,12 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
     artworks = discover_artworks(image_dir)
     if max_artworks > 0:
         artworks = artworks[:max_artworks]
+    if preview_listing_copy_only:
+        preview_listing_copy(artworks=artworks, templates=templates)
+        return
+
+    if not PRINTIFY_API_TOKEN:
+        raise RuntimeError("Missing PRINTIFY_API_TOKEN")
 
     printify = PrintifyClient(PRINTIFY_API_TOKEN, dry_run=dry_run)
 
@@ -2162,6 +2357,7 @@ if __name__ == "__main__":
             verify_publish=args.verify_publish,
             inspect_state_key_value=args.inspect_state_key,
             list_state_keys_only=args.list_state_keys,
+            preview_listing_copy_only=args.preview_listing_copy,
         )
     except CatalogCliUsageError as exc:
         print(f"Catalog CLI error: {exc}")

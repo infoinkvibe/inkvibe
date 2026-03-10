@@ -52,6 +52,11 @@ from printify_shopify_sync_pipeline import (
     RunSummary,
     list_state_keys,
     inspect_state_key,
+    load_artwork_metadata,
+    filename_title_quality_reason,
+    resolve_artwork_title,
+    _render_listing_tags,
+    preview_listing_copy,
 )
 
 
@@ -343,6 +348,81 @@ def test_render_title_uses_clean_fallback(tmp_path: Path):
     template = _template_for_variant_tests()
     template.title_pattern = "{artwork_title} Tee"
     assert render_product_title(template, art) == "Groovy Cat Print Tee"
+
+
+def test_sidecar_metadata_loading(tmp_path: Path):
+    sidecar = tmp_path / "piece.json"
+    sidecar.write_text(json.dumps({"title": "Aurora Bloom", "tags": ["Floral", "Spring"], "seo_keywords": "gift, botanical"}), encoding="utf-8")
+    metadata = load_artwork_metadata(sidecar)
+    assert metadata["title"] == "Aurora Bloom"
+    assert metadata["tags"] == ["Floral", "Spring"]
+    assert metadata["seo_keywords"] == ["gift", "botanical"]
+
+
+def test_uuid_noisy_filename_detection():
+    assert filename_title_quality_reason("8f6f45d4-c95f-4f68-9cf9-f022f5197a18") == "uuid_like"
+    assert filename_title_quality_reason("2fd4e1c67a2d28fced849ee1bb76e7391b93eb12") == "hex_like"
+
+
+def test_metadata_title_precedence(tmp_path: Path):
+    src = tmp_path / "e9a47a8c-7f53-4f4f-857f-2d3fe6b5fbe9.png"
+    Image.new("RGBA", (1000, 1000), (0, 0, 0, 255)).save(src)
+    art = Artwork(
+        slug="x",
+        src_path=src,
+        title="ignored",
+        description_html="",
+        tags=[],
+        image_width=1000,
+        image_height=1000,
+        metadata={"title": "Golden Hour Daisies"},
+    )
+    template = _template_for_variant_tests()
+    resolved = resolve_artwork_title(template, art)
+    assert resolved.title_source == "metadata"
+    assert resolved.cleaned_display_title == "Golden Hour Daisies"
+
+
+def test_fallback_title_generation_for_noisy_filename(tmp_path: Path):
+    src = tmp_path / "8f6f45d4-c95f-4f68-9cf9-f022f5197a18.png"
+    Image.new("RGBA", (1000, 1000), (0, 0, 0, 255)).save(src)
+    art = Artwork(
+        slug="x",
+        src_path=src,
+        title="",
+        description_html="",
+        tags=[],
+        image_width=1000,
+        image_height=1000,
+        metadata={"theme": "retro sunset"},
+    )
+    template = _template_for_variant_tests()
+    template.product_type_label = "Graphic Tee"
+    resolved = resolve_artwork_title(template, art)
+    assert resolved.title_source == "fallback"
+    assert resolved.cleaned_display_title == "Retro Sunset Graphic Tee"
+
+
+def test_tag_merging_and_deduplication(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    art.tags = ["Gift", "Floral"]
+    art.metadata = {"tags": ["floral", "spring"], "seo_keywords": ["gift", "garden party"]}
+    template = _template_for_variant_tests()
+    template.tags = ["spring", "Boho"]
+    tags = _render_listing_tags(template, art)
+    assert tags.count("gift") == 1
+    assert tags.count("floral") == 1
+    assert "boho" in tags
+
+
+def test_preview_listing_copy_behavior(tmp_path: Path, capsys):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    art.metadata = {"title": "Ocean Drift", "tags": ["coastal"]}
+    template = _template_for_variant_tests()
+    preview_listing_copy(artworks=[art], templates=[template])
+    out = capsys.readouterr().out
+    assert "Ocean Drift" in out
+    assert "tags:" in out
 
 
 def test_render_description_generic_fallback(tmp_path: Path):
