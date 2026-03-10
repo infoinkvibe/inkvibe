@@ -27,11 +27,15 @@ from printify_shopify_sync_pipeline import (
     choose_variants_from_catalog,
     ensure_state_shape,
     normalize_printify_price,
+    compute_sale_price_minor,
+    compute_compare_at_price_minor,
     filename_slug_to_title,
     render_product_description,
     render_product_title,
     summarize_upload_strategy,
     load_templates,
+    select_templates,
+    build_seo_context,
     normalize_catalog_variants_response,
     prepare_artwork_export,
     process_artwork,
@@ -343,3 +347,118 @@ def test_render_description_generic_fallback(tmp_path: Path):
 def test_upload_strategy_summary_helper():
     upload_map = {"front": {"upload_strategy": "direct"}, "back": {"upload_strategy": "r2_url"}}
     assert summarize_upload_strategy(upload_map) == "direct+r2_url"
+
+
+def test_pricing_markup_fixed_with_x99_rounding():
+    template = ProductTemplate(
+        key="pricing",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        base_price="21.00",
+        markup_type="fixed",
+        markup_value="4.50",
+        rounding_mode="x_99",
+    )
+    price = compute_sale_price_minor(template, {"id": 1, "price": 1800})
+    assert price == 2599
+
+
+def test_pricing_markup_percent_with_whole_dollar_rounding():
+    template = ProductTemplate(
+        key="pricing",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        markup_type="percent",
+        markup_value="20",
+        rounding_mode="whole_dollar",
+    )
+    price = compute_sale_price_minor(template, {"id": 1, "price": 2499})
+    assert price == 3000
+
+
+def test_compare_at_price_only_when_higher():
+    template = ProductTemplate(
+        key="pricing",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        compare_at_price="39.99",
+    )
+    assert compute_compare_at_price_minor(template, 2999) == 3999
+    assert compute_compare_at_price_minor(template, 3999) is None
+
+
+def test_template_filtering_by_key_and_limit():
+    templates = [
+        ProductTemplate("tee", 1, 1, "{artwork_title}", "{artwork_title}"),
+        ProductTemplate("mug", 2, 2, "{artwork_title}", "{artwork_title}"),
+        ProductTemplate("poster", 3, 3, "{artwork_title}", "{artwork_title}"),
+    ]
+    selected = select_templates(templates, template_keys=["mug", "poster"], limit_templates=1)
+    assert [template.key for template in selected] == ["mug"]
+
+
+def test_seo_metadata_context_and_rendering(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1200, 1200)
+    template = ProductTemplate(
+        key="seo",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title} {product_type_label}",
+        description_pattern="<p>{audience}</p><p>{seo_keywords}</p><p>{style_keywords}</p>",
+        seo_keywords=["gift for cat lovers", "cute cat shirt"],
+        audience="cat moms",
+        product_type_label="Graphic Tee",
+        style_keywords=["retro", "minimal"],
+    )
+    context = build_seo_context(template, art)
+    assert context["audience"] == "cat moms"
+    description = render_product_description(template, art)
+    assert "gift for cat lovers" in description
+    assert "retro, minimal" in description
+
+
+def test_state_key_tracks_artwork_template_combinations(tmp_path: Path):
+    artwork = _create_artwork(tmp_path, 1200, 1200)
+    template_a = ProductTemplate(
+        key="tee",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_colors=["Black"],
+        enabled_sizes=["M"],
+        placements=[PlacementRequirement("front", 1000, 1000)],
+    )
+    template_b = ProductTemplate(
+        key="mug",
+        printify_blueprint_id=2,
+        printify_print_provider_id=2,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_colors=["Black"],
+        enabled_sizes=["M"],
+        placements=[PlacementRequirement("front", 1000, 1000)],
+    )
+    state = ensure_state_shape({})
+    process_artwork(
+        printify=DummyPrintify(),
+        shopify=None,
+        shop_id=None,
+        artwork=artwork,
+        templates=[template_a, template_b],
+        state=state,
+        force=True,
+        export_dir=tmp_path / "exports",
+        state_path=tmp_path / "state.json",
+        artwork_options=ArtworkProcessingOptions(),
+        upload_strategy="auto",
+        r2_config=None,
+    )
+    keys = {row["state_key"] for row in state["processed"]["art"]["products"]}
+    assert keys == {"art:tee", "art:mug"}

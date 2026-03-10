@@ -71,6 +71,15 @@ python printify_shopify_sync_pipeline.py \
   --export-dir ./exports \
   --state-path ./state.json \
   --max-artworks 5
+
+# List template keys
+python printify_shopify_sync_pipeline.py --templates ./product_templates.json --list-templates
+
+# Process one artwork with selected templates
+python printify_shopify_sync_pipeline.py --max-artworks 1 --template-key tshirt_gildan --template-key mug_11oz
+
+# Keep only first selected template after filtering
+python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --template-key mug_11oz --limit-templates 1
 ```
 
 ## Template schema
@@ -85,6 +94,23 @@ Each placement requires:
 - `placement_name`
 - `width_px`
 - `height_px`
+
+Pricing fields (optional):
+- `base_price`
+- `markup_type` (`fixed` or `percent`)
+- `markup_value`
+- `rounding_mode` (`none`, `whole_dollar`, `x_99`)
+- `compare_at_price`
+
+SEO/listing fields (optional):
+- `seo_keywords`
+- `audience`
+- `product_type_label`
+- `style_keywords`
+
+Pricing notes:
+- Final variant `price` and optional `compare_at_price` are normalized to integer minor units for Printify.
+- Existing integer price behavior is preserved, while decimal template values are converted safely.
 
 ## Artwork sizing behavior
 
@@ -154,3 +180,10 @@ Use `--upload-strategy auto|direct|r2_url` (default: `auto`).
 - `r2_url`: always upload to R2 and send Printify the public URL (requires all `R2_*` env vars).
 
 `R2_PUBLIC_BASE_URL` should be your public bucket/domain prefix; `r2.dev` URLs are acceptable for development/testing, while a custom domain is preferred for production reliability and branding.
+
+## Batch and multi-template runs
+
+- The pipeline can process multiple product templates per artwork in one run.
+- State tracking now records `state_key` as `artwork_slug:template_key` for clearer artwork/template idempotency behavior.
+- Final logs include a concise run summary: artworks scanned, templates processed, products created, skipped, failures.
+
