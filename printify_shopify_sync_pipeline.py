@@ -52,6 +52,8 @@ PRINTIFY_DIRECT_UPLOAD_LIMIT_BYTES = 5 * 1024 * 1024
 
 logger = logging.getLogger("inkvibeauto")
 
+DEFAULT_TEMPLATE_PRICE = "29.99"
+
 
 # -----------------------------
 # Models / exceptions
@@ -223,6 +225,143 @@ def choose_artwork_display_title(artwork: Artwork) -> str:
     if not artwork.title.strip() or looks_like_slug(artwork.title):
         return derived
     return artwork.title.strip()
+
+
+def _extract_blueprint_brand(blueprint: Dict[str, Any]) -> str:
+    for key in ("brand", "brand_name"):
+        value = blueprint.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict):
+            nested = value.get("title") or value.get("name")
+            if isinstance(nested, str) and nested.strip():
+                return nested.strip()
+    return ""
+
+
+def _extract_blueprint_model(blueprint: Dict[str, Any]) -> str:
+    for key in ("model", "model_name"):
+        value = blueprint.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def search_blueprints(blueprints: List[Dict[str, Any]], query: str) -> List[Dict[str, Any]]:
+    terms = [term for term in re.split(r"\s+", query.lower().strip()) if term]
+    if not terms:
+        return blueprints
+
+    def _matches(blueprint: Dict[str, Any]) -> bool:
+        haystack = " ".join(
+            [
+                str(blueprint.get("title", "")).lower(),
+                str(_extract_blueprint_brand(blueprint)).lower(),
+                str(_extract_blueprint_model(blueprint)).lower(),
+                str(blueprint.get("description", "")).lower(),
+            ]
+        )
+        return all(term in haystack for term in terms)
+
+    return [blueprint for blueprint in blueprints if _matches(blueprint)]
+
+
+def summarize_variant_options(variants: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+    colors = sorted({c for c in (_variant_option_value(variant, "color") for variant in variants) if c})
+    sizes = sorted({s for s in (_variant_option_value(variant, "size") for variant in variants) if s})
+    placements: set[str] = set()
+
+    for variant in variants:
+        placeholders = variant.get("placeholders") or variant.get("placeholder_options") or []
+        if isinstance(placeholders, list):
+            for item in placeholders:
+                if isinstance(item, dict):
+                    pos = item.get("position") or item.get("name")
+                    if isinstance(pos, str) and pos.strip():
+                        placements.add(pos.strip())
+
+    return {"colors": colors, "sizes": sizes, "placements": sorted(placements)}
+
+
+def filter_providers(providers: List[Dict[str, Any]], query: str) -> List[Dict[str, Any]]:
+    needle = query.lower().strip()
+    if not needle:
+        return providers
+    return [provider for provider in providers if needle in str(provider.get("title", "")).lower()]
+
+
+def score_provider_for_template(
+    provider: Dict[str, Any],
+    variants: List[Dict[str, Any]],
+    template: Optional[ProductTemplate] = None,
+) -> Dict[str, Any]:
+    summary = summarize_variant_options(variants)
+    available_colors = set(summary["colors"])
+    available_sizes = set(summary["sizes"])
+    available_placements = set(summary["placements"])
+
+    wanted_colors = set(template.enabled_colors) if template else set()
+    wanted_sizes = set(template.enabled_sizes) if template else set()
+    wanted_placements = {placement.placement_name for placement in template.placements} if template else set()
+
+    matching_color_count = len(available_colors & wanted_colors) if wanted_colors else len(available_colors)
+    matching_size_count = len(available_sizes & wanted_sizes) if wanted_sizes else len(available_sizes)
+    matching_variant_count = 0
+    for variant in variants:
+        color_ok = not wanted_colors or _variant_option_value(variant, "color") in wanted_colors
+        size_ok = not wanted_sizes or _variant_option_value(variant, "size") in wanted_sizes
+        placement_ok = (not wanted_placements) or (not available_placements) or bool(available_placements & wanted_placements)
+        if color_ok and size_ok and placement_ok and variant.get("is_available", True):
+            matching_variant_count += 1
+
+    placement_match_count = len(available_placements & wanted_placements) if wanted_placements else len(available_placements)
+    score = (matching_color_count * 4) + (matching_size_count * 4) + (matching_variant_count * 2) + (placement_match_count * 3)
+
+    return {
+        "provider_id": provider.get("id"),
+        "provider_title": provider.get("title", ""),
+        "score": score,
+        "matching_color_count": matching_color_count,
+        "matching_size_count": matching_size_count,
+        "matching_variant_count": matching_variant_count,
+        "placement_match_count": placement_match_count,
+        "variant_count": len(variants),
+        "colors": summary["colors"],
+        "sizes": summary["sizes"],
+        "placements": summary["placements"],
+    }
+
+
+def generate_template_snippet(
+    *,
+    key: str,
+    blueprint_id: int,
+    provider_id: int,
+    variants: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    summary = summarize_variant_options(variants)
+    placements = summary["placements"] or ["front"]
+    placement_rows = [
+        {
+            "placement_name": placement,
+            "width_px": 4500,
+            "height_px": 5400,
+            "file_type": "png",
+        }
+        for placement in placements
+    ]
+    return {
+        "key": key,
+        "printify_blueprint_id": blueprint_id,
+        "printify_print_provider_id": provider_id,
+        "title_pattern": "{artwork_title}",
+        "description_pattern": "<p>{artwork_title}</p>",
+        "enabled_colors": summary["colors"],
+        "enabled_sizes": summary["sizes"],
+        "placements": placement_rows,
+        "default_price": DEFAULT_TEMPLATE_PRICE,
+        "seo_keywords": ["replace-me-keyword-1", "replace-me-keyword-2"],
+    }
 
 
 def build_generic_description_html(artwork_title: str) -> str:
@@ -1360,9 +1499,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-templates", type=int, default=0, help="Limit number of templates after filtering (0 = no limit)")
     parser.add_argument("--list-templates", action="store_true", help="List templates from config and exit")
     parser.add_argument("--upload-strategy", choices=["auto", "direct", "r2_url"], default="auto", help="Asset upload strategy: auto (default), direct, or r2_url")
-    parser.epilog = "Examples:\n  python printify_shopify_sync_pipeline.py --dry-run --template-key tshirt_gildan --template-key mug_11oz\n  python printify_shopify_sync_pipeline.py --list-templates --templates ./product_templates.json"
+    parser.add_argument("--list-blueprints", action="store_true", help="List Printify catalog blueprints")
+    parser.add_argument("--search-blueprints", default="", help="Search Printify blueprints by title/keywords")
+    parser.add_argument("--limit-blueprints", type=int, default=25, help="Limit blueprint results (0 = no limit)")
+    parser.add_argument("--list-providers", action="store_true", help="List providers for a blueprint")
+    parser.add_argument("--blueprint-id", type=int, default=0, help="Printify blueprint id used by provider/variant tools")
+    parser.add_argument("--provider-id", type=int, default=0, help="Printify provider id used by variant/template tools")
+    parser.add_argument("--limit-providers", type=int, default=25, help="Limit provider results (0 = no limit)")
+    parser.add_argument("--inspect-variants", action="store_true", help="Inspect variants for a blueprint/provider")
+    parser.add_argument("--recommend-provider", action="store_true", help="Recommend a provider for the blueprint")
+    parser.add_argument("--generate-template-snippet", action="store_true", help="Generate a starter template snippet JSON")
+    parser.add_argument("--template-file", default="", help="Optional template JSON path for recommendation context")
+    parser.add_argument("--key", default="", help="Template key used for snippet generation")
+    parser.epilog = (
+        "Examples:\n"
+        "  python printify_shopify_sync_pipeline.py --dry-run --template-key tshirt_gildan --template-key mug_11oz\n"
+        "  python printify_shopify_sync_pipeline.py --list-blueprints --search-blueprints hoodie --limit-blueprints 10\n"
+        "  python printify_shopify_sync_pipeline.py --list-providers --blueprint-id 5"
+    )
     return parser.parse_args()
-
 
 
 def select_templates(
@@ -1380,7 +1535,102 @@ def select_templates(
     return selected
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False) -> None:
+def _find_template_by_key(config_path: pathlib.Path, template_key: str) -> Optional[ProductTemplate]:
+    if not template_key:
+        return None
+    for template in load_templates(config_path):
+        if template.key == template_key:
+            return template
+    return None
+
+
+def run_catalog_cli(
+    *,
+    printify: PrintifyClient,
+    config_path: pathlib.Path,
+    list_blueprints: bool,
+    search_query: str,
+    limit_blueprints: int,
+    list_providers: bool,
+    blueprint_id: int,
+    provider_id: int,
+    limit_providers: int,
+    inspect_variants: bool,
+    recommend_provider: bool,
+    template_file: str,
+    generate_template_snippet_flag: bool,
+    snippet_key: str,
+) -> bool:
+    if not any([list_blueprints, bool(search_query), list_providers, inspect_variants, recommend_provider, generate_template_snippet_flag]):
+        return False
+
+    if list_blueprints or search_query:
+        blueprints = printify.list_blueprints()
+        rows = search_blueprints(blueprints, search_query) if search_query else blueprints
+        if limit_blueprints > 0:
+            rows = rows[:limit_blueprints]
+        for blueprint in rows:
+            print(
+                f"id={blueprint.get('id')}	title={blueprint.get('title', '')}	brand={_extract_blueprint_brand(blueprint) or '-'}	model={_extract_blueprint_model(blueprint) or '-'}"
+            )
+        return True
+
+    if (list_providers or inspect_variants or recommend_provider or generate_template_snippet_flag) and blueprint_id <= 0:
+        raise RuntimeError("--blueprint-id is required")
+
+    if list_providers or recommend_provider:
+        providers = printify.list_print_providers(blueprint_id)
+        scored_rows: List[Dict[str, Any]] = []
+        template = None
+        if recommend_provider:
+            template_path = pathlib.Path(template_file) if template_file else config_path
+            template = _find_template_by_key(template_path, snippet_key) if snippet_key else None
+        for provider in providers:
+            variants = printify.list_variants(blueprint_id, int(provider.get("id", 0)))
+            score = score_provider_for_template(provider, variants, template=template)
+            scored_rows.append(score)
+
+        scored_rows.sort(key=lambda row: row["score"], reverse=True)
+        if list_providers:
+            rows = scored_rows[:limit_providers] if limit_providers > 0 else scored_rows
+            for row in rows:
+                print(
+                    f"provider_id={row['provider_id']}	title={row['provider_title']}	variants={row['variant_count']}	colors={','.join(row['colors'][:6]) or '-'}	sizes={','.join(row['sizes'][:6]) or '-'}"
+                )
+            return True
+
+        if recommend_provider:
+            if not scored_rows:
+                print("No providers found")
+                return True
+            top = scored_rows[0]
+            print(
+                f"recommended_provider_id={top['provider_id']}	title={top['provider_title']}	score={top['score']}	reason=colors:{top['matching_color_count']} sizes:{top['matching_size_count']} variants:{top['matching_variant_count']} placements:{top['placement_match_count']}"
+            )
+            return True
+
+    if inspect_variants or generate_template_snippet_flag:
+        if provider_id <= 0:
+            raise RuntimeError("--provider-id is required")
+        variants = printify.list_variants(blueprint_id, provider_id)
+        summary = summarize_variant_options(variants)
+
+        if inspect_variants:
+            print(
+                f"blueprint_id={blueprint_id}	provider_id={provider_id}	variant_count={len(variants)}	colors={','.join(summary['colors'][:12]) or '-'}	sizes={','.join(summary['sizes'][:12]) or '-'}"
+            )
+            return True
+
+        if generate_template_snippet_flag:
+            key = snippet_key or f"blueprint_{blueprint_id}_provider_{provider_id}"
+            snippet = generate_template_snippet(key=key, blueprint_id=blueprint_id, provider_id=provider_id, variants=variants)
+            print(json.dumps(snippet, indent=2))
+            return True
+
+    return False
+
+
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, snippet_key: str = "") -> None:
     if not PRINTIFY_API_TOKEN:
         raise RuntimeError("Missing PRINTIFY_API_TOKEN")
     if not image_dir.exists():
@@ -1398,6 +1648,25 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
 
     state = ensure_state_shape(load_json(state_path, {}))
     printify = PrintifyClient(PRINTIFY_API_TOKEN, dry_run=dry_run)
+
+    if run_catalog_cli(
+        printify=printify,
+        config_path=config_path,
+        list_blueprints=list_blueprints,
+        search_query=search_blueprints_query,
+        limit_blueprints=limit_blueprints,
+        list_providers=list_providers,
+        blueprint_id=blueprint_id,
+        provider_id=provider_id,
+        limit_providers=limit_providers,
+        inspect_variants=inspect_variants,
+        recommend_provider=recommend_provider,
+        template_file=template_file,
+        generate_template_snippet_flag=generate_template_snippet_flag,
+        snippet_key=snippet_key,
+    ):
+        return
+
     shop_id = resolve_shop_id(printify, PRINTIFY_SHOP_ID)
     shopify = ShopifyClient(SHOPIFY_ADMIN_TOKEN, dry_run=dry_run) if SHOPIFY_ADMIN_TOKEN else None
     r2_config = load_r2_config_from_env()
@@ -1456,4 +1725,16 @@ if __name__ == "__main__":
         template_keys=args.template_key,
         limit_templates=args.limit_templates,
         list_templates=args.list_templates,
+        list_blueprints=args.list_blueprints,
+        search_blueprints_query=args.search_blueprints,
+        limit_blueprints=args.limit_blueprints,
+        list_providers=args.list_providers,
+        blueprint_id=args.blueprint_id,
+        provider_id=args.provider_id,
+        limit_providers=args.limit_providers,
+        inspect_variants=args.inspect_variants,
+        recommend_provider=args.recommend_provider,
+        template_file=args.template_file,
+        generate_template_snippet_flag=args.generate_template_snippet,
+        snippet_key=args.key,
     )
