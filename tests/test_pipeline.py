@@ -35,6 +35,10 @@ from printify_shopify_sync_pipeline import (
     summarize_upload_strategy,
     load_templates,
     select_templates,
+    search_blueprints,
+    filter_providers,
+    score_provider_for_template,
+    generate_template_snippet,
     build_seo_context,
     normalize_catalog_variants_response,
     prepare_artwork_export,
@@ -462,3 +466,52 @@ def test_state_key_tracks_artwork_template_combinations(tmp_path: Path):
     )
     keys = {row["state_key"] for row in state["processed"]["art"]["products"]}
     assert keys == {"art:tee", "art:mug"}
+
+
+def test_blueprint_search_filters_by_keywords():
+    rows = [
+        {"id": 1, "title": "Unisex Heavy Cotton Tee", "brand": "Gildan", "model": "5000"},
+        {"id": 2, "title": "Ceramic Mug", "brand": "Generic", "model": "11oz"},
+    ]
+    filtered = search_blueprints(rows, "cotton gildan")
+    assert [row["id"] for row in filtered] == [1]
+
+
+def test_provider_filter_by_title():
+    providers = [{"id": 1, "title": "Print Provider A"}, {"id": 2, "title": "Another Co"}]
+    assert [p["id"] for p in filter_providers(providers, "provider")] == [1]
+
+
+def test_provider_scoring_prefers_matching_template_constraints():
+    template = ProductTemplate(
+        key="tee",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_colors=["Black", "White"],
+        enabled_sizes=["M", "L"],
+        placements=[PlacementRequirement("front", 4500, 5400)],
+    )
+    provider = {"id": 99, "title": "Best Provider"}
+    variants = [
+        {"id": 1, "is_available": True, "options": {"color": "Black", "size": "M"}},
+        {"id": 2, "is_available": True, "options": {"color": "White", "size": "L"}},
+    ]
+    score = score_provider_for_template(provider, variants, template)
+    assert score["matching_color_count"] == 2
+    assert score["matching_size_count"] == 2
+    assert score["matching_variant_count"] == 2
+
+
+def test_generate_template_snippet_contains_detected_values():
+    variants = [
+        {"id": 1, "options": {"color": "Black", "size": "M"}},
+        {"id": 2, "options": {"color": "White", "size": "L"}},
+    ]
+    snippet = generate_template_snippet(key="new_tee", blueprint_id=6, provider_id=7, variants=variants)
+    assert snippet["key"] == "new_tee"
+    assert snippet["printify_blueprint_id"] == 6
+    assert snippet["printify_print_provider_id"] == 7
+    assert snippet["enabled_colors"] == ["Black", "White"]
+    assert snippet["enabled_sizes"] == ["L", "M"]

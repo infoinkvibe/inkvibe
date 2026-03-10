@@ -82,6 +82,29 @@ python printify_shopify_sync_pipeline.py --max-artworks 1 --template-key tshirt_
 python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --template-key mug_11oz --limit-templates 1
 ```
 
+## Catalog exploration workflows
+
+Use the new read-only catalog tooling to discover blueprint/provider ids and bootstrap template entries.
+
+```bash
+# Find candidate blueprints (filter by keyword)
+python printify_shopify_sync_pipeline.py --list-blueprints --search-blueprints "heavy cotton tee" --limit-blueprints 15
+
+# List providers for a blueprint with variant/color/size summary
+python printify_shopify_sync_pipeline.py --list-providers --blueprint-id 6 --limit-providers 10
+
+# Inspect a specific provider's variants
+python printify_shopify_sync_pipeline.py --inspect-variants --blueprint-id 6 --provider-id 99
+
+# Recommend best provider for a blueprint (optionally use template key constraints)
+python printify_shopify_sync_pipeline.py --recommend-provider --blueprint-id 6 --template-file ./product_templates.json --key tshirt_gildan
+
+# Generate starter snippet JSON for product_templates.json
+python printify_shopify_sync_pipeline.py --generate-template-snippet --blueprint-id 6 --provider-id 99 --key tshirt_new
+```
+
+Output is compact by design and includes blueprint/provider identifiers, catalog titles, variant counts, and summarized color/size support.
+
 ## Template schema
 
 `product_templates.json` expects a top-level array of templates with required keys:
