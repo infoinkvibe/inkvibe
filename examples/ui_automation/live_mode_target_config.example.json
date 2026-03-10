@@ -1,0 +1,12 @@
+{
+  "checklist_csv": "./exports/shopify_personalization_setup_checklist.csv",
+  "queue_csv": "./exports/launch_queue.csv",
+  "setup_packet_dir": "./exports/setup_packets",
+  "output_dir": "./exports/ui_automation",
+  "listing_slug": ["ocean-bloom-text-tee"],
+  "dry_run": false,
+  "screenshot_only": false,
+  "headless": false,
+  "pause_per_product": true,
+  "generate_shopify_theme_checklist": true
+}

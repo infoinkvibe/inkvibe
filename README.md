@@ -395,3 +395,47 @@ Run metadata-backed artwork in dry-run mode:
 ```bash
 python printify_shopify_sync_pipeline.py --dry-run --force --template-key mug_11oz --max-artworks 3
 ```
+
+## Phase 8: Printify UI automation helper
+
+Use `printify_ui_automation.py` for semi-automated Printify Product Creator actions driven by setup packets/checklists.
+
+Key behaviors:
+- Requires explicit targeting (`--listing-slug`, `--row-id`, or `--synced-manual-only`).
+- Reads `shopify_personalization_setup_checklist.csv`, queue CSV metadata, and setup packet JSON files.
+- Supports `--dry-run` and `--screenshot-only` safety modes.
+- Captures before/after screenshots, action logs, and a `ui_automation_report.(json|csv)` containing:
+  - `ui_automation_status`
+  - `ui_automation_last_run_at`
+  - `ui_automation_last_result`
+  - `ui_automation_screenshot_paths`
+- Stops with diagnostics if required selectors cannot be found.
+- Optionally generates a one-time Shopify checklist with `--generate-shopify-theme-checklist`.
+
+Example dry-run for two synced/manual setup products:
+
+```bash
+python printify_ui_automation.py \
+  --checklist-csv examples/ui_automation/shopify_personalization_setup_checklist.sample.csv \
+  --queue-csv examples/ui_automation/launch_queue.sample.csv \
+  --setup-packet-dir examples/setup_packets \
+  --synced-manual-only \
+  --dry-run \
+  --headless \
+  --output-dir ./exports/ui_automation
+```
+
+Example live-mode single-target run:
+
+```bash
+python printify_ui_automation.py \
+  --checklist-csv ./exports/shopify_personalization_setup_checklist.csv \
+  --queue-csv ./exports/launch_queue.csv \
+  --setup-packet-dir ./exports/setup_packets \
+  --listing-slug ocean-bloom-text-tee \
+  --pause-per-product \
+  --generate-shopify-theme-checklist \
+  --output-dir ./exports/ui_automation
+```
+
+> Live mode requires Playwright (`pip install playwright` and browser install) and an authenticated Printify session context.
