@@ -1,0 +1,7 @@
+{
+  "listing_slug": "ocean-bloom-logo-hoodie",
+  "ui_automation_screenshot_paths": [
+    "exports/ui_automation/artifacts/ocean-bloom-logo-hoodie-before.png",
+    "exports/ui_automation/artifacts/ocean-bloom-logo-hoodie-after.png"
+  ]
+}

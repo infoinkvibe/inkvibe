@@ -1,0 +1,3 @@
+listing_slug,printify_product_id,should_enable_personalization,personalization_toggle_manual_required,printify_personalize_button_required,editable_fields_summary,supports_text_edit,supports_photo_upload,supports_logo_upload,variant_visibility_recommended,sync_details_recommended,row_id,synced_to_shopify,manual_setup_required
+text-only-tee,pid-1001,YES,NO,YES,"name/date text",YES,NO,NO,in_stock_only,"title,description,mockups,colors/sizes/prices/SKUs,tags,shipping profile",row-1,YES,YES
+logo-hoodie,pid-1002,YES,NO,YES,"name + logo upload",YES,NO,YES,in_stock_only,"title,description,mockups,colors/sizes/prices/SKUs,tags,shipping profile",row-2,YES,YES

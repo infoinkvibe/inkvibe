@@ -1,0 +1,12 @@
+{
+  "listing_slug": "text-only-tee",
+  "printify_product_id": "pid-1001",
+  "printify_product_url": "https://printify.com/app/products/pid-1001",
+  "should_enable_personalization": true,
+  "editable_fields_summary": "name/date text",
+  "supports_text_edit": true,
+  "supports_photo_upload": false,
+  "supports_logo_upload": false,
+  "variant_visibility_recommended": "in_stock_only",
+  "sync_details_recommended": "title,description,mockups,colors/sizes/prices/SKUs,tags,shipping profile"
+}

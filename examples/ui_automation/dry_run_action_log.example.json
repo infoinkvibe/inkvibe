@@ -1,0 +1,16 @@
+[
+  {
+    "ts": "2026-03-10T00:00:00+00:00",
+    "action": "open_product",
+    "url": "https://printify.com/app/products/pid-1001"
+  },
+  {
+    "ts": "2026-03-10T00:00:02+00:00",
+    "action": "dry_run_detect_personalization",
+    "expected": true
+  },
+  {
+    "ts": "2026-03-10T00:00:03+00:00",
+    "action": "dry_run_find_publish_panel"
+  }
+]

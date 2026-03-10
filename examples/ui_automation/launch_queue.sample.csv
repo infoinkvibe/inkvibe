@@ -1,0 +1,3 @@
+listing_slug,row_id,synced_to_shopify,manual_setup_required,printify_product_id,printify_product_url
+text-only-tee,row-1,YES,YES,pid-1001,https://printify.com/app/products/pid-1001
+logo-hoodie,row-2,YES,YES,pid-1002,https://printify.com/app/products/pid-1002
