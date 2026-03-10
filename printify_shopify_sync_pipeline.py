@@ -119,6 +119,24 @@ class ProductTemplate:
     publish_variants: bool = True
     publish_tags: bool = True
     default_price: str = DEFAULT_PRICE_FALLBACK
+    base_price: Optional[str] = None
+    markup_type: str = "fixed"
+    markup_value: str = "0"
+    rounding_mode: str = "none"
+    compare_at_price: Optional[str] = None
+    seo_keywords: List[str] = field(default_factory=list)
+    audience: Optional[str] = None
+    product_type_label: Optional[str] = None
+    style_keywords: List[str] = field(default_factory=list)
+
+
+@dataclass
+class RunSummary:
+    artworks_scanned: int = 0
+    templates_processed: int = 0
+    products_created: int = 0
+    products_skipped: int = 0
+    failures: int = 0
 
 
 @dataclass
@@ -220,22 +238,38 @@ def build_generic_description_html(artwork_title: str) -> str:
     )
 
 
-def render_product_title(template: ProductTemplate, artwork: Artwork) -> str:
+def build_seo_context(template: ProductTemplate, artwork: Artwork) -> Dict[str, str]:
     display_title = choose_artwork_display_title(artwork)
-    return template.title_pattern.format(artwork_title=display_title, clean_artwork_title=display_title).strip()
+    seo_keywords = ", ".join(template.seo_keywords[:8])
+    style_keywords = ", ".join(template.style_keywords[:6])
+    audience = (template.audience or "").strip()
+    product_type = (template.product_type_label or template.shopify_product_type or "Product").strip()
+    return {
+        "artwork_title": display_title,
+        "clean_artwork_title": display_title,
+        "seo_keywords": seo_keywords,
+        "audience": audience,
+        "product_type_label": product_type,
+        "style_keywords": style_keywords,
+    }
+
+
+def render_product_title(template: ProductTemplate, artwork: Artwork) -> str:
+    context = build_seo_context(template, artwork)
+    return template.title_pattern.format(**context).strip()
 
 
 def render_product_description(template: ProductTemplate, artwork: Artwork) -> str:
-    display_title = choose_artwork_display_title(artwork)
-    generated = build_generic_description_html(display_title)
+    context = build_seo_context(template, artwork)
+    generated = build_generic_description_html(context["artwork_title"])
     pattern = (template.description_pattern or "").strip()
 
     if not pattern or pattern in {"{artwork_title}", "<p>{artwork_title}</p>"}:
-        return generated
+        audience_line = f"<p>Designed for {context['audience']} who love {context['style_keywords']}.</p>" if context["audience"] and context["style_keywords"] else ""
+        return f"{generated}{audience_line}".strip()
 
     return template.description_pattern.format(
-        artwork_title=display_title,
-        clean_artwork_title=display_title,
+        **context,
         generated_description=generated,
     ).strip()
 
@@ -292,6 +326,64 @@ def normalize_printify_price(value: Any) -> int:
     minor_units = decimal_value * Decimal("100")
     normalized = minor_units.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
     return int(normalized)
+
+def _decimal_from_value(value: Any, *, default: str = "0") -> Decimal:
+    if value is None:
+        value = default
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (int, float)):
+        return Decimal(str(value))
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return Decimal(default)
+        return Decimal(stripped)
+    raise ValueError(f"Unsupported decimal value type: {type(value).__name__}")
+
+
+def apply_rounding_mode(price_minor: int, rounding_mode: str) -> int:
+    if rounding_mode == "none":
+        return max(0, price_minor)
+    if rounding_mode == "whole_dollar":
+        return max(0, int((Decimal(price_minor) / Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * 100))
+    if rounding_mode == "x_99":
+        dollars = int((price_minor + 99) // 100)
+        return max(99, dollars * 100 - 1)
+    raise ValueError(f"Unsupported rounding_mode '{rounding_mode}'")
+
+
+def compute_sale_price_minor(template: ProductTemplate, variant: Dict[str, Any]) -> int:
+    base_source = template.base_price if template.base_price is not None else variant.get("price")
+    if base_source is None:
+        base_source = variant.get("cost")
+    if base_source is None:
+        base_source = variant.get("price_cents")
+    if base_source is None:
+        base_source = template.default_price
+
+    if isinstance(base_source, int):
+        base_minor = base_source
+    else:
+        base_minor = normalize_printify_price(base_source)
+
+    markup_value = _decimal_from_value(template.markup_value)
+    if template.markup_type == "percent":
+        final_minor = Decimal(base_minor) * (Decimal("1") + (markup_value / Decimal("100")))
+        final_minor_int = int(final_minor.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    else:
+        markup_minor = int((markup_value * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        final_minor_int = base_minor + markup_minor
+
+    return apply_rounding_mode(final_minor_int, template.rounding_mode)
+
+
+def compute_compare_at_price_minor(template: ProductTemplate, sale_price_minor: int) -> Optional[int]:
+    if template.compare_at_price is None:
+        return None
+    compare_minor = normalize_printify_price(template.compare_at_price)
+    return compare_minor if compare_minor > sale_price_minor else None
+
 
 
 def file_fingerprint(path: pathlib.Path) -> str:
@@ -800,6 +892,10 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
         for field_name in ["placement_name", "width_px", "height_px"]:
             if field_name not in placement:
                 raise TemplateValidationError(f"Template[{index}] placement[{pidx}] missing '{field_name}'")
+    if row.get("markup_type", "fixed") not in {"fixed", "percent"}:
+        raise TemplateValidationError(f"Template[{index}] markup_type must be fixed|percent")
+    if row.get("rounding_mode", "none") not in {"none", "whole_dollar", "x_99"}:
+        raise TemplateValidationError(f"Template[{index}] rounding_mode must be none|whole_dollar|x_99")
 
 
 def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
@@ -839,6 +935,15 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
                 publish_variants=bool(row.get("publish_variants", True)),
                 publish_tags=bool(row.get("publish_tags", True)),
                 default_price=str(row.get("default_price", DEFAULT_PRICE_FALLBACK)),
+                base_price=str(row["base_price"]) if "base_price" in row else None,
+                markup_type=str(row.get("markup_type", "fixed")),
+                markup_value=str(row.get("markup_value", "0")),
+                rounding_mode=str(row.get("rounding_mode", "none")),
+                compare_at_price=str(row["compare_at_price"]) if "compare_at_price" in row and row.get("compare_at_price") is not None else None,
+                seo_keywords=[str(v) for v in row.get("seo_keywords", [])],
+                audience=str(row.get("audience", "")).strip() or None,
+                product_type_label=str(row.get("product_type_label", "")).strip() or None,
+                style_keywords=[str(v) for v in row.get("style_keywords", [])],
                 placements=[PlacementRequirement(**p) for p in row.get("placements", [])],
             )
         )
@@ -897,23 +1002,20 @@ def normalize_catalog_variants_response(raw_variants: Any) -> List[Dict[str, Any
 def build_printify_product_payload(artwork: Artwork, template: ProductTemplate, variant_rows: List[Dict[str, Any]], upload_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     title = render_product_title(template, artwork)
     description_html = render_product_description(template, artwork)
-    tags = list(dict.fromkeys(DEFAULT_TAGS + artwork.tags + template.tags))
+    seo_tags = [*template.seo_keywords[:6], *template.style_keywords[:4]]
+    tags = list(dict.fromkeys(DEFAULT_TAGS + artwork.tags + template.tags + seo_tags))
 
     variants_payload: List[Dict[str, Any]] = []
     enabled_variant_ids: List[int] = []
     for variant in variant_rows:
         variant_id = int(variant["id"])
         enabled_variant_ids.append(variant_id)
-        raw_price = variant.get("price")
-        if raw_price is None:
-            raw_price = variant.get("cost")
-        if raw_price is None:
-            raw_price = variant.get("price_cents")
-        if raw_price is None:
-            raw_price = template.default_price
-
-        normalized_price = normalize_printify_price(raw_price)
-        variants_payload.append({"id": variant_id, "price": normalized_price, "is_enabled": True})
+        normalized_price = compute_sale_price_minor(template, variant)
+        variant_payload = {"id": variant_id, "price": normalized_price, "is_enabled": True}
+        compare_at_price = compute_compare_at_price_minor(template, normalized_price)
+        if compare_at_price is not None:
+            variant_payload["compare_at_price"] = compare_at_price
+        variants_payload.append(variant_payload)
 
     if variants_payload:
         logger.debug("Printify variants sample (normalized): %s", variants_payload[0])
@@ -1102,30 +1204,50 @@ def create_in_printify(printify: PrintifyClient, shop_id: int, artwork: Artwork,
     return result
 
 
-def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config]) -> None:
+def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], summary: Optional[RunSummary] = None) -> None:
     processed = state.setdefault("processed", {})
     existing = processed.get(artwork.slug, {})
-    if existing.get("completed") and not force:
+    existing_products = existing.get("products", []) if isinstance(existing.get("products", []), list) else []
+    completed_template_keys = {
+        row.get("template")
+        for row in existing_products
+        if isinstance(row, dict) and isinstance(row.get("result"), dict) and "error" not in row.get("result", {})
+    }
+
+    if existing.get("completed") and not force and len(completed_template_keys) >= len(templates):
         logger.info("Skipping already processed artwork: %s", artwork.slug)
+        if summary is not None:
+            summary.products_skipped += len(templates)
         return
 
     logger.info("Processing artwork: %s", artwork.src_path.name)
     record: Dict[str, Any] = {
-        "products": [],
+        "products": existing_products if (existing_products and not force) else [],
         "completed": False,
         "last_run": datetime.now(timezone.utc).isoformat(),
     }
 
     all_templates_successful = True
     for template in templates:
+        if not force and template.key in completed_template_keys:
+            logger.info("Skipping completed artwork/template combo: %s/%s", artwork.slug, template.key)
+            if summary is not None:
+                summary.products_skipped += 1
+            continue
+
+        if summary is not None:
+            summary.templates_processed += 1
+
         upload_map: Dict[str, Dict[str, Any]] = {}
         try:
             catalog_variants = printify.list_variants(template.printify_blueprint_id, template.printify_print_provider_id)
             variant_rows = choose_variants_from_catalog(catalog_variants, template)
             if not variant_rows:
                 all_templates_successful = False
+                if summary is not None:
+                    summary.products_skipped += 1
                 result = {"status": "no_matching_variants"}
-                record["products"].append({"template": template.key, "result": result})
+                record["products"].append({"template": template.key, "state_key": f"{artwork.slug}:{template.key}", "result": result})
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, upload_map=upload_map)
                 continue
 
@@ -1140,9 +1262,12 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
 
             if skipped_placements:
                 all_templates_successful = False
+                if summary is not None:
+                    summary.products_skipped += 1
                 result = {"status": "skipped_undersized", "placements": skipped_placements}
                 record["products"].append({
                     "template": template.key,
+                    "state_key": f"{artwork.slug}:{template.key}",
                     "result": result,
                 })
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, upload_map=upload_map)
@@ -1157,16 +1282,21 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
 
             record["products"].append({
                 "template": template.key,
+                "state_key": f"{artwork.slug}:{template.key}",
                 "blueprint_id": template.printify_blueprint_id,
                 "print_provider_id": template.printify_print_provider_id,
                 "result": result,
             })
+            if summary is not None:
+                summary.products_created += 1
             log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=True, result=result, upload_map=upload_map)
         except Exception as exc:
             all_templates_successful = False
+            if summary is not None:
+                summary.failures += 1
             logger.exception("Sync failed for artwork=%s template=%s", artwork.slug, template.key)
             error_result = {"error": str(exc)}
-            record["products"].append({"template": template.key, "result": error_result})
+            record["products"].append({"template": template.key, "state_key": f"{artwork.slug}:{template.key}", "result": error_result})
             log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": error_result}, upload_map=upload_map)
         save_json_atomic(state_path, state)
         logger.info("State persisted after template processing state_path=%s", state_path)
@@ -1226,17 +1356,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-level", default="INFO", help="Logging level: DEBUG/INFO/WARNING/ERROR")
     parser.add_argument("--skip-audit", action="store_true", help="Skip Printify catalog/shop preflight audit")
     parser.add_argument("--max-artworks", type=int, default=0, help="Limit number of discovered artworks (0 = no limit)")
+    parser.add_argument("--template-key", action="append", default=[], help="Only process matching template key(s); can be repeated")
+    parser.add_argument("--limit-templates", type=int, default=0, help="Limit number of templates after filtering (0 = no limit)")
+    parser.add_argument("--list-templates", action="store_true", help="List templates from config and exit")
     parser.add_argument("--upload-strategy", choices=["auto", "direct", "r2_url"], default="auto", help="Asset upload strategy: auto (default), direct, or r2_url")
+    parser.epilog = "Examples:\n  python printify_shopify_sync_pipeline.py --dry-run --template-key tshirt_gildan --template-key mug_11oz\n  python printify_shopify_sync_pipeline.py --list-templates --templates ./product_templates.json"
     return parser.parse_args()
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, upload_strategy: str = "auto") -> None:
+
+def select_templates(
+    templates: List[ProductTemplate],
+    *,
+    template_keys: Optional[List[str]] = None,
+    limit_templates: int = 0,
+) -> List[ProductTemplate]:
+    selected = templates
+    if template_keys:
+        wanted = {key.strip() for key in template_keys if key.strip()}
+        selected = [template for template in templates if template.key in wanted]
+    if limit_templates > 0:
+        selected = selected[:limit_templates]
+    return selected
+
+
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False) -> None:
     if not PRINTIFY_API_TOKEN:
         raise RuntimeError("Missing PRINTIFY_API_TOKEN")
     if not image_dir.exists():
         raise RuntimeError(f"Missing image directory: {image_dir}")
 
     templates = load_templates(config_path)
+    if list_templates:
+        for template in templates:
+            print(f"{template.key}	blueprint={template.printify_blueprint_id}	provider={template.printify_print_provider_id}")
+        return
+    templates = select_templates(templates, template_keys=template_keys, limit_templates=limit_templates)
     artworks = discover_artworks(image_dir)
     if max_artworks > 0:
         artworks = artworks[:max_artworks]
@@ -1251,6 +1406,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         audit_printify_integration(printify, templates, shop_id)
 
     logger.info("Loaded %s template(s) and %s artwork file(s)", len(templates), len(artworks))
+    summary = RunSummary(artworks_scanned=len(artworks))
     artwork_options = ArtworkProcessingOptions(allow_upscale=allow_upscale, upscale_method=upscale_method, skip_undersized=skip_undersized)
     for artwork in artworks:
         process_artwork(
@@ -1266,9 +1422,18 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             artwork_options=artwork_options,
             upload_strategy=upload_strategy,
             r2_config=r2_config,
+            summary=summary,
         )
 
     save_json_atomic(state_path, state)
+    logger.info(
+        "Run summary artworks_scanned=%s templates_processed=%s products_created=%s products_skipped=%s failures=%s",
+        summary.artworks_scanned,
+        summary.templates_processed,
+        summary.products_created,
+        summary.products_skipped,
+        summary.failures,
+    )
     logger.info("Done")
 
 
@@ -1288,4 +1453,7 @@ if __name__ == "__main__":
         skip_audit=args.skip_audit,
         max_artworks=args.max_artworks,
         upload_strategy=args.upload_strategy,
+        template_keys=args.template_key,
+        limit_templates=args.limit_templates,
+        list_templates=args.list_templates,
     )
