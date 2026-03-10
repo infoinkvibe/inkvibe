@@ -142,6 +142,9 @@ python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --update-o
 
 # Rebuild mode: create fresh product and replace active state references on next run
 python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --rebuild-product
+
+# Auto-rebuild mode: attempt update first, rebuild only on compatibility failures
+python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --auto-rebuild-on-incompatible-update
 ```
 
 Per-template logs now include action (`create/update/rebuild/skip`), product id, provider id, and blueprint id. Run summary now includes created/updated/rebuilt/skipped totals.
@@ -247,8 +250,12 @@ Also review `state.json` for updated `processed` and `uploads` records for the l
 
 ## Troubleshooting
 
+- Duplicate title wording (for example, `Signature T-Shirt T-Shirt`) is now de-duplicated automatically when rendered title context already semantically includes the product label (`tee/shirt`, `mug/cup` families).
 - Templates using `printify_blueprint_id` 6 must use a valid `printify_print_provider_id` (for example, `99` for Printify Choice).
 - Printify variant responses can arrive as either a raw list or a `{"variants": [...]}` wrapper; the pipeline normalizes both, but malformed shapes now raise a clear error that includes the top-level type/keys.
+- If update calls fail with a payload consistency error (for example, missing `print_areas[*].variant_ids` coverage), InkVibeAuto now validates locally before API calls and reports missing ids directly.
+- If update preflight detects incompatibility (blueprint/provider/variant/print-area position mismatch), default behavior is conservative: fail with a recommendation to rerun using `--rebuild-product`.
+- Use `--auto-rebuild-on-incompatible-update` only when you explicitly want automatic delete/recreate behavior after failed compatibility checks.
 
 ## Backward compatibility
 
@@ -285,6 +292,7 @@ Publish controls:
 - `--publish`: force publish after create/update/rebuild.
 - `--skip-publish`: skip publish after create/update/rebuild.
 - `--verify-publish`: read product back and log concise verification warnings/success signals.
+- `--auto-rebuild-on-incompatible-update`: on update-only incompatibility, automatically switch to rebuild (delete+recreate) for that product.
 
 State helpers:
 - `--list-state-keys`: list tracked `artwork_slug:template_key` keys.

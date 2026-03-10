@@ -227,6 +227,42 @@ def filename_slug_to_title(value: str) -> str:
     return " ".join(chosen).title().strip()
 
 
+
+
+def _semantic_product_tokens(value: str) -> set[str]:
+    normalized = re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+    words = [w for w in normalized.split() if w]
+    tokens: set[str] = set()
+    for word in words:
+        if word in {"tee", "tees", "tshirt", "tshirts", "shirt", "shirts", "t", "ts"}:
+            tokens.add("shirt")
+            continue
+        if word in {"mug", "mugs", "cup", "cups"}:
+            tokens.add("mug")
+            continue
+        tokens.add(word)
+    return tokens
+
+
+def title_semantically_includes_product_label(cleaned_title: str, product_label: str) -> bool:
+    title_tokens = _semantic_product_tokens(cleaned_title)
+    label_tokens = _semantic_product_tokens(product_label)
+    if not title_tokens or not label_tokens:
+        return False
+    return label_tokens.issubset(title_tokens)
+
+
+def _dedupe_rendered_title(title: str) -> str:
+    title = re.sub(r"\s+", " ", title).strip()
+    patterns = [
+        (r"\b(t-?shirt)\s+\1\b", r"\1"),
+        (r"\b(tee)\s+\1\b", r"\1"),
+        (r"\b(mug)\s+\1\b", r"\1"),
+    ]
+    for pattern, repl in patterns:
+        title = re.sub(pattern, repl, title, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", title).strip()
+
 def _split_keywords(value: Any) -> List[str]:
     if isinstance(value, list):
         rows = value
@@ -538,7 +574,12 @@ def build_seo_context(template: ProductTemplate, artwork: Artwork) -> Dict[str, 
 
 def render_product_title(template: ProductTemplate, artwork: Artwork) -> str:
     context = build_seo_context(template, artwork)
-    return template.title_pattern.format(**context).strip()
+    product_label = context.get("product_type_label", "")
+    if product_label and title_semantically_includes_product_label(context.get("artwork_title", ""), product_label):
+        context = dict(context)
+        context["product_type_label"] = ""
+    rendered = template.title_pattern.format(**context).strip()
+    return _dedupe_rendered_title(rendered)
 
 
 def _render_listing_tags(template: ProductTemplate, artwork: Artwork) -> List[str]:
@@ -1423,6 +1464,71 @@ def build_printify_product_payload(artwork: Artwork, template: ProductTemplate, 
     }
 
 
+
+
+def validate_printify_payload_consistency(payload: Dict[str, Any]) -> Dict[str, Any]:
+    variants = payload.get("variants", []) if isinstance(payload, dict) else []
+    print_areas = payload.get("print_areas", []) if isinstance(payload, dict) else []
+    enabled_variant_ids = {int(v.get("id")) for v in variants if isinstance(v, dict) and v.get("is_enabled", True) and "id" in v}
+
+    area_variant_ids: set[int] = set()
+    for area in print_areas if isinstance(print_areas, list) else []:
+        if not isinstance(area, dict):
+            continue
+        for vid in area.get("variant_ids", []) or []:
+            try:
+                area_variant_ids.add(int(vid))
+            except Exception:
+                continue
+
+    missing_variant_ids = sorted(enabled_variant_ids - area_variant_ids)
+    is_consistent = len(missing_variant_ids) == 0 and bool(enabled_variant_ids)
+    if not is_consistent:
+        raise ValueError(
+            "Inconsistent Printify payload: enabled variants are missing from print_areas.variant_ids "
+            f"missing={missing_variant_ids} enabled_count={len(enabled_variant_ids)} print_area_variant_count={len(area_variant_ids)}"
+        )
+
+    return {
+        "enabled_variant_ids": sorted(enabled_variant_ids),
+        "print_area_variant_ids": sorted(area_variant_ids),
+        "missing_variant_ids": missing_variant_ids,
+        "enabled_variant_count": len(enabled_variant_ids),
+        "print_area_variant_count": len(area_variant_ids),
+    }
+
+
+def assess_update_compatibility(existing_product: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    existing_blueprint = int(existing_product.get("blueprint_id") or 0)
+    existing_provider = int(existing_product.get("print_provider_id") or 0)
+    payload_blueprint = int(payload.get("blueprint_id") or 0)
+    payload_provider = int(payload.get("print_provider_id") or 0)
+
+    existing_enabled = {int(v.get("id")) for v in existing_product.get("variants", []) if isinstance(v, dict) and v.get("is_enabled", True) and "id" in v}
+    payload_enabled = {int(v.get("id")) for v in payload.get("variants", []) if isinstance(v, dict) and v.get("is_enabled", True) and "id" in v}
+
+    existing_positions = {str(ph.get("position")) for area in existing_product.get("print_areas", []) if isinstance(area, dict) for ph in (area.get("placeholders", []) or []) if isinstance(ph, dict) and ph.get("position")}
+    payload_positions = {str(ph.get("position")) for area in payload.get("print_areas", []) if isinstance(area, dict) for ph in (area.get("placeholders", []) or []) if isinstance(ph, dict) and ph.get("position")}
+
+    issues: List[str] = []
+    if existing_blueprint and payload_blueprint and existing_blueprint != payload_blueprint:
+        issues.append(f"blueprint mismatch existing={existing_blueprint} payload={payload_blueprint}")
+    if existing_provider and payload_provider and existing_provider != payload_provider:
+        issues.append(f"provider mismatch existing={existing_provider} payload={payload_provider}")
+    missing_in_existing = sorted(payload_enabled - existing_enabled)
+    if missing_in_existing:
+        issues.append(f"existing product missing variant ids={missing_in_existing}")
+    if payload_positions and not payload_positions.issubset(existing_positions):
+        issues.append(f"print area position mismatch payload={sorted(payload_positions)} existing={sorted(existing_positions)}")
+
+    return {
+        "compatible": len(issues) == 0,
+        "issues": issues,
+        "missing_variant_ids": missing_in_existing,
+        "existing_blueprint_id": existing_blueprint,
+        "existing_print_provider_id": existing_provider,
+    }
+
 def preview_listing_copy(*, artworks: List[Artwork], templates: List[ProductTemplate]) -> None:
     for artwork in artworks:
         for template in templates:
@@ -1668,8 +1774,10 @@ def upsert_in_printify(
     action: str,
     publish_mode: str,
     verify_publish: bool,
+    auto_rebuild_on_incompatible_update: bool = False,
 ) -> Dict[str, Any]:
     payload = build_printify_product_payload(artwork, template, variant_rows, upload_map)
+    payload_stats = validate_printify_payload_consistency(payload)
     logger.info("Mockup/image publish behavior template=%s publish_images=%s publish_mockups_override=%s", template.key, template.publish_images, template.publish_mockups)
 
     if action == "skip":
@@ -1686,12 +1794,46 @@ def upsert_in_printify(
         product_id = str(created.get("id") or created.get("data", {}).get("id") or "")
         result: Dict[str, Any] = {"action": "create", "printify_product_id": product_id, "created": created}
     elif action == "update":
-        try:
-            updated = printify.update_product(shop_id, existing_product_id, payload)
-        except DryRunMutationSkipped:
-            return {"status": "dry-run", "action": "update", "payload_preview": payload, "printify_product_id": existing_product_id}
-        result = {"action": "update", "printify_product_id": existing_product_id, "updated": updated}
-        product_id = existing_product_id
+        existing_product = printify.get_product(shop_id, existing_product_id)
+        compatibility = assess_update_compatibility(existing_product, payload)
+        logger.info(
+            "Update preflight product_id=%s action=%s enabled_variant_count=%s print_area_variant_count=%s",
+            existing_product_id,
+            action,
+            payload_stats["enabled_variant_count"],
+            payload_stats["print_area_variant_count"],
+        )
+        if not compatibility["compatible"]:
+            logger.warning(
+                "Update compatibility failed product_id=%s issues=%s suggested_action=%s",
+                existing_product_id,
+                "; ".join(compatibility["issues"]),
+                "--rebuild-product" if not auto_rebuild_on_incompatible_update else "auto-rebuild",
+            )
+            if not auto_rebuild_on_incompatible_update:
+                raise RuntimeError(
+                    "Incompatible update payload for existing Printify product. "
+                    f"issues={compatibility['issues']}. Use --rebuild-product or --auto-rebuild-on-incompatible-update"
+                )
+            action = "rebuild"
+
+        if action == "update":
+            try:
+                updated = printify.update_product(shop_id, existing_product_id, payload)
+            except DryRunMutationSkipped:
+                return {"status": "dry-run", "action": "update", "payload_preview": payload, "printify_product_id": existing_product_id}
+            result = {"action": "update", "printify_product_id": existing_product_id, "updated": updated}
+            product_id = existing_product_id
+        else:
+            try:
+                printify.delete_product(shop_id, existing_product_id)
+            except DryRunMutationSkipped:
+                return {"status": "dry-run", "action": "rebuild", "payload_preview": payload, "printify_product_id": existing_product_id}
+            except Exception:
+                logger.warning("Delete existing product failed during rebuild product_id=%s", existing_product_id)
+            created = printify.create_product(shop_id, payload)
+            product_id = str(created.get("id") or created.get("data", {}).get("id") or "")
+            result = {"action": "rebuild", "previous_product_id": existing_product_id, "printify_product_id": product_id, "created": created}
     elif action == "rebuild":
         if existing_product_id:
             try:
@@ -1742,7 +1884,7 @@ def upsert_in_printify(
     return result
 
 
-def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, summary: Optional[RunSummary] = None) -> None:
+def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, summary: Optional[RunSummary] = None) -> None:
     processed = state.setdefault("processed", {})
     existing = processed.get(artwork.slug, {})
     existing_products = existing.get("products", []) if isinstance(existing.get("products", []), list) else []
@@ -1858,6 +2000,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 action=action,
                 publish_mode=publish_mode,
                 verify_publish=verify_publish,
+                auto_rebuild_on_incompatible_update=auto_rebuild_on_incompatible_update,
             ) if (template.push_via_printify and shop_id is not None) else {"status": "prepared_only", "action": action, "publish_attempted": False, "publish_verified": False}
             if template.publish_to_shopify and shopify is not None:
                 result["shopify"] = create_in_shopify_only(shopify, artwork, template, variant_rows)
@@ -1997,6 +2140,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--create-only", action="store_true", help="Only create products; skip when state already has a product id")
     parser.add_argument("--update-only", action="store_true", help="Only update products; skip when no product id exists in state")
     parser.add_argument("--rebuild-product", action="store_true", help="Delete+recreate products when state already has a product id")
+    parser.add_argument("--auto-rebuild-on-incompatible-update", action="store_true", help="Automatically rebuild when update preflight detects blueprint/provider/variant incompatibility")
     parser.add_argument("--publish", action="store_true", help="Force publish after create/update/rebuild")
     parser.add_argument("--skip-publish", action="store_true", help="Skip publish after create/update/rebuild")
     parser.add_argument("--verify-publish", action="store_true", help="Read back created/updated product and verify basic storefront indicators")
@@ -2202,7 +2346,7 @@ def run_catalog_cli(
     return False
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, preview_listing_copy_only: bool = False) -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, preview_listing_copy_only: bool = False) -> None:
     if publish_mode not in {"default", "publish", "skip"}:
         raise RuntimeError(f"Unsupported publish mode: {publish_mode}")
 
@@ -2289,6 +2433,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             rebuild_product=rebuild_product,
             publish_mode=publish_mode,
             verify_publish=verify_publish,
+            auto_rebuild_on_incompatible_update=auto_rebuild_on_incompatible_update,
             summary=summary,
         )
 
@@ -2355,6 +2500,7 @@ if __name__ == "__main__":
             rebuild_product=args.rebuild_product,
             publish_mode=publish_mode,
             verify_publish=args.verify_publish,
+            auto_rebuild_on_incompatible_update=args.auto_rebuild_on_incompatible_update,
             inspect_state_key_value=args.inspect_state_key,
             list_state_keys_only=args.list_state_keys,
             preview_listing_copy_only=args.preview_listing_copy,

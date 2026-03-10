@@ -57,6 +57,9 @@ from printify_shopify_sync_pipeline import (
     resolve_artwork_title,
     _render_listing_tags,
     preview_listing_copy,
+    title_semantically_includes_product_label,
+    validate_printify_payload_consistency,
+    assess_update_compatibility,
 )
 
 
@@ -349,6 +352,52 @@ def test_render_title_uses_clean_fallback(tmp_path: Path):
     template.title_pattern = "{artwork_title} Tee"
     assert render_product_title(template, art) == "Groovy Cat Print Tee"
 
+def test_title_dedup_for_shirt_wording(tmp_path: Path):
+    src = tmp_path / "signature_t-shirt.png"
+    Image.new("RGBA", (1000, 1000), (255, 0, 0, 255)).save(src)
+    art = Artwork(
+        slug="signature",
+        src_path=src,
+        title="Signature T-Shirt",
+        description_html="",
+        tags=[],
+        image_width=1000,
+        image_height=1000,
+        metadata={"title": "Signature T-Shirt"},
+    )
+    template = _template_for_variant_tests()
+    template.product_type_label = "T-Shirt"
+    template.title_pattern = "{artwork_title} {product_type_label}"
+    assert render_product_title(template, art) == "Signature T-Shirt"
+
+
+def test_title_dedup_for_mug_wording(tmp_path: Path):
+    src = tmp_path / "cozy_mug.png"
+    Image.new("RGBA", (1000, 1000), (255, 0, 0, 255)).save(src)
+    art = Artwork(
+        slug="cozy",
+        src_path=src,
+        title="Cozy Mug",
+        description_html="",
+        tags=[],
+        image_width=1000,
+        image_height=1000,
+    )
+    template = _template_for_variant_tests()
+    template.product_type_label = "Mug"
+    template.title_pattern = "{artwork_title} {product_type_label}"
+    assert render_product_title(template, art) == "Cozy Mug"
+
+
+def test_metadata_title_pattern_semantic_dedup(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    art.metadata = {"title": "Signature Tee"}
+    template = _template_for_variant_tests()
+    template.product_type_label = "T-Shirt"
+    template.title_pattern = "{artwork_title} {product_type_label}"
+    assert title_semantically_includes_product_label("Signature Tee", "T-Shirt") is True
+    assert render_product_title(template, art) == "Signature Tee"
+
 
 def test_sidecar_metadata_loading(tmp_path: Path):
     sidecar = tmp_path / "piece.json"
@@ -615,10 +664,46 @@ def test_resolve_product_action_modes():
     assert resolve_product_action(existing_product_id="", create_only=False, update_only=True, rebuild_product=False) == "skip"
     assert resolve_product_action(existing_product_id="p1", create_only=False, update_only=False, rebuild_product=True) == "rebuild"
 
+def test_payload_consistency_validation_detects_missing_variant_ids():
+    payload = {
+        "variants": [{"id": 1, "is_enabled": True}, {"id": 2, "is_enabled": True}],
+        "print_areas": [{"variant_ids": [1], "placeholders": []}],
+    }
+    with pytest.raises(ValueError, match=r"missing=\[2\]"):
+        validate_printify_payload_consistency(payload)
+
+
+def test_update_compatibility_logic_detects_provider_and_variant_mismatch():
+    existing = {
+        "blueprint_id": 6,
+        "print_provider_id": 99,
+        "variants": [{"id": 1, "is_enabled": True}],
+        "print_areas": [{"placeholders": [{"position": "front"}]}],
+    }
+    payload = {
+        "blueprint_id": 6,
+        "print_provider_id": 12,
+        "variants": [{"id": 1, "is_enabled": True}, {"id": 2, "is_enabled": True}],
+        "print_areas": [{"variant_ids": [1, 2], "placeholders": [{"position": "front"}, {"position": "back"}]}],
+    }
+    decision = assess_update_compatibility(existing, payload)
+    assert decision["compatible"] is False
+    assert any("provider mismatch" in issue for issue in decision["issues"])
+    assert any("missing variant ids=[2]" in issue for issue in decision["issues"])
+
 
 def test_process_artwork_updates_existing_product_by_default(tmp_path: Path):
     class UpdateCapablePrintify(DummyPrintify):
         dry_run = False
+
+        def get_product(self, shop_id, product_id):
+            return {
+                "id": product_id,
+                "blueprint_id": 1,
+                "print_provider_id": 1,
+                "variants": [{"id": 1, "is_enabled": True}],
+                "print_areas": [{"placeholders": [{"position": "front"}]}],
+            }
 
         def update_product(self, shop_id, product_id, payload):
             return {"id": product_id, "status": "updated"}
@@ -897,3 +982,105 @@ def test_publish_skipped_but_verify_counts_warning(tmp_path: Path):
     assert row["publish_attempted"] is False
     assert row["publish_verified"] is False
     assert summary.verification_warnings == 1
+
+
+def test_process_artwork_incompatible_update_suggests_rebuild(tmp_path: Path):
+    class IncompatibleUpdatePrintify(DummyPrintify):
+        dry_run = False
+
+        def get_product(self, shop_id, product_id):
+            return {
+                "id": product_id,
+                "blueprint_id": 1,
+                "print_provider_id": 1,
+                "variants": [{"id": 999, "is_enabled": True}],
+                "print_areas": [{"placeholders": [{"position": "front"}]}],
+            }
+
+        def update_product(self, shop_id, product_id, payload):
+            raise AssertionError("should not update when incompatible")
+
+    artwork = _create_artwork(tmp_path, 1200, 1200)
+    template = ProductTemplate(
+        key="tee",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_colors=["Black"],
+        enabled_sizes=["M"],
+        publish_after_create=False,
+        placements=[PlacementRequirement("front", 1000, 1000)],
+    )
+    state = ensure_state_shape({"processed": {"art": {"products": [{"template": "tee", "state_key": "art:tee", "result": {"printify": {"printify_product_id": "existing-1"}}}]}}})
+    process_artwork(
+        printify=IncompatibleUpdatePrintify(),
+        shopify=None,
+        shop_id=111,
+        artwork=artwork,
+        templates=[template],
+        state=state,
+        force=False,
+        export_dir=tmp_path / "exports",
+        state_path=tmp_path / "state.json",
+        artwork_options=ArtworkProcessingOptions(),
+        upload_strategy="auto",
+        r2_config=None,
+    )
+    latest = state["processed"]["art"]["products"][-1]["result"]
+    assert "--rebuild-product" in latest["error"]
+
+
+def test_process_artwork_auto_rebuild_on_incompatible_update(tmp_path: Path):
+    class AutoRebuildPrintify(DummyPrintify):
+        dry_run = False
+
+        def get_product(self, shop_id, product_id):
+            return {
+                "id": product_id,
+                "blueprint_id": 1,
+                "print_provider_id": 1,
+                "variants": [{"id": 999, "is_enabled": True}],
+                "print_areas": [{"placeholders": [{"position": "front"}]}],
+            }
+
+        def update_product(self, shop_id, product_id, payload):
+            raise AssertionError("should rebuild, not update")
+
+        def delete_product(self, shop_id, product_id):
+            return {"deleted": True}
+
+        def create_product(self, shop_id, payload):
+            return {"id": "recreated-1"}
+
+    artwork = _create_artwork(tmp_path, 1200, 1200)
+    template = ProductTemplate(
+        key="tee",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_colors=["Black"],
+        enabled_sizes=["M"],
+        publish_after_create=False,
+        placements=[PlacementRequirement("front", 1000, 1000)],
+    )
+    state = ensure_state_shape({"processed": {"art": {"products": [{"template": "tee", "state_key": "art:tee", "result": {"printify": {"printify_product_id": "existing-1"}}}]}}})
+    process_artwork(
+        printify=AutoRebuildPrintify(),
+        shopify=None,
+        shop_id=111,
+        artwork=artwork,
+        templates=[template],
+        state=state,
+        force=False,
+        export_dir=tmp_path / "exports",
+        state_path=tmp_path / "state.json",
+        artwork_options=ArtworkProcessingOptions(),
+        upload_strategy="auto",
+        r2_config=None,
+        auto_rebuild_on_incompatible_update=True,
+    )
+    latest = state["processed"]["art"]["products"][-1]["result"]["printify"]
+    assert latest["action"] == "rebuild"
+    assert latest["printify_product_id"] == "recreated-1"
