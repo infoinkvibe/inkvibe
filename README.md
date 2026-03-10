@@ -313,3 +313,47 @@ Safer bulk rollout workflow:
 3. Confirm state + verification fields in `state.json`.
 4. Run a small batch (`--max-artworks 5`) and review summary counters.
 5. Run full batch after warnings are understood.
+
+## Artwork sidecar metadata (optional)
+
+InkVibeAuto now supports optional per-artwork sidecar metadata files that sit beside image files:
+
+```text
+images/my-design.png
+images/my-design.json
+```
+
+Supported sidecar JSON fields:
+- `title`
+- `subtitle`
+- `description`
+- `tags`
+- `seo_keywords`
+- `audience`
+- `style_keywords`
+- `theme`
+- `collection`
+- `color_story`
+- `occasion`
+- `artist_note`
+
+Behavior:
+- If sidecar metadata exists, listing copy prefers metadata values.
+- If metadata is missing, filename-based behavior remains in place.
+- Low-quality filename stems (UUID/hash/noisy strings) now trigger safer fallback titles.
+
+Example sidecar files:
+- `examples/tee-artwork.sidecar.example.json`
+- `examples/mug-artwork.sidecar.example.json`
+
+Preview listing copy without creating/updating products:
+
+```bash
+python printify_shopify_sync_pipeline.py --preview-listing-copy --template-key tshirt_gildan --max-artworks 5
+```
+
+Run metadata-backed artwork in dry-run mode:
+
+```bash
+python printify_shopify_sync_pipeline.py --dry-run --force --template-key mug_11oz --max-artworks 3
+```
