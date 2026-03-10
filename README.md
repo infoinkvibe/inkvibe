@@ -297,6 +297,19 @@ Publish controls:
 State helpers:
 - `--list-state-keys`: list tracked `artwork_slug:template_key` keys.
 - `--inspect-state-key <artwork_slug:template_key>`: show the matching state entry as JSON.
+- `--list-failures`: concise list of failed combinations needing attention.
+- `--list-pending`: concise list of combinations not yet successful.
+
+Bulk safety controls:
+- `--max-artworks <n>`: cap input artwork files scanned in this run.
+- `--batch-size <n>`: cap processed artwork/template combinations in this run.
+- `--stop-after-failures <n>`: stop when N failures are reached.
+- `--fail-fast`: stop on first failure.
+- `--resume`: skip combinations already successful in state and continue pending rows.
+
+Reporting exports:
+- `--export-failure-report <path>`: CSV report for failed combinations.
+- `--export-run-report <path>`: CSV report for all processed combinations (success/failure/skipped).
 
 Examples:
 
@@ -313,14 +326,31 @@ python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --publish 
 # Inspect state entries
 python printify_shopify_sync_pipeline.py --list-state-keys
 python printify_shopify_sync_pipeline.py --inspect-state-key cool-cat:tshirt_gildan
+
+# Batch-size examples
+python printify_shopify_sync_pipeline.py --batch-size 10 --resume
+python printify_shopify_sync_pipeline.py --max-artworks 5 --batch-size 20
+
+# Failure controls
+python printify_shopify_sync_pipeline.py --fail-fast
+python printify_shopify_sync_pipeline.py --stop-after-failures 3
+
+# Reporting exports
+python printify_shopify_sync_pipeline.py --export-failure-report reports/failures.csv
+python printify_shopify_sync_pipeline.py --export-run-report reports/run.csv
+
+# Pending/failure inspection
+python printify_shopify_sync_pipeline.py --list-failures
+python printify_shopify_sync_pipeline.py --list-pending
 ```
 
 Safer bulk rollout workflow:
 1. Dry run first (`--dry-run`) to validate templates/placements.
 2. Real run for one artwork (`--max-artworks 1 --publish --verify-publish`).
 3. Confirm state + verification fields in `state.json`.
-4. Run a small batch (`--max-artworks 5`) and review summary counters.
-5. Run full batch after warnings are understood.
+4. Run a small real batch (`--batch-size 5 --resume --export-failure-report reports/failures.csv`).
+5. Review failures (`--list-failures`) and fix templates/artwork/provider issues.
+6. Resume (`--resume`) until `--list-pending` is empty, then run the full rollout.
 
 ## Artwork sidecar metadata (optional)
 
