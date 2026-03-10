@@ -101,9 +101,54 @@ python printify_shopify_sync_pipeline.py --recommend-provider --blueprint-id 6 -
 
 # Generate starter snippet JSON for product_templates.json
 python printify_shopify_sync_pipeline.py --generate-template-snippet --blueprint-id 6 --provider-id 99 --key tshirt_new
+
+# Write snippet to a file for direct editing
+python printify_shopify_sync_pipeline.py --generate-template-snippet --blueprint-id 6 --provider-id 99 --key tshirt_new --template-output-file ./snippet.json
 ```
 
 Output is compact by design and includes blueprint/provider identifiers, catalog titles, variant counts, and summarized color/size support.
+
+
+## Product update/rebuild workflows
+
+By default, InkVibeAuto checks `state.json` for each `artwork_slug:template_key` pair:
+- if a Printify product id exists, it updates that product,
+- if no id exists, it creates a new product.
+
+```bash
+# Default behavior: update existing products when state has ids
+python printify_shopify_sync_pipeline.py --template-key tshirt_gildan
+
+# Create-only mode: skip rows that already have a product id
+python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --create-only
+
+# Update-only mode: skip rows with no existing product id in state
+python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --update-only
+
+# Rebuild mode: create fresh product and replace active state references on next run
+python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --rebuild-product
+```
+
+Per-template logs now include action (`create/update/rebuild/skip`), product id, provider id, and blueprint id. Run summary now includes created/updated/rebuilt/skipped totals.
+
+## Example: add a new mug or hoodie template from scratch
+
+```bash
+# 1) Find blueprint candidates
+python printify_shopify_sync_pipeline.py --list-blueprints --search-blueprints mug --limit-blueprints 10
+
+# 2) Rank providers for chosen blueprint
+python printify_shopify_sync_pipeline.py --recommend-provider --blueprint-id <blueprint_id>
+
+# 3) Inspect variants/placements for top provider
+python printify_shopify_sync_pipeline.py --inspect-variants --blueprint-id <blueprint_id> --provider-id <provider_id>
+
+# 4) Bootstrap snippet and paste into product_templates.json
+python printify_shopify_sync_pipeline.py --generate-template-snippet --blueprint-id <blueprint_id> --provider-id <provider_id> --key mug_new --template-output-file ./mug_template.json
+
+# 5) Test with one artwork in dry-run
+python printify_shopify_sync_pipeline.py --dry-run --template-key mug_new --max-artworks 1
+```
 
 ## Template schema
 

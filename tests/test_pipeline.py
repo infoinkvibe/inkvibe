@@ -40,6 +40,7 @@ from printify_shopify_sync_pipeline import (
     score_provider_for_template,
     generate_template_snippet,
     build_seo_context,
+    resolve_product_action,
     normalize_catalog_variants_response,
     prepare_artwork_export,
     process_artwork,
@@ -515,3 +516,71 @@ def test_generate_template_snippet_contains_detected_values():
     assert snippet["printify_print_provider_id"] == 7
     assert snippet["enabled_colors"] == ["Black", "White"]
     assert snippet["enabled_sizes"] == ["L", "M"]
+    assert snippet["base_price"] == "24.99"
+    assert snippet["markup_type"] == "fixed"
+    assert snippet["rounding_mode"] == "x_99"
+    assert "audience" in snippet
+
+
+def test_resolve_product_action_modes():
+    assert resolve_product_action(existing_product_id="", create_only=False, update_only=False, rebuild_product=False) == "create"
+    assert resolve_product_action(existing_product_id="p1", create_only=False, update_only=False, rebuild_product=False) == "update"
+    assert resolve_product_action(existing_product_id="p1", create_only=True, update_only=False, rebuild_product=False) == "skip"
+    assert resolve_product_action(existing_product_id="", create_only=False, update_only=True, rebuild_product=False) == "skip"
+    assert resolve_product_action(existing_product_id="p1", create_only=False, update_only=False, rebuild_product=True) == "rebuild"
+
+
+def test_process_artwork_updates_existing_product_by_default(tmp_path: Path):
+    class UpdateCapablePrintify(DummyPrintify):
+        dry_run = False
+
+        def update_product(self, shop_id, product_id, payload):
+            return {"id": product_id, "status": "updated"}
+
+        def create_product(self, shop_id, payload):
+            raise AssertionError("should not create")
+
+        def publish_product(self, shop_id, product_id, payload):
+            return {"status": "published"}
+
+    artwork = _create_artwork(tmp_path, 1200, 1200)
+    template = ProductTemplate(
+        key="tee",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_colors=["Black"],
+        enabled_sizes=["M"],
+        placements=[PlacementRequirement("front", 1000, 1000)],
+    )
+    state = ensure_state_shape({
+        "processed": {
+            "art": {
+                "products": [
+                    {
+                        "template": "tee",
+                        "state_key": "art:tee",
+                        "result": {"printify": {"printify_product_id": "existing-1"}},
+                    }
+                ]
+            }
+        }
+    })
+    process_artwork(
+        printify=UpdateCapablePrintify(),
+        shopify=None,
+        shop_id=111,
+        artwork=artwork,
+        templates=[template],
+        state=state,
+        force=False,
+        export_dir=tmp_path / "exports",
+        state_path=tmp_path / "state.json",
+        artwork_options=ArtworkProcessingOptions(),
+        upload_strategy="auto",
+        r2_config=None,
+    )
+    latest = state["processed"]["art"]["products"][-1]["result"]["printify"]
+    assert latest["action"] == "update"
+    assert latest["printify_product_id"] == "existing-1"

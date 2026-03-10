@@ -137,6 +137,8 @@ class RunSummary:
     artworks_scanned: int = 0
     templates_processed: int = 0
     products_created: int = 0
+    products_updated: int = 0
+    products_rebuilt: int = 0
     products_skipped: int = 0
     failures: int = 0
 
@@ -340,13 +342,14 @@ def generate_template_snippet(
     variants: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     summary = summarize_variant_options(variants)
-    placements = summary["placements"] or ["front"]
+    placements = (summary["placements"] or ["front"])[:3]
     placement_rows = [
         {
             "placement_name": placement,
             "width_px": 4500,
             "height_px": 5400,
             "file_type": "png",
+            "allow_upscale": False,
         }
         for placement in placements
     ]
@@ -356,11 +359,17 @@ def generate_template_snippet(
         "printify_print_provider_id": provider_id,
         "title_pattern": "{artwork_title}",
         "description_pattern": "<p>{artwork_title}</p>",
-        "enabled_colors": summary["colors"],
-        "enabled_sizes": summary["sizes"],
+        "enabled_colors": summary["colors"][:12],
+        "enabled_sizes": summary["sizes"][:8],
         "placements": placement_rows,
-        "default_price": DEFAULT_TEMPLATE_PRICE,
+        "base_price": "24.99",
+        "markup_type": "fixed",
+        "markup_value": "5.00",
+        "rounding_mode": "x_99",
         "seo_keywords": ["replace-me-keyword-1", "replace-me-keyword-2"],
+        "audience": "",
+        "product_type_label": "",
+        "style_keywords": ["minimal", "giftable"],
     }
 
 
@@ -645,6 +654,9 @@ class BaseApiClient:
     def put(self, path: str, payload: Dict[str, Any]) -> Any:
         return self._request("PUT", path, payload=payload, mutating=True)
 
+    def delete(self, path: str) -> Any:
+        return self._request("DELETE", path, expected_statuses=(200, 202, 204), mutating=True)
+
 
 class PrintifyClient(BaseApiClient):
     def __init__(self, api_token: str, dry_run: bool = False):
@@ -693,6 +705,12 @@ class PrintifyClient(BaseApiClient):
 
     def create_product(self, shop_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
         return self.post(f"/shops/{shop_id}/products.json", payload)
+
+    def update_product(self, shop_id: int, product_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self.put(f"/shops/{shop_id}/products/{product_id}.json", payload)
+
+    def delete_product(self, shop_id: int, product_id: str) -> Dict[str, Any]:
+        return self.delete(f"/shops/{shop_id}/products/{product_id}.json")
 
     def publish_product(self, shop_id: int, product_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return self.post(f"/shops/{shop_id}/products/{product_id}/publish.json", payload)
@@ -1218,17 +1236,20 @@ def summarize_upload_strategy(upload_map: Dict[str, Dict[str, Any]]) -> str:
     return "+".join(strategies) if strategies else "none"
 
 
-def log_template_summary(*, artwork_slug: str, template_key: str, success: bool, result: Dict[str, Any], upload_map: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
+def log_template_summary(*, artwork_slug: str, template_key: str, success: bool, result: Dict[str, Any], blueprint_id: int = 0, provider_id: int = 0, action: str = "skip", upload_map: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
     printify_result = result.get("printify", {}) if isinstance(result, dict) else {}
     product_id = printify_result.get("printify_product_id") or "n/a"
     upload_strategy = summarize_upload_strategy(upload_map or {})
     status = "success" if success else "failure"
     logger.info(
-        "Template summary artwork=%s template=%s status=%s product_id=%s upload_strategy=%s",
+        "Template summary artwork=%s template=%s status=%s action=%s product_id=%s provider_id=%s blueprint_id=%s upload_strategy=%s",
         artwork_slug,
         template_key,
         status,
+        action,
         product_id,
+        provider_id or "n/a",
+        blueprint_id or "n/a",
         upload_strategy,
     )
 
@@ -1323,17 +1344,67 @@ def upload_assets_to_printify(
     return uploaded
 
 
-def create_in_printify(printify: PrintifyClient, shop_id: int, artwork: Artwork, template: ProductTemplate, variant_rows: List[Dict[str, Any]], upload_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+def resolve_product_action(*, existing_product_id: str, create_only: bool, update_only: bool, rebuild_product: bool) -> str:
+    if rebuild_product:
+        return "rebuild"
+    if create_only and update_only:
+        raise RuntimeError("--create-only and --update-only cannot be used together")
+    if create_only:
+        return "skip" if existing_product_id else "create"
+    if update_only:
+        return "update" if existing_product_id else "skip"
+    return "update" if existing_product_id else "create"
+
+
+def upsert_in_printify(
+    *,
+    printify: PrintifyClient,
+    shop_id: int,
+    artwork: Artwork,
+    template: ProductTemplate,
+    variant_rows: List[Dict[str, Any]],
+    upload_map: Dict[str, Dict[str, Any]],
+    existing_product_id: str,
+    action: str,
+) -> Dict[str, Any]:
     payload = build_printify_product_payload(artwork, template, variant_rows, upload_map)
     logger.info("Mockup/image publish behavior template=%s publish_images=%s publish_mockups_override=%s", template.key, template.publish_images, template.publish_mockups)
-    try:
-        created = printify.create_product(shop_id, payload)
-    except DryRunMutationSkipped:
-        return {"status": "dry-run", "payload_preview": payload}
 
-    product_id = str(created.get("id") or created.get("data", {}).get("id") or "")
-    result: Dict[str, Any] = {"printify_product_id": product_id, "created": created}
-    logger.info("Printify product created product_id=%s title=%s enabled_variants=%s", product_id, payload.get("title", ""), len(payload.get("variants", [])))
+    if action == "skip":
+        return {"status": "skipped", "action": "skip", "printify_product_id": existing_product_id or ""}
+
+    if action == "update" and not existing_product_id:
+        raise RuntimeError("Cannot update product because no existing product_id was found")
+
+    if action == "create":
+        try:
+            created = printify.create_product(shop_id, payload)
+        except DryRunMutationSkipped:
+            return {"status": "dry-run", "action": "create", "payload_preview": payload}
+        product_id = str(created.get("id") or created.get("data", {}).get("id") or "")
+        result: Dict[str, Any] = {"action": "create", "printify_product_id": product_id, "created": created}
+    elif action == "update":
+        try:
+            updated = printify.update_product(shop_id, existing_product_id, payload)
+        except DryRunMutationSkipped:
+            return {"status": "dry-run", "action": "update", "payload_preview": payload, "printify_product_id": existing_product_id}
+        result = {"action": "update", "printify_product_id": existing_product_id, "updated": updated}
+        product_id = existing_product_id
+    elif action == "rebuild":
+        if existing_product_id:
+            try:
+                printify.delete_product(shop_id, existing_product_id)
+            except DryRunMutationSkipped:
+                return {"status": "dry-run", "action": "rebuild", "payload_preview": payload, "printify_product_id": existing_product_id}
+            except Exception:
+                logger.warning("Delete existing product failed during rebuild product_id=%s", existing_product_id)
+        created = printify.create_product(shop_id, payload)
+        product_id = str(created.get("id") or created.get("data", {}).get("id") or "")
+        result = {"action": "rebuild", "previous_product_id": existing_product_id, "printify_product_id": product_id, "created": created}
+    else:
+        raise RuntimeError(f"Unsupported action: {action}")
+
+    logger.info("Printify product action=%s product_id=%s title=%s enabled_variants=%s", action, product_id, payload.get("title", ""), len(payload.get("variants", [])))
     if template.publish_after_create and product_id:
         try:
             result["published"] = printify.publish_product(shop_id, product_id, build_printify_publish_payload(template))
@@ -1343,21 +1414,10 @@ def create_in_printify(printify: PrintifyClient, shop_id: int, artwork: Artwork,
     return result
 
 
-def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], summary: Optional[RunSummary] = None) -> None:
+def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, summary: Optional[RunSummary] = None) -> None:
     processed = state.setdefault("processed", {})
     existing = processed.get(artwork.slug, {})
     existing_products = existing.get("products", []) if isinstance(existing.get("products", []), list) else []
-    completed_template_keys = {
-        row.get("template")
-        for row in existing_products
-        if isinstance(row, dict) and isinstance(row.get("result"), dict) and "error" not in row.get("result", {})
-    }
-
-    if existing.get("completed") and not force and len(completed_template_keys) >= len(templates):
-        logger.info("Skipping already processed artwork: %s", artwork.slug)
-        if summary is not None:
-            summary.products_skipped += len(templates)
-        return
 
     logger.info("Processing artwork: %s", artwork.src_path.name)
     record: Dict[str, Any] = {
@@ -1368,17 +1428,43 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
 
     all_templates_successful = True
     for template in templates:
-        if not force and template.key in completed_template_keys:
-            logger.info("Skipping completed artwork/template combo: %s/%s", artwork.slug, template.key)
-            if summary is not None:
-                summary.products_skipped += 1
-            continue
+        state_key = f"{artwork.slug}:{template.key}"
+        matching_rows = [row for row in record["products"] if isinstance(row, dict) and row.get("state_key") == state_key]
+        existing_product_id = ""
+        for row in reversed(matching_rows):
+            row_result = row.get("result", {}) if isinstance(row.get("result"), dict) else {}
+            printify_row = row_result.get("printify", {}) if isinstance(row_result.get("printify"), dict) else {}
+            candidate = printify_row.get("printify_product_id")
+            if isinstance(candidate, str) and candidate.strip() and row_result.get("error") is None:
+                existing_product_id = candidate.strip()
+                break
+
+        action = resolve_product_action(
+            existing_product_id=existing_product_id,
+            create_only=create_only,
+            update_only=update_only,
+            rebuild_product=rebuild_product,
+        )
 
         if summary is not None:
             summary.templates_processed += 1
 
         upload_map: Dict[str, Dict[str, Any]] = {}
         try:
+            if action == "skip":
+                result = {"printify": {"status": "skipped", "action": "skip", "printify_product_id": existing_product_id}}
+                if summary is not None:
+                    summary.products_skipped += 1
+                record["products"].append({
+                    "template": template.key,
+                    "state_key": state_key,
+                    "blueprint_id": template.printify_blueprint_id,
+                    "print_provider_id": template.printify_print_provider_id,
+                    "result": result,
+                })
+                log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=True, result=result, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
+                continue
+
             catalog_variants = printify.list_variants(template.printify_blueprint_id, template.printify_print_provider_id)
             variant_rows = choose_variants_from_catalog(catalog_variants, template)
             if not variant_rows:
@@ -1386,8 +1472,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 if summary is not None:
                     summary.products_skipped += 1
                 result = {"status": "no_matching_variants"}
-                record["products"].append({"template": template.key, "state_key": f"{artwork.slug}:{template.key}", "result": result})
-                log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, upload_map=upload_map)
+                record["products"].append({"template": template.key, "state_key": state_key, "result": result})
+                log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
             prepared_assets: List[PreparedArtwork] = []
@@ -1406,37 +1492,54 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 result = {"status": "skipped_undersized", "placements": skipped_placements}
                 record["products"].append({
                     "template": template.key,
-                    "state_key": f"{artwork.slug}:{template.key}",
+                    "state_key": state_key,
                     "result": result,
                 })
-                log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, upload_map=upload_map)
+                log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
             upload_map = upload_assets_to_printify(printify, state, artwork, template, prepared_assets, state_path, upload_strategy, r2_config)
 
             result: Dict[str, Any] = {}
-            result["printify"] = create_in_printify(printify, shop_id, artwork, template, variant_rows, upload_map) if (template.push_via_printify and shop_id is not None) else {"status": "prepared_only"}
+            result["printify"] = upsert_in_printify(
+                printify=printify,
+                shop_id=shop_id,
+                artwork=artwork,
+                template=template,
+                variant_rows=variant_rows,
+                upload_map=upload_map,
+                existing_product_id=existing_product_id,
+                action=action,
+            ) if (template.push_via_printify and shop_id is not None) else {"status": "prepared_only", "action": action}
             if template.publish_to_shopify and shopify is not None:
                 result["shopify"] = create_in_shopify_only(shopify, artwork, template, variant_rows)
 
             record["products"].append({
                 "template": template.key,
-                "state_key": f"{artwork.slug}:{template.key}",
+                "state_key": state_key,
                 "blueprint_id": template.printify_blueprint_id,
                 "print_provider_id": template.printify_print_provider_id,
                 "result": result,
             })
             if summary is not None:
-                summary.products_created += 1
-            log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=True, result=result, upload_map=upload_map)
+                printify_action = (result.get("printify", {}) or {}).get("action", action)
+                if printify_action == "create":
+                    summary.products_created += 1
+                elif printify_action == "update":
+                    summary.products_updated += 1
+                elif printify_action == "rebuild":
+                    summary.products_rebuilt += 1
+                elif printify_action == "skip":
+                    summary.products_skipped += 1
+            log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=True, result=result, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action=(result.get("printify", {}) or {}).get("action", action), upload_map=upload_map)
         except Exception as exc:
             all_templates_successful = False
             if summary is not None:
                 summary.failures += 1
             logger.exception("Sync failed for artwork=%s template=%s", artwork.slug, template.key)
             error_result = {"error": str(exc)}
-            record["products"].append({"template": template.key, "state_key": f"{artwork.slug}:{template.key}", "result": error_result})
-            log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": error_result}, upload_map=upload_map)
+            record["products"].append({"template": template.key, "state_key": state_key, "result": error_result})
+            log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": error_result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action=action, upload_map=upload_map)
         save_json_atomic(state_path, state)
         logger.info("State persisted after template processing state_path=%s", state_path)
         time.sleep(0.25)
@@ -1510,7 +1613,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recommend-provider", action="store_true", help="Recommend a provider for the blueprint")
     parser.add_argument("--generate-template-snippet", action="store_true", help="Generate a starter template snippet JSON")
     parser.add_argument("--template-file", default="", help="Optional template JSON path for recommendation context")
-    parser.add_argument("--key", default="", help="Template key used for snippet generation")
+    parser.add_argument("--template-output-file", default="", help="Optional file path to write generated template snippet JSON")
+    parser.add_argument("--key", default="", help="Template key used for snippet generation or provider recommendation context")
+    parser.add_argument("--create-only", action="store_true", help="Only create products; skip when state already has a product id")
+    parser.add_argument("--update-only", action="store_true", help="Only update products; skip when no product id exists in state")
+    parser.add_argument("--rebuild-product", action="store_true", help="Delete+recreate products when state already has a product id")
     parser.epilog = (
         "Examples:\n"
         "  python printify_shopify_sync_pipeline.py --dry-run --template-key tshirt_gildan --template-key mug_11oz\n"
@@ -1560,6 +1667,7 @@ def run_catalog_cli(
     template_file: str,
     generate_template_snippet_flag: bool,
     snippet_key: str,
+    template_output_file: str,
 ) -> bool:
     if not any([list_blueprints, bool(search_query), list_providers, inspect_variants, recommend_provider, generate_template_snippet_flag]):
         return False
@@ -1582,17 +1690,19 @@ def run_catalog_cli(
         providers = printify.list_print_providers(blueprint_id)
         scored_rows: List[Dict[str, Any]] = []
         template = None
-        if recommend_provider:
+        if recommend_provider and snippet_key:
             template_path = pathlib.Path(template_file) if template_file else config_path
-            template = _find_template_by_key(template_path, snippet_key) if snippet_key else None
+            template = _find_template_by_key(template_path, snippet_key)
+
         for provider in providers:
             variants = printify.list_variants(blueprint_id, int(provider.get("id", 0)))
             score = score_provider_for_template(provider, variants, template=template)
             scored_rows.append(score)
 
         scored_rows.sort(key=lambda row: row["score"], reverse=True)
+        rows = scored_rows[:limit_providers] if limit_providers > 0 else scored_rows
+
         if list_providers:
-            rows = scored_rows[:limit_providers] if limit_providers > 0 else scored_rows
             for row in rows:
                 print(
                     f"provider_id={row['provider_id']}	title={row['provider_title']}	variants={row['variant_count']}	colors={','.join(row['colors'][:6]) or '-'}	sizes={','.join(row['sizes'][:6]) or '-'}"
@@ -1600,12 +1710,16 @@ def run_catalog_cli(
             return True
 
         if recommend_provider:
-            if not scored_rows:
+            if not rows:
                 print("No providers found")
                 return True
-            top = scored_rows[0]
+            for row in rows:
+                print(
+                    f"provider_id={row['provider_id']}	title={row['provider_title']}	score={row['score']}	matching_colors={row['matching_color_count']}	matching_sizes={row['matching_size_count']}	matching_variants={row['matching_variant_count']}	placements={','.join(row['placements'][:5]) or '-'}"
+                )
+            top = rows[0]
             print(
-                f"recommended_provider_id={top['provider_id']}	title={top['provider_title']}	score={top['score']}	reason=colors:{top['matching_color_count']} sizes:{top['matching_size_count']} variants:{top['matching_variant_count']} placements:{top['placement_match_count']}"
+                f"Top provider rationale: provider_id={top['provider_id']} chosen for highest score ({top['score']}) with colors={top['matching_color_count']}, sizes={top['matching_size_count']}, variants={top['matching_variant_count']}, placements={top['placement_match_count']}."
             )
             return True
 
@@ -1624,13 +1738,17 @@ def run_catalog_cli(
         if generate_template_snippet_flag:
             key = snippet_key or f"blueprint_{blueprint_id}_provider_{provider_id}"
             snippet = generate_template_snippet(key=key, blueprint_id=blueprint_id, provider_id=provider_id, variants=variants)
-            print(json.dumps(snippet, indent=2))
+            rendered = json.dumps(snippet, indent=2)
+            if template_output_file:
+                pathlib.Path(template_output_file).write_text(rendered + "\n", encoding="utf-8")
+            else:
+                print(rendered)
             return True
 
     return False
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, snippet_key: str = "") -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False) -> None:
     if not PRINTIFY_API_TOKEN:
         raise RuntimeError("Missing PRINTIFY_API_TOKEN")
     if not image_dir.exists():
@@ -1664,6 +1782,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         template_file=template_file,
         generate_template_snippet_flag=generate_template_snippet_flag,
         snippet_key=snippet_key,
+        template_output_file=template_output_file,
     ):
         return
 
@@ -1691,15 +1810,20 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             artwork_options=artwork_options,
             upload_strategy=upload_strategy,
             r2_config=r2_config,
+            create_only=create_only,
+            update_only=update_only,
+            rebuild_product=rebuild_product,
             summary=summary,
         )
 
     save_json_atomic(state_path, state)
     logger.info(
-        "Run summary artworks_scanned=%s templates_processed=%s products_created=%s products_skipped=%s failures=%s",
+        "Run summary artworks_scanned=%s templates_processed=%s products_created=%s products_updated=%s products_rebuilt=%s products_skipped=%s failures=%s",
         summary.artworks_scanned,
         summary.templates_processed,
         summary.products_created,
+        summary.products_updated,
+        summary.products_rebuilt,
         summary.products_skipped,
         summary.failures,
     )
@@ -1737,4 +1861,8 @@ if __name__ == "__main__":
         template_file=args.template_file,
         generate_template_snippet_flag=args.generate_template_snippet,
         snippet_key=args.key,
+        template_output_file=args.template_output_file,
+        create_only=args.create_only,
+        update_only=args.update_only,
+        rebuild_product=args.rebuild_product,
     )
