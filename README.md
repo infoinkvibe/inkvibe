@@ -270,3 +270,46 @@ Use `--upload-strategy auto|direct|r2_url` (default: `auto`).
 - State tracking now records `state_key` as `artwork_slug:template_key` for clearer artwork/template idempotency behavior.
 - Final logs include a concise run summary: artworks scanned, templates processed, products created, skipped, failures.
 
+
+## Product lifecycle and publish verification
+
+InkVibeAuto lifecycle for each `artwork_slug:template_key` pair:
+- `create`: no previous product id found in state.
+- `update`: existing product id found in state.
+- `rebuild`: delete and recreate when `--rebuild-product` is used.
+- `publish`: optional post-create/update publish step.
+- `verify`: optional post-action readback check of product id/title/variants/print areas and storefront indicators.
+
+Publish controls:
+- default behavior stays backward compatible (`template.publish_after_create` controls publish).
+- `--publish`: force publish after create/update/rebuild.
+- `--skip-publish`: skip publish after create/update/rebuild.
+- `--verify-publish`: read product back and log concise verification warnings/success signals.
+
+State helpers:
+- `--list-state-keys`: list tracked `artwork_slug:template_key` keys.
+- `--inspect-state-key <artwork_slug:template_key>`: show the matching state entry as JSON.
+
+Examples:
+
+```bash
+# Create/update without publish
+python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --skip-publish
+
+# Create/update and force publish
+python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --publish
+
+# Create/update + publish + verification readback
+python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --publish --verify-publish
+
+# Inspect state entries
+python printify_shopify_sync_pipeline.py --list-state-keys
+python printify_shopify_sync_pipeline.py --inspect-state-key cool-cat:tshirt_gildan
+```
+
+Safer bulk rollout workflow:
+1. Dry run first (`--dry-run`) to validate templates/placements.
+2. Real run for one artwork (`--max-artworks 1 --publish --verify-publish`).
+3. Confirm state + verification fields in `state.json`.
+4. Run a small batch (`--max-artworks 5`) and review summary counters.
+5. Run full batch after warnings are understood.

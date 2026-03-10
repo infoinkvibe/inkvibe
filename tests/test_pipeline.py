@@ -49,6 +49,9 @@ from printify_shopify_sync_pipeline import (
     NonRetryableRequestError,
     CatalogCliUsageError,
     run_catalog_cli,
+    RunSummary,
+    list_state_keys,
+    inspect_state_key,
 )
 
 
@@ -692,3 +695,125 @@ def test_catalog_cli_auto_provider_selects_best(tmp_path: Path, capsys):
     assert done is True
     assert "Auto-selected provider_id=1" in captured
     assert "provider_id=1" in captured
+
+
+def test_state_shape_backward_compatible_with_new_fields():
+    state = ensure_state_shape({"processed": {"art": {"products": [{"state_key": "art:tee"}]}}})
+    assert "processed" in state
+    assert list_state_keys(state) == ["art:tee"]
+
+
+def test_inspect_state_helpers():
+    state = ensure_state_shape({
+        "processed": {
+            "a": {"products": [{"state_key": "a:t1", "result": {"ok": True}}]},
+            "b": {"products": [{"state_key": "b:t2", "result": {"ok": True}}]},
+        }
+    })
+    keys = list_state_keys(state)
+    assert keys == ["a:t1", "b:t2"]
+    assert inspect_state_key(state, "a:t1")["state_key"] == "a:t1"
+    assert inspect_state_key(state, "missing") is None
+
+
+def test_publish_verify_decision_logic(tmp_path: Path):
+    class PublishVerifyPrintify(DummyPrintify):
+        dry_run = False
+
+        def create_product(self, shop_id, payload):
+            return {"id": "p-new"}
+
+        def publish_product(self, shop_id, product_id, payload):
+            return {"status": "published"}
+
+        def get_product(self, shop_id, product_id):
+            return {
+                "id": product_id,
+                "title": "Art",
+                "variants": [{"id": 1, "is_enabled": True}],
+                "print_areas": [{"variant_ids": [1], "placeholders": []}],
+                "images": [{"src": "https://example.test/mock.png"}],
+                "visible": True,
+            }
+
+    artwork = _create_artwork(tmp_path, 1200, 1200)
+    template = ProductTemplate(
+        key="tee",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_colors=["Black"],
+        enabled_sizes=["M"],
+        placements=[PlacementRequirement("front", 1000, 1000)],
+    )
+    state = ensure_state_shape({})
+    summary = RunSummary()
+    process_artwork(
+        printify=PublishVerifyPrintify(),
+        shopify=None,
+        shop_id=111,
+        artwork=artwork,
+        templates=[template],
+        state=state,
+        force=True,
+        export_dir=tmp_path / "exports",
+        state_path=tmp_path / "state.json",
+        artwork_options=ArtworkProcessingOptions(),
+        upload_strategy="auto",
+        r2_config=None,
+        publish_mode="publish",
+        verify_publish=True,
+        summary=summary,
+    )
+    row = state["processed"]["art"]["products"][-1]
+    assert row["publish_attempted"] is True
+    assert row["publish_verified"] is True
+    assert summary.publish_attempts == 1
+    assert summary.publish_verified == 1
+
+
+def test_publish_skipped_but_verify_counts_warning(tmp_path: Path):
+    class VerifyWarnPrintify(DummyPrintify):
+        dry_run = False
+
+        def create_product(self, shop_id, payload):
+            return {"id": "p-new"}
+
+        def get_product(self, shop_id, product_id):
+            return {"id": product_id, "title": "Different", "variants": [], "print_areas": []}
+
+    artwork = _create_artwork(tmp_path, 1200, 1200)
+    template = ProductTemplate(
+        key="tee",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_colors=["Black"],
+        enabled_sizes=["M"],
+        placements=[PlacementRequirement("front", 1000, 1000)],
+    )
+    state = ensure_state_shape({})
+    summary = RunSummary()
+    process_artwork(
+        printify=VerifyWarnPrintify(),
+        shopify=None,
+        shop_id=111,
+        artwork=artwork,
+        templates=[template],
+        state=state,
+        force=True,
+        export_dir=tmp_path / "exports",
+        state_path=tmp_path / "state.json",
+        artwork_options=ArtworkProcessingOptions(),
+        upload_strategy="auto",
+        r2_config=None,
+        publish_mode="skip",
+        verify_publish=True,
+        summary=summary,
+    )
+    row = state["processed"]["art"]["products"][-1]
+    assert row["publish_attempted"] is False
+    assert row["publish_verified"] is False
+    assert summary.verification_warnings == 1

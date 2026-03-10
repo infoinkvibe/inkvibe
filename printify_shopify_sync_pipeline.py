@@ -145,6 +145,9 @@ class RunSummary:
     products_rebuilt: int = 0
     products_skipped: int = 0
     failures: int = 0
+    publish_attempts: int = 0
+    publish_verified: int = 0
+    verification_warnings: int = 0
 
 
 @dataclass
@@ -575,6 +578,32 @@ def ensure_state_shape(state: Dict[str, Any]) -> Dict[str, Any]:
     return state
 
 
+def derive_state_index(state: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    processed = state.get("processed", {}) if isinstance(state, dict) else {}
+    index: Dict[str, Dict[str, Any]] = {}
+    for artwork_record in processed.values():
+        if not isinstance(artwork_record, dict):
+            continue
+        rows = artwork_record.get("products", [])
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            state_key = str(row.get("state_key") or "").strip()
+            if state_key:
+                index[state_key] = row
+    return index
+
+
+def list_state_keys(state: Dict[str, Any]) -> List[str]:
+    return sorted(derive_state_index(state).keys())
+
+
+def inspect_state_key(state: Dict[str, Any], state_key: str) -> Optional[Dict[str, Any]]:
+    return derive_state_index(state).get(state_key)
+
+
 # -----------------------------
 # HTTP clients
 # -----------------------------
@@ -739,6 +768,12 @@ class PrintifyClient(BaseApiClient):
 
     def publish_product(self, shop_id: int, product_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return self.post(f"/shops/{shop_id}/products/{product_id}/publish.json", payload)
+
+    def get_product(self, shop_id: int, product_id: str) -> Dict[str, Any]:
+        return self.get(f"/shops/{shop_id}/products/{product_id}.json")
+
+    def list_products(self, shop_id: int) -> List[Dict[str, Any]]:
+        return self.get(f"/shops/{shop_id}/products.json")
 
 
 # -----------------------------
@@ -1239,6 +1274,66 @@ def build_printify_publish_payload(template: ProductTemplate) -> Dict[str, Any]:
     }
 
 
+def _extract_enabled_variant_count(product: Dict[str, Any]) -> int:
+    variants = product.get("variants", []) if isinstance(product, dict) else []
+    if not isinstance(variants, list):
+        return 0
+    count = 0
+    for variant in variants:
+        if not isinstance(variant, dict):
+            continue
+        if variant.get("is_enabled") is False:
+            continue
+        count += 1
+    return count
+
+
+def verify_printify_product_readback(
+    *,
+    product: Dict[str, Any],
+    expected_product_id: str,
+    expected_title: str,
+) -> Dict[str, Any]:
+    warnings: List[str] = []
+    observed_id = str(product.get("id") or product.get("product_id") or "")
+    if expected_product_id and observed_id and observed_id != expected_product_id:
+        warnings.append(f"id mismatch expected={expected_product_id} observed={observed_id}")
+
+    observed_title = str(product.get("title") or "")
+    if expected_title and observed_title and observed_title != expected_title:
+        warnings.append("title mismatch")
+
+    enabled_variant_count = _extract_enabled_variant_count(product)
+    if enabled_variant_count <= 0:
+        warnings.append("no enabled variants detected")
+
+    print_areas = product.get("print_areas") if isinstance(product, dict) else None
+    if not isinstance(print_areas, list) or not print_areas:
+        warnings.append("print_areas missing")
+
+    images = product.get("images") if isinstance(product, dict) else None
+    if images is None:
+        warnings.append("images field missing")
+
+    storefront_ready = any(bool(product.get(flag)) for flag in ("visible", "is_visible", "is_published", "published"))
+    publish_related = {
+        "visible": product.get("visible"),
+        "is_visible": product.get("is_visible"),
+        "is_published": product.get("is_published"),
+        "published": product.get("published"),
+    }
+
+    return {
+        "ok": len(warnings) == 0,
+        "warnings": warnings,
+        "verified_product_id": observed_id,
+        "verified_title": observed_title,
+        "verified_variant_count": enabled_variant_count,
+        "storefront_ready": storefront_ready,
+        "publish_indicators": publish_related,
+    }
+
+
 # -----------------------------
 # Sync flows
 # -----------------------------
@@ -1391,6 +1486,8 @@ def upsert_in_printify(
     upload_map: Dict[str, Dict[str, Any]],
     existing_product_id: str,
     action: str,
+    publish_mode: str,
+    verify_publish: bool,
 ) -> Dict[str, Any]:
     payload = build_printify_product_payload(artwork, template, variant_rows, upload_map)
     logger.info("Mockup/image publish behavior template=%s publish_images=%s publish_mockups_override=%s", template.key, template.publish_images, template.publish_mockups)
@@ -1430,16 +1527,42 @@ def upsert_in_printify(
         raise RuntimeError(f"Unsupported action: {action}")
 
     logger.info("Printify product action=%s product_id=%s title=%s enabled_variants=%s", action, product_id, payload.get("title", ""), len(payload.get("variants", [])))
-    if template.publish_after_create and product_id:
+    should_publish = (template.publish_after_create if publish_mode == "default" else publish_mode == "publish") and bool(product_id)
+    result["publish_attempted"] = False
+    result["publish_verified"] = False
+
+    if should_publish:
+        result["publish_attempted"] = True
         try:
             result["published"] = printify.publish_product(shop_id, product_id, build_printify_publish_payload(template))
-            logger.info("Printify publish completed product_id=%s result=%s", product_id, result["published"])
+            logger.info("Printify publish completed product_id=%s", product_id)
         except DryRunMutationSkipped:
             result["published"] = {"status": "dry-run"}
+
+    if verify_publish and product_id:
+        try:
+            readback = printify.get_product(shop_id, product_id)
+            verification = verify_printify_product_readback(
+                product=readback,
+                expected_product_id=product_id,
+                expected_title=str(payload.get("title") or ""),
+            )
+            result["verification"] = verification
+            result["verified_product"] = readback
+            if verification.get("ok"):
+                result["publish_verified"] = True
+                logger.info("Printify verification ok product_id=%s variants=%s", product_id, verification.get("verified_variant_count", 0))
+            else:
+                logger.warning("Printify verification warnings product_id=%s warnings=%s", product_id, verification.get("warnings", []))
+                if not result["publish_attempted"]:
+                    logger.info("Verification ran without publish attempt (requested --verify-publish).")
+        except Exception as exc:
+            result["verification"] = {"ok": False, "warnings": [f"readback failed: {exc}"]}
+            logger.warning("Printify verification failed product_id=%s error=%s", product_id, exc)
     return result
 
 
-def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, summary: Optional[RunSummary] = None) -> None:
+def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, summary: Optional[RunSummary] = None) -> None:
     processed = state.setdefault("processed", {})
     existing = processed.get(artwork.slug, {})
     existing_products = existing.get("products", []) if isinstance(existing.get("products", []), list) else []
@@ -1485,6 +1608,12 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     "state_key": state_key,
                     "blueprint_id": template.printify_blueprint_id,
                     "print_provider_id": template.printify_print_provider_id,
+                    "last_action": "skip",
+                    "publish_attempted": False,
+                    "publish_verified": False,
+                    "last_verified_at": None,
+                    "verified_title": None,
+                    "verified_variant_count": None,
                     "result": result,
                 })
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=True, result=result, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
@@ -1518,6 +1647,12 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 record["products"].append({
                     "template": template.key,
                     "state_key": state_key,
+                    "last_action": "skip",
+                    "publish_attempted": False,
+                    "publish_verified": False,
+                    "last_verified_at": None,
+                    "verified_title": None,
+                    "verified_variant_count": None,
                     "result": result,
                 })
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
@@ -1535,17 +1670,29 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 upload_map=upload_map,
                 existing_product_id=existing_product_id,
                 action=action,
-            ) if (template.push_via_printify and shop_id is not None) else {"status": "prepared_only", "action": action}
+                publish_mode=publish_mode,
+                verify_publish=verify_publish,
+            ) if (template.push_via_printify and shop_id is not None) else {"status": "prepared_only", "action": action, "publish_attempted": False, "publish_verified": False}
             if template.publish_to_shopify and shopify is not None:
                 result["shopify"] = create_in_shopify_only(shopify, artwork, template, variant_rows)
 
-            record["products"].append({
+            printify_result = result.get("printify", {}) if isinstance(result.get("printify"), dict) else {}
+            verification = printify_result.get("verification", {}) if isinstance(printify_result.get("verification"), dict) else {}
+            verification_warnings = verification.get("warnings", []) if isinstance(verification.get("warnings", []), list) else []
+            row = {
                 "template": template.key,
                 "state_key": state_key,
                 "blueprint_id": template.printify_blueprint_id,
                 "print_provider_id": template.printify_print_provider_id,
+                "last_action": printify_result.get("action", action),
+                "publish_attempted": bool(printify_result.get("publish_attempted", False)),
+                "publish_verified": bool(printify_result.get("publish_verified", False)),
+                "last_verified_at": datetime.now(timezone.utc).isoformat() if verification else None,
+                "verified_title": verification.get("verified_title"),
+                "verified_variant_count": verification.get("verified_variant_count"),
                 "result": result,
-            })
+            }
+            record["products"].append(row)
             if summary is not None:
                 printify_action = (result.get("printify", {}) or {}).get("action", action)
                 if printify_action == "create":
@@ -1556,6 +1703,12 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     summary.products_rebuilt += 1
                 elif printify_action == "skip":
                     summary.products_skipped += 1
+                if row.get("publish_attempted"):
+                    summary.publish_attempts += 1
+                if row.get("publish_verified"):
+                    summary.publish_verified += 1
+                if verification_warnings:
+                    summary.verification_warnings += 1
             log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=True, result=result, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action=(result.get("printify", {}) or {}).get("action", action), upload_map=upload_map)
         except Exception as exc:
             all_templates_successful = False
@@ -1563,7 +1716,17 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 summary.failures += 1
             logger.exception("Sync failed for artwork=%s template=%s", artwork.slug, template.key)
             error_result = {"error": str(exc)}
-            record["products"].append({"template": template.key, "state_key": state_key, "result": error_result})
+            record["products"].append({
+                "template": template.key,
+                "state_key": state_key,
+                "last_action": action,
+                "publish_attempted": False,
+                "publish_verified": False,
+                "last_verified_at": None,
+                "verified_title": None,
+                "verified_variant_count": None,
+                "result": error_result,
+            })
             log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": error_result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action=action, upload_map=upload_map)
         save_json_atomic(state_path, state)
         logger.info("State persisted after template processing state_path=%s", state_path)
@@ -1644,6 +1807,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--create-only", action="store_true", help="Only create products; skip when state already has a product id")
     parser.add_argument("--update-only", action="store_true", help="Only update products; skip when no product id exists in state")
     parser.add_argument("--rebuild-product", action="store_true", help="Delete+recreate products when state already has a product id")
+    parser.add_argument("--publish", action="store_true", help="Force publish after create/update/rebuild")
+    parser.add_argument("--skip-publish", action="store_true", help="Skip publish after create/update/rebuild")
+    parser.add_argument("--verify-publish", action="store_true", help="Read back created/updated product and verify basic storefront indicators")
+    parser.add_argument("--inspect-state-key", default="", help="Read-only inspect state entry by key (artwork_slug:template_key)")
+    parser.add_argument("--list-state-keys", action="store_true", help="List known state keys from state.json and exit")
     parser.epilog = (
         "Examples:\n"
         "  python printify_shopify_sync_pipeline.py --dry-run --template-key tshirt_gildan --template-key mug_11oz\n"
@@ -1843,7 +2011,23 @@ def run_catalog_cli(
     return False
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False) -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False) -> None:
+    if publish_mode not in {"default", "publish", "skip"}:
+        raise RuntimeError(f"Unsupported publish mode: {publish_mode}")
+
+    state = ensure_state_shape(load_json(state_path, {}))
+    if list_state_keys_only:
+        for key in list_state_keys(state):
+            print(key)
+        return
+    if inspect_state_key_value:
+        row = inspect_state_key(state, inspect_state_key_value)
+        if row is None:
+            print(json.dumps({"state_key": inspect_state_key_value, "found": False}, ensure_ascii=False))
+        else:
+            print(json.dumps(row, indent=2, ensure_ascii=False))
+        return
+
     if not PRINTIFY_API_TOKEN:
         raise RuntimeError("Missing PRINTIFY_API_TOKEN")
     if not image_dir.exists():
@@ -1859,7 +2043,6 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
     if max_artworks > 0:
         artworks = artworks[:max_artworks]
 
-    state = ensure_state_shape(load_json(state_path, {}))
     printify = PrintifyClient(PRINTIFY_API_TOKEN, dry_run=dry_run)
 
     if run_catalog_cli(
@@ -1909,12 +2092,14 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             create_only=create_only,
             update_only=update_only,
             rebuild_product=rebuild_product,
+            publish_mode=publish_mode,
+            verify_publish=verify_publish,
             summary=summary,
         )
 
     save_json_atomic(state_path, state)
     logger.info(
-        "Run summary artworks_scanned=%s templates_processed=%s products_created=%s products_updated=%s products_rebuilt=%s products_skipped=%s failures=%s",
+        "Run summary artworks_scanned=%s templates_processed=%s products_created=%s products_updated=%s products_rebuilt=%s products_skipped=%s failures=%s publish_attempts=%s publish_verified=%s verification_warnings=%s",
         summary.artworks_scanned,
         summary.templates_processed,
         summary.products_created,
@@ -1922,6 +2107,9 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         summary.products_rebuilt,
         summary.products_skipped,
         summary.failures,
+        summary.publish_attempts,
+        summary.publish_verified,
+        summary.verification_warnings,
     )
     logger.info("Done")
 
@@ -1929,6 +2117,13 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
 if __name__ == "__main__":
     args = parse_args()
     configure_logging(args.log_level)
+    publish_mode = "default"
+    if args.publish and args.skip_publish:
+        raise SystemExit("--publish and --skip-publish cannot be used together")
+    if args.publish:
+        publish_mode = "publish"
+    elif args.skip_publish:
+        publish_mode = "skip"
     try:
         run(
             pathlib.Path(args.templates),
@@ -1963,6 +2158,10 @@ if __name__ == "__main__":
             create_only=args.create_only,
             update_only=args.update_only,
             rebuild_product=args.rebuild_product,
+            publish_mode=publish_mode,
+            verify_publish=args.verify_publish,
+            inspect_state_key_value=args.inspect_state_key,
+            list_state_keys_only=args.list_state_keys,
         )
     except CatalogCliUsageError as exc:
         print(f"Catalog CLI error: {exc}")
