@@ -102,11 +102,26 @@ python printify_shopify_sync_pipeline.py --recommend-provider --blueprint-id 6 -
 # Generate starter snippet JSON for product_templates.json
 python printify_shopify_sync_pipeline.py --generate-template-snippet --blueprint-id 6 --provider-id 99 --key tshirt_new
 
+
+# Generate starter snippet JSON with automatic provider selection
+python printify_shopify_sync_pipeline.py --generate-template-snippet --blueprint-id 6 --auto-provider --key tshirt_new
+
 # Write snippet to a file for direct editing
 python printify_shopify_sync_pipeline.py --generate-template-snippet --blueprint-id 6 --provider-id 99 --key tshirt_new --template-output-file ./snippet.json
 ```
 
 Output is compact by design and includes blueprint/provider identifiers, catalog titles, variant counts, and summarized color/size support.
+
+
+## Catalog troubleshooting
+
+- If you see `Provider <id> is not available for blueprint <id>`, the provider/blueprint pair is invalid.
+- List valid providers for a blueprint:
+  - `python printify_shopify_sync_pipeline.py --list-providers --blueprint-id <blueprint_id>`
+- Ask InkVibeAuto to rank providers:
+  - `python printify_shopify_sync_pipeline.py --recommend-provider --blueprint-id <blueprint_id>`
+- Auto-select the top provider when generating a snippet:
+  - `python printify_shopify_sync_pipeline.py --generate-template-snippet --blueprint-id <blueprint_id> --auto-provider --key <template_key>`
 
 
 ## Product update/rebuild workflows
