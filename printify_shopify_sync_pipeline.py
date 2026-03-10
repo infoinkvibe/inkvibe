@@ -76,6 +76,10 @@ class NonRetryableRequestError(RuntimeError):
     pass
 
 
+class CatalogCliUsageError(RuntimeError):
+    pass
+
+
 @dataclass
 class Artwork:
     slug: str
@@ -609,7 +613,7 @@ class BaseApiClient:
                 if response.status_code in {429, 500, 502, 503, 504}:
                     sleep_seconds = _retry_after_seconds(response.headers.get("Retry-After"), attempt)
                     logger.warning(
-                        "Request %s %s failed with %s (%s/%s), retrying in %.2fs",
+                        "Request %s %s failed with HTTP %s (%s/%s); retryable status, retrying in %.2fs",
                         method.upper(),
                         path,
                         response.status_code,
@@ -626,10 +630,23 @@ class BaseApiClient:
                 except Exception:
                     pass
 
-                if response.status_code == 400:
-                    logger.error("Validation failed for %s %s: %s", method.upper(), path, body)
-                    raise NonRetryableRequestError(f"HTTP 400 for {method.upper()} {path}: {body}")
+                if 400 <= response.status_code < 500 and response.status_code != 429:
+                    logger.error(
+                        "Request %s %s failed with HTTP %s; non-retryable client error: %s",
+                        method.upper(),
+                        path,
+                        response.status_code,
+                        body,
+                    )
+                    raise NonRetryableRequestError(f"HTTP {response.status_code} for {method.upper()} {path}: {body}")
 
+                logger.error(
+                    "Request %s %s failed with HTTP %s after retry checks: %s",
+                    method.upper(),
+                    path,
+                    response.status_code,
+                    body,
+                )
                 raise RuntimeError(f"HTTP {response.status_code} for {method.upper()} {path}: {body}")
             except (DryRunMutationSkipped, NonRetryableRequestError):
                 raise
@@ -638,7 +655,15 @@ class BaseApiClient:
                 if attempt >= RETRY_MAX_ATTEMPTS:
                     break
                 sleep_seconds = _compute_backoff(attempt)
-                logger.warning("Request exception for %s %s (%s/%s): %s", method.upper(), path, attempt, RETRY_MAX_ATTEMPTS, exc)
+                logger.warning(
+                    "Request exception for %s %s (%s/%s): %s; treated as transient transport error, retrying in %.2fs",
+                    method.upper(),
+                    path,
+                    attempt,
+                    RETRY_MAX_ATTEMPTS,
+                    exc,
+                    sleep_seconds,
+                )
                 time.sleep(sleep_seconds)
 
         if last_exc is not None:
@@ -1612,6 +1637,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inspect-variants", action="store_true", help="Inspect variants for a blueprint/provider")
     parser.add_argument("--recommend-provider", action="store_true", help="Recommend a provider for the blueprint")
     parser.add_argument("--generate-template-snippet", action="store_true", help="Generate a starter template snippet JSON")
+    parser.add_argument("--auto-provider", action="store_true", help="Automatically choose the best provider for inspect/snippet catalog flows")
     parser.add_argument("--template-file", default="", help="Optional template JSON path for recommendation context")
     parser.add_argument("--template-output-file", default="", help="Optional file path to write generated template snippet JSON")
     parser.add_argument("--key", default="", help="Template key used for snippet generation or provider recommendation context")
@@ -1651,6 +1677,48 @@ def _find_template_by_key(config_path: pathlib.Path, template_key: str) -> Optio
     return None
 
 
+def _format_provider_choices(providers: List[Dict[str, Any]]) -> str:
+    if not providers:
+        return "none"
+    return ", ".join(f"{int(provider.get('id', 0))} {provider.get('title', '').strip() or '<untitled>'}" for provider in providers)
+
+
+def _require_provider_for_blueprint(
+    *,
+    providers: List[Dict[str, Any]],
+    blueprint_id: int,
+    provider_id: int,
+) -> Dict[str, Any]:
+    for provider in providers:
+        if int(provider.get("id", 0)) == provider_id:
+            return provider
+    valid_choices = _format_provider_choices(providers)
+    hint = (
+        f"Try: --list-providers --blueprint-id {blueprint_id} or "
+        f"--recommend-provider --blueprint-id {blueprint_id}"
+    )
+    raise CatalogCliUsageError(
+        f"Provider {provider_id} is not available for blueprint {blueprint_id}. "
+        f"Valid providers: {valid_choices}. {hint}"
+    )
+
+
+def _recommend_provider_for_blueprint(
+    *,
+    printify: PrintifyClient,
+    providers: List[Dict[str, Any]],
+    blueprint_id: int,
+    template: Optional[ProductTemplate],
+) -> List[Dict[str, Any]]:
+    scored_rows: List[Dict[str, Any]] = []
+    for provider in providers:
+        variants = printify.list_variants(blueprint_id, int(provider.get("id", 0)))
+        score = score_provider_for_template(provider, variants, template=template)
+        scored_rows.append(score)
+    scored_rows.sort(key=lambda row: row["score"], reverse=True)
+    return scored_rows
+
+
 def run_catalog_cli(
     *,
     printify: PrintifyClient,
@@ -1666,6 +1734,7 @@ def run_catalog_cli(
     recommend_provider: bool,
     template_file: str,
     generate_template_snippet_flag: bool,
+    auto_provider: bool,
     snippet_key: str,
     template_output_file: str,
 ) -> bool:
@@ -1686,20 +1755,21 @@ def run_catalog_cli(
     if (list_providers or inspect_variants or recommend_provider or generate_template_snippet_flag) and blueprint_id <= 0:
         raise RuntimeError("--blueprint-id is required")
 
+    if auto_provider and not (inspect_variants or generate_template_snippet_flag):
+        raise RuntimeError("--auto-provider is only supported with --inspect-variants or --generate-template-snippet")
+
     if list_providers or recommend_provider:
         providers = printify.list_print_providers(blueprint_id)
-        scored_rows: List[Dict[str, Any]] = []
         template = None
         if recommend_provider and snippet_key:
             template_path = pathlib.Path(template_file) if template_file else config_path
             template = _find_template_by_key(template_path, snippet_key)
-
-        for provider in providers:
-            variants = printify.list_variants(blueprint_id, int(provider.get("id", 0)))
-            score = score_provider_for_template(provider, variants, template=template)
-            scored_rows.append(score)
-
-        scored_rows.sort(key=lambda row: row["score"], reverse=True)
+        scored_rows = _recommend_provider_for_blueprint(
+            printify=printify,
+            providers=providers,
+            blueprint_id=blueprint_id,
+            template=template,
+        )
         rows = scored_rows[:limit_providers] if limit_providers > 0 else scored_rows
 
         if list_providers:
@@ -1724,20 +1794,45 @@ def run_catalog_cli(
             return True
 
     if inspect_variants or generate_template_snippet_flag:
-        if provider_id <= 0:
-            raise RuntimeError("--provider-id is required")
-        variants = printify.list_variants(blueprint_id, provider_id)
+        providers = printify.list_print_providers(blueprint_id)
+        selected_provider_id = provider_id
+        if auto_provider:
+            template_path = pathlib.Path(template_file) if template_file else config_path
+            template = _find_template_by_key(template_path, snippet_key)
+            rows = _recommend_provider_for_blueprint(
+                printify=printify,
+                providers=providers,
+                blueprint_id=blueprint_id,
+                template=template,
+            )
+            if not rows:
+                raise CatalogCliUsageError(f"No providers available for blueprint {blueprint_id}.")
+            top = rows[0]
+            selected_provider_id = int(top["provider_id"])
+            print(
+                f"Auto-selected provider_id={selected_provider_id} title={top['provider_title']} score={top['score']} "
+                f"(colors={top['matching_color_count']}, sizes={top['matching_size_count']}, variants={top['matching_variant_count']}, placements={top['placement_match_count']})."
+            )
+
+        if selected_provider_id <= 0:
+            raise RuntimeError("--provider-id is required unless --auto-provider is used")
+        _require_provider_for_blueprint(
+            providers=providers,
+            blueprint_id=blueprint_id,
+            provider_id=selected_provider_id,
+        )
+        variants = printify.list_variants(blueprint_id, selected_provider_id)
         summary = summarize_variant_options(variants)
 
         if inspect_variants:
             print(
-                f"blueprint_id={blueprint_id}	provider_id={provider_id}	variant_count={len(variants)}	colors={','.join(summary['colors'][:12]) or '-'}	sizes={','.join(summary['sizes'][:12]) or '-'}"
+                f"blueprint_id={blueprint_id}	provider_id={selected_provider_id}	variant_count={len(variants)}	colors={','.join(summary['colors'][:12]) or '-'}	sizes={','.join(summary['sizes'][:12]) or '-'}"
             )
             return True
 
         if generate_template_snippet_flag:
-            key = snippet_key or f"blueprint_{blueprint_id}_provider_{provider_id}"
-            snippet = generate_template_snippet(key=key, blueprint_id=blueprint_id, provider_id=provider_id, variants=variants)
+            key = snippet_key or f"blueprint_{blueprint_id}_provider_{selected_provider_id}"
+            snippet = generate_template_snippet(key=key, blueprint_id=blueprint_id, provider_id=selected_provider_id, variants=variants)
             rendered = json.dumps(snippet, indent=2)
             if template_output_file:
                 pathlib.Path(template_output_file).write_text(rendered + "\n", encoding="utf-8")
@@ -1748,7 +1843,7 @@ def run_catalog_cli(
     return False
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False) -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False) -> None:
     if not PRINTIFY_API_TOKEN:
         raise RuntimeError("Missing PRINTIFY_API_TOKEN")
     if not image_dir.exists():
@@ -1781,6 +1876,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         recommend_provider=recommend_provider,
         template_file=template_file,
         generate_template_snippet_flag=generate_template_snippet_flag,
+        auto_provider=auto_provider,
         snippet_key=snippet_key,
         template_output_file=template_output_file,
     ):
@@ -1833,36 +1929,54 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
 if __name__ == "__main__":
     args = parse_args()
     configure_logging(args.log_level)
-    run(
-        pathlib.Path(args.templates),
-        dry_run=args.dry_run,
-        force=args.force,
-        allow_upscale=args.allow_upscale,
-        upscale_method=args.upscale_method,
-        skip_undersized=args.skip_undersized,
-        image_dir=pathlib.Path(args.image_dir),
-        export_dir=pathlib.Path(args.export_dir),
-        state_path=pathlib.Path(args.state_path),
-        skip_audit=args.skip_audit,
-        max_artworks=args.max_artworks,
-        upload_strategy=args.upload_strategy,
-        template_keys=args.template_key,
-        limit_templates=args.limit_templates,
-        list_templates=args.list_templates,
-        list_blueprints=args.list_blueprints,
-        search_blueprints_query=args.search_blueprints,
-        limit_blueprints=args.limit_blueprints,
-        list_providers=args.list_providers,
-        blueprint_id=args.blueprint_id,
-        provider_id=args.provider_id,
-        limit_providers=args.limit_providers,
-        inspect_variants=args.inspect_variants,
-        recommend_provider=args.recommend_provider,
-        template_file=args.template_file,
-        generate_template_snippet_flag=args.generate_template_snippet,
-        snippet_key=args.key,
-        template_output_file=args.template_output_file,
-        create_only=args.create_only,
-        update_only=args.update_only,
-        rebuild_product=args.rebuild_product,
-    )
+    try:
+        run(
+            pathlib.Path(args.templates),
+            dry_run=args.dry_run,
+            force=args.force,
+            allow_upscale=args.allow_upscale,
+            upscale_method=args.upscale_method,
+            skip_undersized=args.skip_undersized,
+            image_dir=pathlib.Path(args.image_dir),
+            export_dir=pathlib.Path(args.export_dir),
+            state_path=pathlib.Path(args.state_path),
+            skip_audit=args.skip_audit,
+            max_artworks=args.max_artworks,
+            upload_strategy=args.upload_strategy,
+            template_keys=args.template_key,
+            limit_templates=args.limit_templates,
+            list_templates=args.list_templates,
+            list_blueprints=args.list_blueprints,
+            search_blueprints_query=args.search_blueprints,
+            limit_blueprints=args.limit_blueprints,
+            list_providers=args.list_providers,
+            blueprint_id=args.blueprint_id,
+            provider_id=args.provider_id,
+            limit_providers=args.limit_providers,
+            inspect_variants=args.inspect_variants,
+            recommend_provider=args.recommend_provider,
+            template_file=args.template_file,
+            generate_template_snippet_flag=args.generate_template_snippet,
+            auto_provider=args.auto_provider,
+            snippet_key=args.key,
+            template_output_file=args.template_output_file,
+            create_only=args.create_only,
+            update_only=args.update_only,
+            rebuild_product=args.rebuild_product,
+        )
+    except CatalogCliUsageError as exc:
+        print(f"Catalog CLI error: {exc}")
+        raise SystemExit(2)
+    except NonRetryableRequestError as exc:
+        catalog_mode = any([
+            args.list_blueprints,
+            bool(args.search_blueprints),
+            args.list_providers,
+            args.inspect_variants,
+            args.recommend_provider,
+            args.generate_template_snippet,
+        ])
+        if catalog_mode:
+            print(f"Catalog request failed: {exc}")
+            raise SystemExit(2)
+        raise

@@ -46,6 +46,9 @@ from printify_shopify_sync_pipeline import (
     process_artwork,
     save_json_atomic,
     DryRunMutationSkipped,
+    NonRetryableRequestError,
+    CatalogCliUsageError,
+    run_catalog_cli,
 )
 
 
@@ -584,3 +587,108 @@ def test_process_artwork_updates_existing_product_by_default(tmp_path: Path):
     latest = state["processed"]["art"]["products"][-1]["result"]["printify"]
     assert latest["action"] == "update"
     assert latest["printify_product_id"] == "existing-1"
+
+def test_no_retry_on_404_catalog_error():
+    class DummyResponse:
+        status_code = 404
+        headers = {}
+        content = b"{}"
+
+        def json(self):
+            return {"error": "Not found"}
+
+        @property
+        def text(self):
+            return '{"error":"Not found"}'
+
+    class DummySession:
+        def __init__(self):
+            self.calls = 0
+            self.headers = {}
+
+        def request(self, **kwargs):
+            self.calls += 1
+            return DummyResponse()
+
+    client = BaseApiClient.__new__(BaseApiClient)
+    client.base_url = "https://example.test"
+    client.dry_run = False
+    client.session = DummySession()
+
+    with pytest.raises(NonRetryableRequestError, match="HTTP 404"):
+        client.get("/catalog/blueprints/1/print_providers/99/variants.json")
+    assert client.session.calls == 1
+
+
+def test_catalog_cli_invalid_provider_for_blueprint_has_helpful_error(tmp_path: Path):
+    class DummyCatalogPrintify:
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 1, "title": "SPOKE Custom Products"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return []
+
+    with pytest.raises(CatalogCliUsageError, match="Provider 99 is not available for blueprint 68") as exc:
+        run_catalog_cli(
+            printify=DummyCatalogPrintify(),
+            config_path=tmp_path / "templates.json",
+            list_blueprints=False,
+            search_query="",
+            limit_blueprints=25,
+            list_providers=False,
+            blueprint_id=68,
+            provider_id=99,
+            limit_providers=25,
+            inspect_variants=True,
+            recommend_provider=False,
+            template_file="",
+            generate_template_snippet_flag=False,
+            auto_provider=False,
+            snippet_key="",
+            template_output_file="",
+        )
+    assert "Valid providers: 1 SPOKE Custom Products" in str(exc.value)
+    assert "--list-providers --blueprint-id 68" in str(exc.value)
+
+
+def test_catalog_cli_auto_provider_selects_best(tmp_path: Path, capsys):
+    class DummyCatalogPrintify:
+        def list_print_providers(self, blueprint_id):
+            return [
+                {"id": 1, "title": "Provider A"},
+                {"id": 2, "title": "Provider B"},
+            ]
+
+        def list_variants(self, blueprint_id, provider_id):
+            if provider_id == 1:
+                return [
+                    {"id": 11, "is_available": True, "options": {"color": "Black", "size": "M"}, "placeholders": [{"position": "front"}]},
+                    {"id": 12, "is_available": True, "options": {"color": "Black", "size": "L"}, "placeholders": [{"position": "front"}]},
+                ]
+            return [
+                {"id": 21, "is_available": True, "options": {"color": "White", "size": "S"}, "placeholders": [{"position": "back"}]},
+            ]
+
+    done = run_catalog_cli(
+        printify=DummyCatalogPrintify(),
+        config_path=tmp_path / "templates.json",
+        list_blueprints=False,
+        search_query="",
+        limit_blueprints=25,
+        list_providers=False,
+        blueprint_id=68,
+        provider_id=0,
+        limit_providers=25,
+        inspect_variants=True,
+        recommend_provider=False,
+        template_file="",
+        generate_template_snippet_flag=False,
+        auto_provider=True,
+        snippet_key="",
+        template_output_file="",
+    )
+
+    captured = capsys.readouterr().out
+    assert done is True
+    assert "Auto-selected provider_id=1" in captured
+    assert "provider_id=1" in captured
