@@ -42,8 +42,13 @@
     "printify_print_provider_id": 99,
     "title_pattern": "{artwork_title} {product_type_label}",
     "description_pattern": "<p>{artwork_title} on a durable {product_type_label}.</p><p>Made for {audience}. Keywords: {seo_keywords}</p>",
-    "enabled_colors": [],
-    "enabled_sizes": [],
+    "enabled_colors": ["White"],
+    "enabled_sizes": ["11oz"],
+    "max_enabled_variants": 24,
+    "enabled_variant_option_filters": {
+      "color": ["White"],
+      "size": ["11oz"]
+    },
     "tags": ["mug", "coffee"],
     "seo_keywords": ["coffee mug", "desk accessory", "gift for coworkers"],
     "audience": "coffee drinkers and office gifting",

@@ -60,6 +60,8 @@ from printify_shopify_sync_pipeline import (
     title_semantically_includes_product_label,
     validate_printify_payload_consistency,
     assess_update_compatibility,
+    enforce_variant_safety_limit,
+    upsert_in_printify,
     _row_status,
     write_csv_report,
     run,
@@ -1219,3 +1221,96 @@ def test_list_failures_and_pending_helpers(tmp_path: Path, monkeypatch, capsys):
     run(tmp_path / "templates.json", image_dir=tmp_path, state_path=tmp_path / "state.json", list_pending_only=True)
     out2 = capsys.readouterr().out
     assert "a1:t1" in out2 and "a3:t1" in out2
+
+
+def test_enforce_variant_safety_limit_raises_when_exceeded():
+    template = ProductTemplate(
+        key="mug-test",
+        printify_blueprint_id=9,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        max_enabled_variants=2,
+    )
+    with pytest.raises(RuntimeError, match="exceeds safety cap"):
+        enforce_variant_safety_limit(template=template, enabled_variant_count=3)
+
+
+def test_choose_variants_from_catalog_applies_option_filters_and_cap():
+    template = ProductTemplate(
+        key="mug-test",
+        printify_blueprint_id=9,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_variant_option_filters={"material": ["Ceramic"]},
+        max_enabled_variants=1,
+    )
+    variants = [
+        {"id": 1, "is_available": True, "options": {"color": "White", "size": "11oz", "material": "Ceramic"}},
+        {"id": 2, "is_available": True, "options": {"color": "Black", "size": "11oz", "material": "Ceramic"}},
+        {"id": 3, "is_available": True, "options": {"color": "White", "size": "11oz", "material": "Glass"}},
+    ]
+    chosen = choose_variants_from_catalog(variants, template)
+    assert [row["id"] for row in chosen] == [1]
+
+
+def test_upsert_in_printify_recovers_from_stale_product_id(tmp_path: Path):
+    artwork = _create_artwork(tmp_path, 3000, 3000)
+    template = ProductTemplate(
+        key="mug-test",
+        printify_blueprint_id=9,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[PlacementRequirement("front", 1000, 1000)],
+    )
+
+    class DummyPrintifyStaleRecovery:
+        dry_run = False
+
+        def get_product(self, shop_id, product_id):
+            raise NonRetryableRequestError("HTTP 404 for GET /shops/1/products/stale.json")
+
+        def create_product(self, shop_id, payload):
+            return {"id": "new-123"}
+
+        def publish_product(self, shop_id, product_id, payload):
+            return {"status": "ok"}
+
+    result = upsert_in_printify(
+        printify=DummyPrintifyStaleRecovery(),
+        shop_id=1,
+        artwork=artwork,
+        template=template,
+        variant_rows=[{"id": 101, "is_available": True, "price": 1200, "options": {"color": "White", "size": "11oz"}}],
+        upload_map={"front": {"id": "upload-1"}},
+        existing_product_id="stale",
+        action="update",
+        publish_mode="skip",
+        verify_publish=False,
+    )
+    assert result["action"] == "create"
+    assert result["printify_product_id"] == "new-123"
+
+
+def test_run_summary_logging_does_not_raise_format_error(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    monkeypatch.setattr(pipeline, "PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "load_json", lambda path, default: ensure_state_shape({}))
+    monkeypatch.setattr(pipeline, "load_templates", lambda p: [ProductTemplate(key="t1", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{artwork_title}", description_pattern="{artwork_title}")])
+    monkeypatch.setattr(pipeline, "select_templates", lambda templates, **kwargs: templates)
+    monkeypatch.setattr(pipeline, "discover_artworks", lambda d: [Artwork("a1", tmp_path / "a1.png", "a1", "", [], 1000, 1000)])
+    monkeypatch.setattr(pipeline, "PrintifyClient", lambda *args, **kwargs: type("X", (), {"dry_run": True})())
+    monkeypatch.setattr(pipeline, "resolve_shop_id", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "load_r2_config_from_env", lambda: None)
+    monkeypatch.setattr(pipeline, "audit_printify_integration", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "run_catalog_cli", lambda **kwargs: False)
+
+    def fake_process_artwork(**kwargs):
+        kwargs["summary"].failures = 1
+        kwargs["run_rows"].append(pipeline.RunReportRow("now", "a1.png", "a1", "t1", "failure", "create", 1, 1, "auto", "", False, False, "x"))
+
+    monkeypatch.setattr(pipeline, "process_artwork", fake_process_artwork)
+    run(tmp_path / "templates.json", image_dir=tmp_path, export_dir=tmp_path / "exp", state_path=tmp_path / "state.json", skip_audit=True)
