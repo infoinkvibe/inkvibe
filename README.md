@@ -149,6 +149,25 @@ python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --auto-reb
 
 Per-template logs now include action (`create/update/rebuild/skip`), product id, provider id, and blueprint id. Run summary now includes created/updated/rebuilt/skipped totals.
 
+### Troubleshooting stale product ids in state
+
+- Symptom: update path fails because the stored id now returns `404` on `GET /shops/{shop_id}/products/{product_id}.json`.
+- InkVibeAuto now recovers by treating that id as stale, logging:
+  - `Stored product_id not found in Printify; treating as missing and creating a new product`
+  and continuing with create for that artwork/template.
+- State is updated by the successful run row with the new `printify_product_id`.
+- Optional manual reset/rebuild path:
+  - `python printify_shopify_sync_pipeline.py --template-key <template_key> --rebuild-product`
+
+### Troubleshooting too many enabled variants
+
+- Symptom: Printify rejects create/update with `Too many variants enabled. Maximum allowed: 100`.
+- Controls:
+  - tighten `enabled_colors` / `enabled_sizes`,
+  - add `enabled_variant_option_filters`,
+  - set `max_enabled_variants` on the template.
+- InkVibeAuto enforces the max locally before create/update to avoid unnecessary API calls.
+
 ## Example: add a new mug or hoodie template from scratch
 
 ```bash
@@ -187,6 +206,10 @@ Pricing fields (optional):
 - `markup_value`
 - `rounding_mode` (`none`, `whole_dollar`, `x_99`)
 - `compare_at_price`
+
+Variant-control fields (optional):
+- `max_enabled_variants`
+- `enabled_variant_option_filters`
 
 SEO/listing fields (optional):
 - `seo_keywords`

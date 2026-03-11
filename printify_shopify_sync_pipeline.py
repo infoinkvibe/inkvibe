@@ -54,6 +54,7 @@ PRINTIFY_DIRECT_UPLOAD_LIMIT_BYTES = 5 * 1024 * 1024
 logger = logging.getLogger("inkvibeauto")
 
 DEFAULT_TEMPLATE_PRICE = "29.99"
+DEFAULT_MAX_ENABLED_VARIANTS = int(os.getenv("MAX_ENABLED_VARIANTS_SAFETY_LIMIT", "100"))
 
 
 # -----------------------------
@@ -144,6 +145,8 @@ class ProductTemplate:
     audience: Optional[str] = None
     product_type_label: Optional[str] = None
     style_keywords: List[str] = field(default_factory=list)
+    max_enabled_variants: Optional[int] = None
+    enabled_variant_option_filters: Dict[str, List[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -1390,6 +1393,11 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
         raise TemplateValidationError(f"Template[{index}] markup_type must be fixed|percent")
     if row.get("rounding_mode", "none") not in {"none", "whole_dollar", "x_99"}:
         raise TemplateValidationError(f"Template[{index}] rounding_mode must be none|whole_dollar|x_99")
+    if row.get("max_enabled_variants") is not None and int(row.get("max_enabled_variants", 0)) <= 0:
+        raise TemplateValidationError(f"Template[{index}] max_enabled_variants must be > 0 when provided")
+    option_filters = row.get("enabled_variant_option_filters")
+    if option_filters is not None and not isinstance(option_filters, dict):
+        raise TemplateValidationError(f"Template[{index}] enabled_variant_option_filters must be an object")
 
 
 def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
@@ -1438,6 +1446,8 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
                 audience=str(row.get("audience", "")).strip() or None,
                 product_type_label=str(row.get("product_type_label", "")).strip() or None,
                 style_keywords=[str(v) for v in row.get("style_keywords", [])],
+                max_enabled_variants=int(row["max_enabled_variants"]) if row.get("max_enabled_variants") is not None else None,
+                enabled_variant_option_filters={str(k): [str(v) for v in vals] for k, vals in (row.get("enabled_variant_option_filters") or {}).items()},
                 placements=[PlacementRequirement(**p) for p in row.get("placements", [])],
             )
         )
@@ -1448,13 +1458,53 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
 def choose_variants_from_catalog(catalog_variants: Any, template: ProductTemplate) -> List[Dict[str, Any]]:
     catalog_variants = normalize_catalog_variants_response(catalog_variants)
     chosen: List[Dict[str, Any]] = []
+    option_filters = {str(k).lower().strip(): {str(v).strip() for v in values} for k, values in (template.enabled_variant_option_filters or {}).items() if values}
     for variant in catalog_variants:
         color = _variant_option_value(variant, "color")
         size = _variant_option_value(variant, "size")
         is_available = variant.get("is_available", True)
-        if (not template.enabled_colors or color in template.enabled_colors) and (not template.enabled_sizes or size in template.enabled_sizes) and is_available:
+        option_filter_ok = True
+        for option_key, allowed_values in option_filters.items():
+            if _variant_option_value(variant, option_key) not in allowed_values:
+                option_filter_ok = False
+                break
+
+        if (not template.enabled_colors or color in template.enabled_colors) and (not template.enabled_sizes or size in template.enabled_sizes) and option_filter_ok and is_available:
             chosen.append(variant)
+    effective_limit = template.max_enabled_variants if template.max_enabled_variants is not None else DEFAULT_MAX_ENABLED_VARIANTS
+    if effective_limit > 0 and len(chosen) > effective_limit:
+        logger.warning(
+            "Template %s matched %s variants; applying safety cap max_enabled_variants=%s before payload build",
+            template.key,
+            len(chosen),
+            effective_limit,
+        )
+        chosen = chosen[:effective_limit]
+    logger.info(
+        "Variant selection template=%s selected=%s available=%s colors=%s sizes=%s option_filters=%s max_enabled_variants=%s",
+        template.key,
+        len(chosen),
+        len(catalog_variants),
+        template.enabled_colors or "*",
+        template.enabled_sizes or "*",
+        template.enabled_variant_option_filters or {},
+        effective_limit,
+    )
     return chosen
+
+
+def enforce_variant_safety_limit(*, template: ProductTemplate, enabled_variant_count: int) -> None:
+    effective_limit = template.max_enabled_variants if template.max_enabled_variants is not None else DEFAULT_MAX_ENABLED_VARIANTS
+    if effective_limit > 0 and enabled_variant_count > effective_limit:
+        raise RuntimeError(
+            "Enabled variant count exceeds safety cap before Printify API call: "
+            f"template={template.key} enabled_variant_count={enabled_variant_count} max_enabled_variants={effective_limit}. "
+            "Reduce template filters (enabled_colors/enabled_sizes/enabled_variant_option_filters) or raise max_enabled_variants explicitly."
+        )
+
+
+def _is_http_404_error(exc: Exception) -> bool:
+    return isinstance(exc, NonRetryableRequestError) and "HTTP 404" in str(exc)
 
 
 def normalize_catalog_variants_response(raw_variants: Any) -> List[Dict[str, Any]]:
@@ -1849,8 +1899,17 @@ def upsert_in_printify(
     verify_publish: bool,
     auto_rebuild_on_incompatible_update: bool = False,
 ) -> Dict[str, Any]:
+    def _execute_create() -> Tuple[str, Dict[str, Any]]:
+        try:
+            created_resp = printify.create_product(shop_id, payload)
+        except DryRunMutationSkipped:
+            raise
+        new_product_id = str(created_resp.get("id") or created_resp.get("data", {}).get("id") or "")
+        return new_product_id, {"action": "create", "printify_product_id": new_product_id, "created": created_resp}
+
     payload = build_printify_product_payload(artwork, template, variant_rows, upload_map)
     payload_stats = validate_printify_payload_consistency(payload)
+    enforce_variant_safety_limit(template=template, enabled_variant_count=payload_stats["enabled_variant_count"])
     logger.info("Mockup/image publish behavior template=%s publish_images=%s publish_mockups_override=%s", template.key, template.publish_images, template.publish_mockups)
 
     if action == "skip":
@@ -1861,52 +1920,73 @@ def upsert_in_printify(
 
     if action == "create":
         try:
-            created = printify.create_product(shop_id, payload)
+            product_id, result = _execute_create()
         except DryRunMutationSkipped:
             return {"status": "dry-run", "action": "create", "payload_preview": payload}
-        product_id = str(created.get("id") or created.get("data", {}).get("id") or "")
-        result: Dict[str, Any] = {"action": "create", "printify_product_id": product_id, "created": created}
     elif action == "update":
-        existing_product = printify.get_product(shop_id, existing_product_id)
-        compatibility = assess_update_compatibility(existing_product, payload)
-        logger.info(
-            "Update preflight product_id=%s action=%s enabled_variant_count=%s print_area_variant_count=%s",
-            existing_product_id,
-            action,
-            payload_stats["enabled_variant_count"],
-            payload_stats["print_area_variant_count"],
-        )
-        if not compatibility["compatible"]:
-            logger.warning(
-                "Update compatibility failed product_id=%s issues=%s suggested_action=%s",
-                existing_product_id,
-                "; ".join(compatibility["issues"]),
-                "--rebuild-product" if not auto_rebuild_on_incompatible_update else "auto-rebuild",
-            )
-            if not auto_rebuild_on_incompatible_update:
-                raise RuntimeError(
-                    "Incompatible update payload for existing Printify product. "
-                    f"issues={compatibility['issues']}. Use --rebuild-product or --auto-rebuild-on-incompatible-update"
+        try:
+            existing_product = printify.get_product(shop_id, existing_product_id)
+        except Exception as exc:
+            if _is_http_404_error(exc):
+                logger.warning(
+                    "Stored product_id not found in Printify; treating as missing and creating a new product "
+                    "template=%s stale_product_id=%s",
+                    template.key,
+                    existing_product_id,
                 )
-            action = "rebuild"
+                logger.warning(
+                    "Actionable guidance: state entry pointed at a deleted product. InkVibeAuto will create a new product and update state automatically."
+                )
+                action = "create"
+                existing_product_id = ""
+            else:
+                raise
+
+        if action == "create":
+            try:
+                product_id, result = _execute_create()
+            except DryRunMutationSkipped:
+                return {"status": "dry-run", "action": "create", "payload_preview": payload}
 
         if action == "update":
-            try:
-                updated = printify.update_product(shop_id, existing_product_id, payload)
-            except DryRunMutationSkipped:
-                return {"status": "dry-run", "action": "update", "payload_preview": payload, "printify_product_id": existing_product_id}
-            result = {"action": "update", "printify_product_id": existing_product_id, "updated": updated}
-            product_id = existing_product_id
-        else:
-            try:
-                printify.delete_product(shop_id, existing_product_id)
-            except DryRunMutationSkipped:
-                return {"status": "dry-run", "action": "rebuild", "payload_preview": payload, "printify_product_id": existing_product_id}
-            except Exception:
-                logger.warning("Delete existing product failed during rebuild product_id=%s", existing_product_id)
-            created = printify.create_product(shop_id, payload)
-            product_id = str(created.get("id") or created.get("data", {}).get("id") or "")
-            result = {"action": "rebuild", "previous_product_id": existing_product_id, "printify_product_id": product_id, "created": created}
+            compatibility = assess_update_compatibility(existing_product, payload)
+            logger.info(
+                "Update preflight product_id=%s action=%s enabled_variant_count=%s print_area_variant_count=%s",
+                existing_product_id,
+                action,
+                payload_stats["enabled_variant_count"],
+                payload_stats["print_area_variant_count"],
+            )
+            if not compatibility["compatible"]:
+                logger.warning(
+                    "Update compatibility failed product_id=%s issues=%s suggested_action=%s",
+                    existing_product_id,
+                    "; ".join(compatibility["issues"]),
+                    "--rebuild-product" if not auto_rebuild_on_incompatible_update else "auto-rebuild",
+                )
+                if not auto_rebuild_on_incompatible_update:
+                    raise RuntimeError(
+                        "Incompatible update payload for existing Printify product. "
+                        f"issues={compatibility['issues']}. Use --rebuild-product or --auto-rebuild-on-incompatible-update"
+                    )
+                action = "rebuild"
+
+            if action == "update":
+                try:
+                    updated = printify.update_product(shop_id, existing_product_id, payload)
+                except DryRunMutationSkipped:
+                    return {"status": "dry-run", "action": "update", "payload_preview": payload, "printify_product_id": existing_product_id}
+                result = {"action": "update", "printify_product_id": existing_product_id, "updated": updated}
+                product_id = existing_product_id
+            else:
+                try:
+                    printify.delete_product(shop_id, existing_product_id)
+                except DryRunMutationSkipped:
+                    return {"status": "dry-run", "action": "rebuild", "payload_preview": payload, "printify_product_id": existing_product_id}
+                except Exception:
+                    logger.warning("Delete existing product failed during rebuild product_id=%s", existing_product_id)
+                product_id, create_result = _execute_create()
+                result = {"action": "rebuild", "previous_product_id": existing_product_id, "printify_product_id": product_id, "created": create_result["created"]}
     elif action == "rebuild":
         if existing_product_id:
             try:
@@ -1915,9 +1995,11 @@ def upsert_in_printify(
                 return {"status": "dry-run", "action": "rebuild", "payload_preview": payload, "printify_product_id": existing_product_id}
             except Exception:
                 logger.warning("Delete existing product failed during rebuild product_id=%s", existing_product_id)
-        created = printify.create_product(shop_id, payload)
-        product_id = str(created.get("id") or created.get("data", {}).get("id") or "")
-        result = {"action": "rebuild", "previous_product_id": existing_product_id, "printify_product_id": product_id, "created": created}
+        try:
+            product_id, create_result = _execute_create()
+        except DryRunMutationSkipped:
+            return {"status": "dry-run", "action": "rebuild", "payload_preview": payload, "printify_product_id": existing_product_id}
+        result = {"action": "rebuild", "previous_product_id": existing_product_id, "printify_product_id": product_id, "created": create_result["created"]}
     else:
         raise RuntimeError(f"Unsupported action: {action}")
 
@@ -2627,7 +2709,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
 
     save_json_atomic(state_path, state)
     logger.info(
-        "Run summary artworks_scanned=%s templates_processed=%s combinations_processed=%s successes=%s failures=%s skipped=%s products_created=%s products_updated=%s products_rebuilt=%s products_skipped=%s publish_attempts=%s publish_verified=%s verification_warnings=%s",
+        "Run summary artworks_scanned=%s templates_processed=%s combinations_processed=%s successes=%s failures=%s skipped=%s products_created=%s products_updated=%s products_rebuilt=%s products_skipped=%s template_failures=%s publish_attempts=%s publish_verified=%s verification_warnings=%s",
         summary.artworks_scanned,
         summary.templates_processed,
         summary.combinations_processed,
