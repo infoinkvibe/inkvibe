@@ -126,6 +126,25 @@ class PlacementTransform:
     angle: float
 
 
+def normalize_printify_transform(transform: PlacementTransform) -> Dict[str, Any]:
+    normalized_scale = float(transform.scale)
+    normalized_x = float(transform.x)
+    normalized_y = float(transform.y)
+    normalized_angle = int(round(float(transform.angle)))
+    if normalized_angle != transform.angle:
+        logger.debug(
+            "Normalized Printify transform angle from %s to integer %s",
+            transform.angle,
+            normalized_angle,
+        )
+    return {
+        "scale": normalized_scale,
+        "x": normalized_x,
+        "y": normalized_y,
+        "angle": normalized_angle,
+    }
+
+
 @dataclass
 class ProductTemplate:
     key: str
@@ -1960,16 +1979,17 @@ def build_printify_product_payload(artwork: Artwork, template: ProductTemplate, 
             transform.y,
             transform.angle,
         )
+        normalized_transform = normalize_printify_transform(transform)
         print_areas.append({
             "variant_ids": enabled_variant_ids,
             "placeholders": [{
                 "position": placement.placement_name,
                 "images": [{
                     "id": upload_info["id"],
-                    "x": transform.x,
-                    "y": transform.y,
-                    "scale": transform.scale,
-                    "angle": transform.angle,
+                    "x": normalized_transform["x"],
+                    "y": normalized_transform["y"],
+                    "scale": normalized_transform["scale"],
+                    "angle": normalized_transform["angle"],
                 }],
             }],
         })

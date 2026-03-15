@@ -74,6 +74,7 @@ from printify_shopify_sync_pipeline import (
     resolve_launch_plan_rows,
     build_resolved_template,
     build_printify_product_payload,
+    normalize_printify_transform,
 )
 
 
@@ -1657,6 +1658,30 @@ def test_build_resolved_template_applies_overrides():
     assert resolved.publish_after_create is False
 
 
+def test_normalize_printify_transform_default_angle_is_int():
+    normalized = normalize_printify_transform(
+        compute_placement_transform_for_artwork(
+            PlacementRequirement("front", 2700, 1120, placement_scale=0.78, placement_x=0.5, placement_y=0.5, placement_angle=0.0),
+            Artwork(slug="art", src_path=Path("art.png"), title="Art", description_html="", tags=[], image_width=100, image_height=100),
+            "mug_11oz",
+        )
+    )
+    assert normalized["angle"] == 0
+    assert isinstance(normalized["angle"], int)
+
+
+def test_normalize_printify_transform_coerces_float_angle_to_int():
+    normalized = normalize_printify_transform(
+        compute_placement_transform_for_artwork(
+            PlacementRequirement("front", 2700, 1120, placement_scale=0.78, placement_x=0.5, placement_y=0.5, placement_angle=12.9),
+            Artwork(slug="art", src_path=Path("art.png"), title="Art", description_html="", tags=[], image_width=100, image_height=100),
+            "mug_11oz",
+        )
+    )
+    assert normalized["angle"] == 13
+    assert isinstance(normalized["angle"], int)
+
+
 def test_build_printify_product_payload_uses_placement_transform():
     artwork = Artwork(
         slug="art",
@@ -1685,7 +1710,8 @@ def test_build_printify_product_payload_uses_placement_transform():
     assert image["scale"] == 0.58
     assert image["x"] == 0.5
     assert image["y"] == 0.5
-    assert image["angle"] == 0.0
+    assert image["angle"] == 0
+    assert isinstance(image["angle"], int)
 
 
 def test_run_uses_launch_plan_selection(tmp_path: Path, monkeypatch):
