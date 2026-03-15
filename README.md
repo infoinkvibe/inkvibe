@@ -327,8 +327,8 @@ Publish controls:
 - `--auto-rebuild-on-incompatible-update`: on update-only incompatibility, automatically switch to rebuild (delete+recreate) for that product.
 
 State helpers:
-- `--list-state-keys`: list tracked `artwork_slug:template_key` keys.
-- `--inspect-state-key <artwork_slug:template_key>`: show the matching state entry as JSON.
+- `--list-state-keys`: list tracked `artwork_slug:template_key` keys with completion status (`dry-run-only` or `real-completed`).
+- `--inspect-state-key <artwork_slug:template_key>`: show the matching state entry as JSON (including completion status).
 - `--list-failures`: concise list of failed combinations needing attention.
 - `--list-pending`: concise list of combinations not yet successful.
 
@@ -337,7 +337,7 @@ Bulk safety controls:
 - `--batch-size <n>`: cap processed artwork/template combinations in this run.
 - `--stop-after-failures <n>`: stop when N failures are reached.
 - `--fail-fast`: stop on first failure.
-- `--resume`: skip combinations already successful in state and continue pending rows.
+- `--resume`: skip combinations already successful in **real** (non-dry-run) state and continue pending rows.
 
 Reporting exports:
 - `--export-failure-report <path>`: CSV report for failed combinations.
@@ -377,7 +377,7 @@ python printify_shopify_sync_pipeline.py --list-pending
 ```
 
 Safer bulk rollout workflow:
-1. Dry run first (`--dry-run`) to validate templates/placements.
+1. Dry run first (`--dry-run`) to validate templates/placements. Dry-run entries are recorded for diagnostics but do **not** count as completed for `--resume`.
 2. Real run for one artwork (`--max-artworks 1 --publish --verify-publish`).
 3. Confirm state + verification fields in `state.json`.
 4. Run a small real batch (`--batch-size 5 --resume --export-failure-report reports/failures.csv`).

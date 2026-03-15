@@ -1189,6 +1189,7 @@ def test_report_row_status_classification():
     assert _row_status({"result": {"error": "boom"}}) == "failure"
     assert _row_status({"result": {"printify": {"status": "skipped"}}}) == "skipped"
     assert _row_status({"result": {"status": "no_matching_variants"}}) == "skipped"
+    assert _row_status({"result": {"printify": {"status": "dry-run"}}, "dry_run": True, "completion_status": "dry-run-only"}) == "dry-run"
     assert _row_status({"result": {"printify": {"action": "create"}}}) == "success"
 
 
@@ -1262,6 +1263,94 @@ def test_run_batch_size_and_resume_and_reporting(tmp_path: Path, monkeypatch):
     assert len(rows) == 3  # header + 2 rows
 
 
+def test_resume_does_not_skip_dry_run_only_rows(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    state = ensure_state_shape({
+        "processed": {
+            "a1": {"products": [{"state_key": "a1:t1", "dry_run": True, "completion_status": "dry-run-only", "result": {"printify": {"status": "dry-run"}}}]}
+        }
+    })
+
+    class DummyPrintifyClient:
+        def __init__(self, *args, **kwargs):
+            self.dry_run = False
+
+    monkeypatch.setattr(pipeline, "PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "load_json", lambda path, default: state)
+    monkeypatch.setattr(pipeline, "load_templates", lambda p: [
+        ProductTemplate(key="t1", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{artwork_title}", description_pattern="{artwork_title}"),
+    ])
+    monkeypatch.setattr(pipeline, "select_templates", lambda templates, **kwargs: templates)
+    monkeypatch.setattr(pipeline, "discover_artworks", lambda d: [Artwork("a1", tmp_path / "a1.png", "a1", "", [], 1000, 1000)])
+    monkeypatch.setattr(pipeline, "PrintifyClient", DummyPrintifyClient)
+    monkeypatch.setattr(pipeline, "resolve_shop_id", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "load_r2_config_from_env", lambda: None)
+    monkeypatch.setattr(pipeline, "audit_printify_integration", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "run_catalog_cli", lambda **kwargs: False)
+
+    calls = {"n": 0}
+
+    def fake_process_artwork(**kwargs):
+        calls["n"] += 1
+
+    monkeypatch.setattr(pipeline, "process_artwork", fake_process_artwork)
+
+    run(
+        tmp_path / "templates.json",
+        image_dir=tmp_path,
+        export_dir=tmp_path / "exp",
+        state_path=tmp_path / "state.json",
+        skip_audit=True,
+        resume=True,
+    )
+    assert calls["n"] == 1
+
+
+def test_resume_skips_real_completed_rows(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    state = ensure_state_shape({
+        "processed": {
+            "a1": {"products": [{"state_key": "a1:t1", "dry_run": False, "completion_status": "real-completed", "result": {"printify": {"action": "create"}}}]}
+        }
+    })
+
+    class DummyPrintifyClient:
+        def __init__(self, *args, **kwargs):
+            self.dry_run = False
+
+    monkeypatch.setattr(pipeline, "PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "load_json", lambda path, default: state)
+    monkeypatch.setattr(pipeline, "load_templates", lambda p: [
+        ProductTemplate(key="t1", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{artwork_title}", description_pattern="{artwork_title}"),
+    ])
+    monkeypatch.setattr(pipeline, "select_templates", lambda templates, **kwargs: templates)
+    monkeypatch.setattr(pipeline, "discover_artworks", lambda d: [Artwork("a1", tmp_path / "a1.png", "a1", "", [], 1000, 1000)])
+    monkeypatch.setattr(pipeline, "PrintifyClient", DummyPrintifyClient)
+    monkeypatch.setattr(pipeline, "resolve_shop_id", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "load_r2_config_from_env", lambda: None)
+    monkeypatch.setattr(pipeline, "audit_printify_integration", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "run_catalog_cli", lambda **kwargs: False)
+
+    calls = {"n": 0}
+
+    def fake_process_artwork(**kwargs):
+        calls["n"] += 1
+
+    monkeypatch.setattr(pipeline, "process_artwork", fake_process_artwork)
+
+    run(
+        tmp_path / "templates.json",
+        image_dir=tmp_path,
+        export_dir=tmp_path / "exp",
+        state_path=tmp_path / "state.json",
+        skip_audit=True,
+        resume=True,
+    )
+    assert calls["n"] == 0
+
+
 def test_run_stop_after_failures_and_fail_fast(tmp_path: Path, monkeypatch):
     import printify_shopify_sync_pipeline as pipeline
 
@@ -1316,6 +1405,29 @@ def test_list_failures_and_pending_helpers(tmp_path: Path, monkeypatch, capsys):
     run(tmp_path / "templates.json", image_dir=tmp_path, state_path=tmp_path / "state.json", list_pending_only=True)
     out2 = capsys.readouterr().out
     assert "a1:t1" in out2 and "a3:t1" in out2
+
+
+
+
+def test_list_and_inspect_state_show_completion_status(tmp_path: Path, monkeypatch, capsys):
+    import printify_shopify_sync_pipeline as pipeline
+
+    state = ensure_state_shape({
+        "processed": {
+            "a1": {"products": [{"state_key": "a1:t1", "dry_run": True, "completion_status": "dry-run-only", "result": {"printify": {"status": "dry-run"}}}]},
+            "a2": {"products": [{"state_key": "a2:t1", "dry_run": False, "completion_status": "real-completed", "result": {"printify": {"action": "create"}}}]},
+        }
+    })
+    monkeypatch.setattr(pipeline, "load_json", lambda path, default: state)
+
+    run(tmp_path / "templates.json", image_dir=tmp_path, state_path=tmp_path / "state.json", list_state_keys_only=True)
+    out = capsys.readouterr().out
+    assert "a1:t1	dry-run-only" in out
+    assert "a2:t1	real-completed" in out
+
+    run(tmp_path / "templates.json", image_dir=tmp_path, state_path=tmp_path / "state.json", inspect_state_key_value="a1:t1")
+    inspect_out = capsys.readouterr().out
+    assert '"completion_status": "dry-run-only"' in inspect_out
 
 
 def test_enforce_variant_safety_limit_raises_when_exceeded():
