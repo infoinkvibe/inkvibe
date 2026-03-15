@@ -261,8 +261,14 @@ Use a launch-plan CSV when you want explicit artwork/template pair control and p
 # 1) Export a starter file with headers + sample tee/mug rows
 python printify_shopify_sync_pipeline.py --export-launch-plan-template ./launch_plan.csv
 
-# 2) Edit rows: set enabled=true only for rows you want to run
-#    and optionally set *_override fields
+# 2) Or export a real launch plan directly from files in images/
+python printify_shopify_sync_pipeline.py --export-launch-plan-from-images ./launch_plan.csv
+
+#    You can combine with template filtering and defaults
+python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --template-key mug_11oz \
+  --export-launch-plan-from-images ./launch_plan.csv \
+  --launch-plan-default-enabled true \
+  --include-disabled-template-rows
 
 # 3) Run with launch plan (replaces folder cross-product behavior for this run)
 python printify_shopify_sync_pipeline.py --launch-plan ./launch_plan.csv --dry-run
@@ -297,6 +303,11 @@ Defaults remain centered (`x=0.5`, `y=0.5`) and unrotated (`angle=0`).
 - `mug_11oz` front: `0.78`
 
 Use dry-run logs to inspect the exact transform values applied per template/placement.
+
+InkVibeAuto now also applies orientation-aware mockup scaling automatically at payload build time:
+- orientation buckets: `portrait`, `square`, `landscape`
+- template families: mugs use smaller caps than shirts
+- the runtime scale is `min(template placement_scale, orientation preset)` so manual template overrides are preserved as an upper bound.
 
 ## Verifying a successful run
 

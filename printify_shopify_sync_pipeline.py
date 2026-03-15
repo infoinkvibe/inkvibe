@@ -119,6 +119,14 @@ class PlacementRequirement:
 
 
 @dataclass
+class PlacementTransform:
+    scale: float
+    x: float
+    y: float
+    angle: float
+
+
+@dataclass
 class ProductTemplate:
     key: str
     printify_blueprint_id: int
@@ -240,6 +248,21 @@ class ArtworkResolution:
     upscaled: bool
     original_size: Tuple[int, int]
     final_size: Tuple[int, int]
+
+
+LAUNCH_PLAN_OVERRIDE_COLUMNS = [
+    "title_override",
+    "description_override",
+    "tags_override",
+    "audience_override",
+    "style_keywords_override",
+    "seo_keywords_override",
+    "base_price_override",
+    "markup_type_override",
+    "markup_value_override",
+    "compare_at_price_override",
+    "publish_after_create_override",
+]
 
 
 # -----------------------------
@@ -1072,61 +1095,100 @@ def build_resolved_template(base_template: ProductTemplate, overrides: Dict[str,
     return resolved
 
 
+def _blank_launch_plan_override_row() -> Dict[str, str]:
+    return {column: "" for column in LAUNCH_PLAN_OVERRIDE_COLUMNS}
+
+
 def write_launch_plan_template(path: pathlib.Path) -> None:
     rows = [
         {
             "artwork_file": "tee-artwork.png",
             "template_key": "tshirt_gildan",
             "enabled": "true",
-            "title_override": "{artwork_title} T-Shirt",
-            "description_override": "",
-            "tags_override": "shirt,graphic,launch-plan",
-            "audience_override": "",
-            "style_keywords_override": "",
-            "seo_keywords_override": "",
-            "base_price_override": "",
-            "markup_type_override": "",
-            "markup_value_override": "",
-            "compare_at_price_override": "",
-            "publish_after_create_override": "",
+            **_blank_launch_plan_override_row(),
             "row_id": "tee-example-1",
         },
         {
             "artwork_file": "mug-artwork.png",
             "template_key": "mug_11oz",
             "enabled": "true",
-            "title_override": "",
-            "description_override": "",
-            "tags_override": "mug,coffee,launch-plan",
-            "audience_override": "",
-            "style_keywords_override": "",
-            "seo_keywords_override": "",
-            "base_price_override": "",
-            "markup_type_override": "",
-            "markup_value_override": "",
-            "compare_at_price_override": "",
-            "publish_after_create_override": "",
+            **_blank_launch_plan_override_row(),
             "row_id": "mug-example-1",
         },
         {
             "artwork_file": "disabled-example.png",
             "template_key": "tshirt_gildan",
             "enabled": "false",
-            "title_override": "",
-            "description_override": "",
-            "tags_override": "",
-            "audience_override": "",
-            "style_keywords_override": "",
-            "seo_keywords_override": "",
-            "base_price_override": "",
-            "markup_type_override": "",
-            "markup_value_override": "",
-            "compare_at_price_override": "",
-            "publish_after_create_override": "",
+            **_blank_launch_plan_override_row(),
             "row_id": "disabled-example",
         },
     ]
     write_csv_report(path, rows)
+
+
+def _orientation_bucket(width: int, height: int) -> str:
+    if width <= 0 or height <= 0:
+        return "square"
+    ratio = width / height
+    if ratio >= 1.2:
+        return "landscape"
+    if ratio <= (1 / 1.2):
+        return "portrait"
+    return "square"
+
+
+def compute_placement_transform_for_artwork(placement: PlacementRequirement, artwork: Artwork, template_key: str = "") -> PlacementTransform:
+    orientation = _orientation_bucket(artwork.image_width, artwork.image_height)
+    key = template_key.lower()
+    is_mug = "mug" in key
+    is_shirt = any(token in key for token in ["shirt", "tee", "hoodie", "sweatshirt"])
+
+    if is_mug:
+        scale_by_orientation = {"portrait": 0.60, "square": 0.58, "landscape": 0.54}
+    elif is_shirt:
+        scale_by_orientation = {"portrait": 0.66, "square": 0.63, "landscape": 0.59}
+    else:
+        scale_by_orientation = {"portrait": 0.68, "square": 0.64, "landscape": 0.60}
+
+    chosen_scale = min(float(placement.placement_scale), scale_by_orientation[orientation])
+    return PlacementTransform(
+        scale=chosen_scale,
+        x=float(placement.placement_x),
+        y=float(placement.placement_y),
+        angle=float(placement.placement_angle),
+    )
+
+
+def export_launch_plan_from_images(
+    *,
+    path: pathlib.Path,
+    image_dir: pathlib.Path,
+    templates: List[ProductTemplate],
+    include_disabled_template_rows: bool = False,
+    default_enabled: bool = True,
+) -> int:
+    artworks = discover_artworks(image_dir)
+    rows: List[Dict[str, str]] = []
+    for artwork in artworks:
+        rel_artwork = artwork.src_path.relative_to(image_dir)
+        for template in templates:
+            rows.append({
+                "artwork_file": rel_artwork.as_posix(),
+                "template_key": template.key,
+                "enabled": "true" if default_enabled else "false",
+                **_blank_launch_plan_override_row(),
+                "row_id": slugify(f"{artwork.slug}-{template.key}"),
+            })
+            if include_disabled_template_rows:
+                rows.append({
+                    "artwork_file": rel_artwork.as_posix(),
+                    "template_key": template.key,
+                    "enabled": "false",
+                    **_blank_launch_plan_override_row(),
+                    "row_id": slugify(f"{artwork.slug}-{template.key}-disabled"),
+                })
+    write_csv_report(path, rows)
+    return len(rows)
 
 
 def resolve_launch_plan_rows(
@@ -1154,19 +1216,7 @@ def resolve_launch_plan_rows(
             _resolve_artwork_path_for_launch_plan(artwork_file, image_dir)
             overrides = {
                 key: str(row.get(key) or "").strip()
-                for key in [
-                    "title_override",
-                    "description_override",
-                    "tags_override",
-                    "audience_override",
-                    "style_keywords_override",
-                    "seo_keywords_override",
-                    "base_price_override",
-                    "markup_type_override",
-                    "markup_value_override",
-                    "compare_at_price_override",
-                    "publish_after_create_override",
-                ]
+                for key in LAUNCH_PLAN_OVERRIDE_COLUMNS
                 if str(row.get(key) or "").strip()
             }
             launch_rows.append(LaunchPlanRow(row_number=idx, row_id=row_id, artwork_file=artwork_file, template_key=template_key, overrides=overrides))
@@ -1899,14 +1949,16 @@ def build_printify_product_payload(artwork: Artwork, template: ProductTemplate, 
     print_areas: List[Dict[str, Any]] = []
     for placement in template.placements:
         upload_info = upload_map[placement.placement_name]
+        transform = compute_placement_transform_for_artwork(placement, artwork, template.key)
         logger.info(
-            "Placement transform template=%s placement=%s scale=%.3f x=%.3f y=%.3f angle=%.3f",
+            "Placement transform template=%s placement=%s orientation=%s scale=%.3f x=%.3f y=%.3f angle=%.3f",
             template.key,
             placement.placement_name,
-            placement.placement_scale,
-            placement.placement_x,
-            placement.placement_y,
-            placement.placement_angle,
+            _orientation_bucket(artwork.image_width, artwork.image_height),
+            transform.scale,
+            transform.x,
+            transform.y,
+            transform.angle,
         )
         print_areas.append({
             "variant_ids": enabled_variant_ids,
@@ -1914,10 +1966,10 @@ def build_printify_product_payload(artwork: Artwork, template: ProductTemplate, 
                 "position": placement.placement_name,
                 "images": [{
                     "id": upload_info["id"],
-                    "x": placement.placement_x,
-                    "y": placement.placement_y,
-                    "scale": placement.placement_scale,
-                    "angle": placement.placement_angle,
+                    "x": transform.x,
+                    "y": transform.y,
+                    "scale": transform.scale,
+                    "angle": transform.angle,
                 }],
             }],
         })
@@ -2728,6 +2780,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preview-listing-copy", action="store_true", help="Render listing title/description/tags previews without creating/updating products")
     parser.add_argument("--launch-plan", default="", help="Optional CSV launch plan path; when set, process enabled rows instead of folder-scan combinations")
     parser.add_argument("--export-launch-plan-template", default="", help="Write a starter launch-plan CSV template to this path and exit")
+    parser.add_argument("--export-launch-plan-from-images", default="", help="Write a launch-plan CSV generated from files in --image-dir and exit")
+    parser.add_argument("--include-disabled-template-rows", action="store_true", help="Also include disabled rows when exporting launch-plan CSV from images")
+    parser.add_argument("--launch-plan-default-enabled", choices=["true", "false"], default="true", help="Default enabled value used by --export-launch-plan-from-images")
     parser.epilog = (
         "Examples:\n"
         "  python printify_shopify_sync_pipeline.py --dry-run --template-key tshirt_gildan --template-key mug_11oz\n"
@@ -2928,7 +2983,7 @@ def run_catalog_cli(
     return False
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "") -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True) -> None:
     if publish_mode not in {"default", "publish", "skip"}:
         raise RuntimeError(f"Unsupported publish mode: {publish_mode}")
 
@@ -2970,6 +3025,16 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             print(f"{template.key}	blueprint={template.printify_blueprint_id}	provider={template.printify_print_provider_id}")
         return
     templates = select_templates(templates, template_keys=template_keys, limit_templates=limit_templates)
+    if export_launch_plan_from_images_path:
+        exported_count = export_launch_plan_from_images(
+            path=pathlib.Path(export_launch_plan_from_images_path),
+            image_dir=image_dir,
+            templates=templates,
+            include_disabled_template_rows=include_disabled_template_rows,
+            default_enabled=launch_plan_default_enabled,
+        )
+        logger.info("Launch-plan CSV exported from images path=%s rows=%s", export_launch_plan_from_images_path, exported_count)
+        return
     artworks = discover_artworks(image_dir)
     if max_artworks > 0:
         artworks = artworks[:max_artworks]
@@ -3229,6 +3294,9 @@ if __name__ == "__main__":
             preview_listing_copy_only=args.preview_listing_copy,
             launch_plan_path=args.launch_plan,
             export_launch_plan_template=args.export_launch_plan_template,
+            export_launch_plan_from_images_path=args.export_launch_plan_from_images,
+            include_disabled_template_rows=args.include_disabled_template_rows,
+            launch_plan_default_enabled=(args.launch_plan_default_enabled == "true"),
         )
     except CatalogCliUsageError as exc:
         print(f"Catalog CLI error: {exc}")
