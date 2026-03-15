@@ -80,6 +80,9 @@ python printify_shopify_sync_pipeline.py --max-artworks 1 --template-key tshirt_
 
 # Keep only first selected template after filtering
 python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --template-key mug_11oz --limit-templates 1
+
+# Regenerate a valid mug snippet (blueprint 68 + auto-selected provider)
+python printify_shopify_sync_pipeline.py --generate-template-snippet --blueprint-id 68 --auto-provider --key mug_11oz --template-output-file ./mug_template.json
 ```
 
 ## Catalog exploration workflows
@@ -183,6 +186,9 @@ python printify_shopify_sync_pipeline.py --inspect-variants --blueprint-id <blue
 # 4) Bootstrap snippet and paste into product_templates.json
 python printify_shopify_sync_pipeline.py --generate-template-snippet --blueprint-id <blueprint_id> --provider-id <provider_id> --key mug_new --template-output-file ./mug_template.json
 
+# Example known-good mug pair
+python printify_shopify_sync_pipeline.py --inspect-variants --blueprint-id 68 --provider-id 1
+
 # 5) Test with one artwork in dry-run
 python printify_shopify_sync_pipeline.py --dry-run --template-key mug_new --max-artworks 1
 ```
@@ -275,6 +281,7 @@ Also review `state.json` for updated `processed` and `uploads` records for the l
 
 - Duplicate title wording (for example, `Signature T-Shirt T-Shirt`) is now de-duplicated automatically when rendered title context already semantically includes the product label (`tee/shirt`, `mug/cup` families).
 - Templates using `printify_blueprint_id` 6 must use a valid `printify_print_provider_id` (for example, `99` for Printify Choice).
+- Default mug sample now uses blueprint `68` with provider `1` (validate in your region/account with `--list-providers --blueprint-id 68`).
 - Printify variant responses can arrive as either a raw list or a `{"variants": [...]}` wrapper; the pipeline normalizes both, but malformed shapes now raise a clear error that includes the top-level type/keys.
 - If update calls fail with a payload consistency error (for example, missing `print_areas[*].variant_ids` coverage), InkVibeAuto now validates locally before API calls and reports missing ids directly.
 - If update preflight detects incompatibility (blueprint/provider/variant/print-area position mismatch), default behavior is conservative: fail with a recommendation to rerun using `--rebuild-product`.
