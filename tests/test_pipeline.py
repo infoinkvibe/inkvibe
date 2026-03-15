@@ -68,6 +68,10 @@ from printify_shopify_sync_pipeline import (
     format_run_summary,
     template_blueprint_type_warning,
     generate_mug_template_snippet,
+    parse_launch_plan_csv,
+    resolve_launch_plan_rows,
+    build_resolved_template,
+    build_printify_product_payload,
 )
 
 
@@ -1590,3 +1594,150 @@ def test_mug_sample_template_points_to_real_pair_and_safe_cap():
     assert mug.printify_blueprint_id == 68
     assert mug.printify_print_provider_id == 1
     assert mug.max_enabled_variants is not None and mug.max_enabled_variants <= 24
+
+
+def _launch_template() -> ProductTemplate:
+    return ProductTemplate(
+        key="tshirt_gildan",
+        printify_blueprint_id=6,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        tags=["shirt"],
+        placements=[PlacementRequirement("front", 4500, 5400)],
+        base_price="24.00",
+    )
+
+
+def test_parse_launch_plan_csv(tmp_path: Path):
+    csv_path = tmp_path / "launch.csv"
+    csv_path.write_text("artwork_file,template_key,enabled\na.png,tshirt_gildan,true\n", encoding="utf-8")
+    rows = parse_launch_plan_csv(csv_path)
+    assert rows[0]["artwork_file"] == "a.png"
+    assert rows[0]["enabled"] == "true"
+
+
+def test_resolve_launch_plan_rows_validation_and_enabled(tmp_path: Path):
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    Image.new("RGBA", (100, 100), (1, 2, 3, 255)).save(image_dir / "ok.png")
+    csv_path = tmp_path / "launch.csv"
+    csv_path.write_text(
+        "artwork_file,template_key,enabled,row_id\n"
+        "ok.png,tshirt_gildan,true,row-ok\n"
+        "missing.png,tshirt_gildan,true,row-missing\n"
+        "ok.png,tshirt_gildan,false,row-disabled\n",
+        encoding="utf-8",
+    )
+    rows, failures = resolve_launch_plan_rows(
+        launch_plan_path=csv_path,
+        templates=[_launch_template()],
+        image_dir=image_dir,
+    )
+    assert len(rows) == 1
+    assert rows[0].row_id == "row-ok"
+    assert len(failures) == 1
+    assert failures[0].launch_plan_row_id == "row-missing"
+
+
+def test_build_resolved_template_applies_overrides():
+    base = _launch_template()
+    resolved = build_resolved_template(base, {
+        "title_override": "{artwork_title} Tee",
+        "tags_override": "a,b",
+        "base_price_override": "19.99",
+        "publish_after_create_override": "false",
+    })
+    assert base.title_pattern == "{artwork_title}"
+    assert resolved.title_pattern == "{artwork_title} Tee"
+    assert resolved.tags == ["a", "b"]
+    assert resolved.base_price == "19.99"
+    assert resolved.publish_after_create is False
+
+
+def test_build_printify_product_payload_uses_placement_transform():
+    artwork = Artwork(
+        slug="art",
+        src_path=Path("art.png"),
+        title="Art",
+        description_html="",
+        tags=[],
+        image_width=100,
+        image_height=100,
+    )
+    template = ProductTemplate(
+        key="mug_11oz",
+        printify_blueprint_id=68,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[PlacementRequirement("front", 2700, 1120, placement_scale=0.78, placement_x=0.5, placement_y=0.5, placement_angle=0.0)],
+    )
+    payload = build_printify_product_payload(
+        artwork,
+        template,
+        variant_rows=[{"id": 1, "price": 1200}],
+        upload_map={"front": {"id": "upload-1"}},
+    )
+    image = payload["print_areas"][0]["placeholders"][0]["images"][0]
+    assert image["scale"] == 0.78
+    assert image["x"] == 0.5
+    assert image["y"] == 0.5
+    assert image["angle"] == 0.0
+
+
+def test_run_uses_launch_plan_selection(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    Image.new("RGBA", (2000, 2000), (255, 0, 0, 255)).save(image_dir / "one.png")
+    Image.new("RGBA", (2000, 2000), (255, 0, 0, 255)).save(image_dir / "two.png")
+
+    templates_path = tmp_path / "templates.json"
+    templates_path.write_text(json.dumps([
+        {
+            "key": "tshirt_gildan",
+            "printify_blueprint_id": 6,
+            "printify_print_provider_id": 99,
+            "title_pattern": "{artwork_title}",
+            "description_pattern": "{artwork_title}",
+            "placements": [{"placement_name": "front", "width_px": 1000, "height_px": 1000}],
+        }
+    ]), encoding="utf-8")
+
+    launch_csv = tmp_path / "launch.csv"
+    launch_csv.write_text(
+        "artwork_file,template_key,enabled,row_id\n"
+        "one.png,tshirt_gildan,true,row-1\n"
+        "two.png,tshirt_gildan,false,row-2\n",
+        encoding="utf-8",
+    )
+
+    class DummyPrintifyClient:
+        def __init__(self, *args, **kwargs):
+            self.dry_run = True
+
+    calls = []
+
+    def fake_process_artwork(**kwargs):
+        calls.append((kwargs["artwork"].src_path.name, kwargs.get("launch_plan_row_id")))
+
+    monkeypatch.setattr(pipeline, "process_artwork", fake_process_artwork)
+    monkeypatch.setattr(pipeline, "audit_printify_integration", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "resolve_shop_id", lambda *a, **k: 1)
+    monkeypatch.setattr(pipeline, "load_r2_config_from_env", lambda: None)
+    monkeypatch.setattr(pipeline, "PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "PrintifyClient", DummyPrintifyClient)
+    monkeypatch.setattr(pipeline, "run_catalog_cli", lambda **kwargs: False)
+
+    run(
+        templates_path,
+        dry_run=True,
+        image_dir=image_dir,
+        export_dir=tmp_path / "exports",
+        state_path=tmp_path / "state.json",
+        launch_plan_path=str(launch_csv),
+    )
+
+    assert calls == [("one.png", "row-1")]

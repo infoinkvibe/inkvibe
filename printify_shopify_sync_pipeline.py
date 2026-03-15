@@ -13,7 +13,7 @@ import random
 import re
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -112,6 +112,10 @@ class PlacementRequirement:
     allow_upscale: bool = False
     transparent_background_required: bool = False
     padding_pct: float = 0.0
+    placement_scale: float = 1.0
+    placement_x: float = 0.5
+    placement_y: float = 0.5
+    placement_angle: float = 0.0
 
 
 @dataclass
@@ -180,6 +184,8 @@ class FailureReportRow:
     error_type: str
     error_message: str
     suggested_next_action: str
+    launch_plan_row: str = ""
+    launch_plan_row_id: str = ""
 
 
 @dataclass
@@ -197,6 +203,17 @@ class RunReportRow:
     publish_attempted: bool
     publish_verified: bool
     rendered_title: str
+    launch_plan_row: str = ""
+    launch_plan_row_id: str = ""
+
+
+@dataclass
+class LaunchPlanRow:
+    row_number: int
+    row_id: str
+    artwork_file: str
+    template_key: str
+    overrides: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -994,6 +1011,184 @@ def write_csv_report(path: pathlib.Path, rows: List[Dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def _is_truthy_csv(value: str) -> bool:
+    normalized = str(value or "").strip().lower()
+    return normalized in {"1", "true", "yes", "y", "on"}
+
+
+def _split_csv_keywords(value: str) -> List[str]:
+    return [part.strip() for part in str(value or "").split(",") if part.strip()]
+
+
+def _resolve_artwork_path_for_launch_plan(artwork_file: str, image_dir: pathlib.Path) -> pathlib.Path:
+    value = str(artwork_file or "").strip()
+    if not value:
+        raise ValueError("artwork_file is required")
+    candidate = pathlib.Path(value)
+    if candidate.is_file():
+        return candidate
+    image_candidate = image_dir / value
+    if image_candidate.is_file():
+        return image_candidate
+    raise ValueError(f"artwork_file not found: {value} (checked as provided and under {image_dir})")
+
+
+def parse_launch_plan_csv(path: pathlib.Path) -> List[Dict[str, str]]:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames:
+            raise ValueError("Launch plan CSV is missing headers")
+        rows: List[Dict[str, str]] = []
+        for row in reader:
+            normalized = {str(k or "").strip(): str(v or "").strip() for k, v in row.items()}
+            rows.append(normalized)
+    return rows
+
+
+def build_resolved_template(base_template: ProductTemplate, overrides: Dict[str, str]) -> ProductTemplate:
+    resolved = replace(base_template)
+    if overrides.get("title_override"):
+        resolved.title_pattern = overrides["title_override"]
+    if overrides.get("description_override"):
+        resolved.description_pattern = overrides["description_override"]
+    if overrides.get("tags_override"):
+        resolved.tags = _split_csv_keywords(overrides["tags_override"])
+    if overrides.get("audience_override"):
+        resolved.audience = overrides["audience_override"]
+    if overrides.get("style_keywords_override"):
+        resolved.style_keywords = _split_csv_keywords(overrides["style_keywords_override"])
+    if overrides.get("seo_keywords_override"):
+        resolved.seo_keywords = _split_csv_keywords(overrides["seo_keywords_override"])
+    if overrides.get("base_price_override"):
+        resolved.base_price = overrides["base_price_override"]
+    if overrides.get("markup_type_override"):
+        resolved.markup_type = overrides["markup_type_override"]
+    if overrides.get("markup_value_override"):
+        resolved.markup_value = overrides["markup_value_override"]
+    if overrides.get("compare_at_price_override"):
+        resolved.compare_at_price = overrides["compare_at_price_override"]
+    if overrides.get("publish_after_create_override"):
+        resolved.publish_after_create = _is_truthy_csv(overrides["publish_after_create_override"])
+    return resolved
+
+
+def write_launch_plan_template(path: pathlib.Path) -> None:
+    rows = [
+        {
+            "artwork_file": "tee-artwork.png",
+            "template_key": "tshirt_gildan",
+            "enabled": "true",
+            "title_override": "{artwork_title} T-Shirt",
+            "description_override": "",
+            "tags_override": "shirt,graphic,launch-plan",
+            "audience_override": "",
+            "style_keywords_override": "",
+            "seo_keywords_override": "",
+            "base_price_override": "",
+            "markup_type_override": "",
+            "markup_value_override": "",
+            "compare_at_price_override": "",
+            "publish_after_create_override": "",
+            "row_id": "tee-example-1",
+        },
+        {
+            "artwork_file": "mug-artwork.png",
+            "template_key": "mug_11oz",
+            "enabled": "true",
+            "title_override": "",
+            "description_override": "",
+            "tags_override": "mug,coffee,launch-plan",
+            "audience_override": "",
+            "style_keywords_override": "",
+            "seo_keywords_override": "",
+            "base_price_override": "",
+            "markup_type_override": "",
+            "markup_value_override": "",
+            "compare_at_price_override": "",
+            "publish_after_create_override": "",
+            "row_id": "mug-example-1",
+        },
+        {
+            "artwork_file": "disabled-example.png",
+            "template_key": "tshirt_gildan",
+            "enabled": "false",
+            "title_override": "",
+            "description_override": "",
+            "tags_override": "",
+            "audience_override": "",
+            "style_keywords_override": "",
+            "seo_keywords_override": "",
+            "base_price_override": "",
+            "markup_type_override": "",
+            "markup_value_override": "",
+            "compare_at_price_override": "",
+            "publish_after_create_override": "",
+            "row_id": "disabled-example",
+        },
+    ]
+    write_csv_report(path, rows)
+
+
+def resolve_launch_plan_rows(
+    *,
+    launch_plan_path: pathlib.Path,
+    templates: List[ProductTemplate],
+    image_dir: pathlib.Path,
+) -> Tuple[List[LaunchPlanRow], List[FailureReportRow]]:
+    template_map = {template.key: template for template in templates}
+    launch_rows: List[LaunchPlanRow] = []
+    failures: List[FailureReportRow] = []
+    raw_rows = parse_launch_plan_csv(launch_plan_path)
+    for idx, row in enumerate(raw_rows, start=2):
+        row_id = str(row.get("row_id") or "").strip() or str(idx)
+        enabled_value = str(row.get("enabled") or "").strip()
+        if enabled_value and not _is_truthy_csv(enabled_value):
+            continue
+        artwork_file = str(row.get("artwork_file") or "").strip()
+        template_key = str(row.get("template_key") or "").strip()
+        try:
+            if not template_key:
+                raise ValueError("template_key is required")
+            if template_key not in template_map:
+                raise ValueError(f"Unknown template_key '{template_key}'")
+            _resolve_artwork_path_for_launch_plan(artwork_file, image_dir)
+            overrides = {
+                key: str(row.get(key) or "").strip()
+                for key in [
+                    "title_override",
+                    "description_override",
+                    "tags_override",
+                    "audience_override",
+                    "style_keywords_override",
+                    "seo_keywords_override",
+                    "base_price_override",
+                    "markup_type_override",
+                    "markup_value_override",
+                    "compare_at_price_override",
+                    "publish_after_create_override",
+                ]
+                if str(row.get(key) or "").strip()
+            }
+            launch_rows.append(LaunchPlanRow(row_number=idx, row_id=row_id, artwork_file=artwork_file, template_key=template_key, overrides=overrides))
+        except Exception as exc:
+            failures.append(FailureReportRow(
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                artwork_filename=artwork_file,
+                artwork_slug=slugify(pathlib.Path(artwork_file).stem) if artwork_file else "",
+                template_key=template_key,
+                action_attempted="validate_launch_plan_row",
+                blueprint_id=0,
+                provider_id=0,
+                upload_strategy="n/a",
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+                suggested_next_action="Fix launch-plan row and rerun.",
+                launch_plan_row=str(idx),
+                launch_plan_row_id=row_id,
+            ))
+    return launch_rows, failures
+
+
 # -----------------------------
 # HTTP clients
 # -----------------------------
@@ -1501,6 +1696,8 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
         for field_name in ["placement_name", "width_px", "height_px"]:
             if field_name not in placement:
                 raise TemplateValidationError(f"Template[{index}] placement[{pidx}] missing '{field_name}'")
+        if "placement_scale" in placement and float(placement["placement_scale"]) <= 0:
+            raise TemplateValidationError(f"Template[{index}] placement[{pidx}] placement_scale must be > 0")
     if row.get("markup_type", "fixed") not in {"fixed", "percent"}:
         raise TemplateValidationError(f"Template[{index}] markup_type must be fixed|percent")
     if row.get("rounding_mode", "none") not in {"none", "whole_dollar", "x_99"}:
@@ -1702,11 +1899,26 @@ def build_printify_product_payload(artwork: Artwork, template: ProductTemplate, 
     print_areas: List[Dict[str, Any]] = []
     for placement in template.placements:
         upload_info = upload_map[placement.placement_name]
+        logger.info(
+            "Placement transform template=%s placement=%s scale=%.3f x=%.3f y=%.3f angle=%.3f",
+            template.key,
+            placement.placement_name,
+            placement.placement_scale,
+            placement.placement_x,
+            placement.placement_y,
+            placement.placement_angle,
+        )
         print_areas.append({
             "variant_ids": enabled_variant_ids,
             "placeholders": [{
                 "position": placement.placement_name,
-                "images": [{"id": upload_info["id"], "x": 0.5, "y": 0.5, "scale": 1, "angle": 0}],
+                "images": [{
+                    "id": upload_info["id"],
+                    "x": placement.placement_x,
+                    "y": placement.placement_y,
+                    "scale": placement.placement_scale,
+                    "angle": placement.placement_angle,
+                }],
             }],
         })
         # TODO: Provider-specific print_areas can differ by blueprint/provider. Validate generated transforms
@@ -2175,12 +2387,14 @@ def upsert_in_printify(
     return result
 
 
-def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, summary: Optional[RunSummary] = None, failure_rows: Optional[List[FailureReportRow]] = None, run_rows: Optional[List[RunReportRow]] = None) -> None:
+def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, summary: Optional[RunSummary] = None, failure_rows: Optional[List[FailureReportRow]] = None, run_rows: Optional[List[RunReportRow]] = None, launch_plan_row: str = "", launch_plan_row_id: str = "") -> None:
     processed = state.setdefault("processed", {})
     existing = processed.get(artwork.slug, {})
     existing_products = existing.get("products", []) if isinstance(existing.get("products", []), list) else []
 
     logger.info("Processing artwork: %s", artwork.src_path.name)
+    if launch_plan_row or launch_plan_row_id:
+        logger.info("Launch-plan context row=%s row_id=%s", launch_plan_row or "-", launch_plan_row_id or "-")
     record: Dict[str, Any] = {
         "products": existing_products if (existing_products and not force) else [],
         "completed": False,
@@ -2250,6 +2464,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                         publish_attempted=False,
                         publish_verified=False,
                         rendered_title=rendered_title,
+                        launch_plan_row=launch_plan_row,
+                        launch_plan_row_id=launch_plan_row_id,
                     ))
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=True, result=result, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
@@ -2263,7 +2479,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 result = {"status": "no_matching_variants"}
                 record["products"].append({"template": template.key, "state_key": state_key, "title_source": title_info.title_source, "rendered_title": rendered_title, "result": result})
                 if run_rows is not None:
-                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", template.printify_blueprint_id, template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title))
+                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", template.printify_blueprint_id, template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, launch_plan_row, launch_plan_row_id))
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
@@ -2295,7 +2511,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     "result": result,
                 })
                 if run_rows is not None:
-                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", template.printify_blueprint_id, template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title))
+                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", template.printify_blueprint_id, template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, launch_plan_row, launch_plan_row_id))
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
@@ -2406,9 +2622,11 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     error_type=type(exc).__name__,
                     error_message=str(exc),
                     suggested_next_action="Inspect state and rerun with --resume after fixing template or artwork",
+                    launch_plan_row=launch_plan_row,
+                    launch_plan_row_id=launch_plan_row_id,
                 ))
             if run_rows is not None:
-                run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "failure", action, template.printify_blueprint_id, template.printify_print_provider_id, summarize_upload_strategy(upload_map), "", False, False, rendered_title))
+                run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "failure", action, template.printify_blueprint_id, template.printify_print_provider_id, summarize_upload_strategy(upload_map), "", False, False, rendered_title, launch_plan_row, launch_plan_row_id))
             log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": error_result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action=action, upload_map=upload_map)
         save_json_atomic(state_path, state)
         logger.info("State persisted after template processing state_path=%s", state_path)
@@ -2508,6 +2726,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--export-failure-report", default="", help="Optional CSV export path for failed combinations")
     parser.add_argument("--export-run-report", default="", help="Optional CSV export path for all processed combinations")
     parser.add_argument("--preview-listing-copy", action="store_true", help="Render listing title/description/tags previews without creating/updating products")
+    parser.add_argument("--launch-plan", default="", help="Optional CSV launch plan path; when set, process enabled rows instead of folder-scan combinations")
+    parser.add_argument("--export-launch-plan-template", default="", help="Write a starter launch-plan CSV template to this path and exit")
     parser.epilog = (
         "Examples:\n"
         "  python printify_shopify_sync_pipeline.py --dry-run --template-key tshirt_gildan --template-key mug_11oz\n"
@@ -2708,9 +2928,14 @@ def run_catalog_cli(
     return False
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False) -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "") -> None:
     if publish_mode not in {"default", "publish", "skip"}:
         raise RuntimeError(f"Unsupported publish mode: {publish_mode}")
+
+    if export_launch_plan_template:
+        write_launch_plan_template(pathlib.Path(export_launch_plan_template))
+        logger.info("Launch-plan CSV template exported path=%s", export_launch_plan_template)
+        return
 
     state = ensure_state_shape(load_json(state_path, {}))
     if list_state_keys_only:
@@ -2801,17 +3026,49 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
     artwork_options = ArtworkProcessingOptions(allow_upscale=allow_upscale, upscale_method=upscale_method, skip_undersized=skip_undersized)
     combinations_processed = 0
     stop_requested = False
-    for artwork in artworks:
-        templates_for_artwork: List[ProductTemplate] = []
-        for template in templates:
+
+    if launch_plan_path:
+        template_by_key = {template.key: template for template in templates}
+        artwork_by_path: Dict[str, Artwork] = {}
+        for artwork in artworks:
+            artwork_by_path[str(artwork.src_path.resolve())] = artwork
+            artwork_by_path[str(artwork.src_path)] = artwork
+            artwork_by_path[artwork.src_path.name] = artwork
+            artwork_by_path[str(artwork.src_path.relative_to(image_dir))] = artwork if artwork.src_path.is_relative_to(image_dir) else artwork
+
+        launch_rows, validation_failures = resolve_launch_plan_rows(
+            launch_plan_path=pathlib.Path(launch_plan_path),
+            templates=templates,
+            image_dir=image_dir,
+        )
+        failure_rows.extend(validation_failures)
+        summary.failures += len(validation_failures)
+
+        for launch_row in launch_rows:
             if batch_size > 0 and combinations_processed >= batch_size:
                 stop_requested = True
                 break
+            artwork_path = _resolve_artwork_path_for_launch_plan(launch_row.artwork_file, image_dir)
+            lookup_keys = [str(artwork_path.resolve()), str(artwork_path), artwork_path.name]
+            artwork = next((artwork_by_path.get(key) for key in lookup_keys if artwork_by_path.get(key) is not None), None)
+            if artwork is None:
+                with Image.open(artwork_path) as im:
+                    width, height = im.size
+                title = filename_slug_to_title(artwork_path.stem)
+                artwork = Artwork(
+                    slug=slugify(artwork_path.stem),
+                    src_path=artwork_path,
+                    title=title,
+                    description_html=f"<p>{title}</p>",
+                    tags=DEFAULT_TAGS.copy(),
+                    image_width=width,
+                    image_height=height,
+                    metadata=load_artwork_metadata(artwork_path),
+                )
+            template = build_resolved_template(template_by_key[launch_row.template_key], launch_row.overrides)
             if resume and is_state_key_successful(state, f"{artwork.slug}:{template.key}"):
                 continue
-            templates_for_artwork.append(template)
             combinations_processed += 1
-        for template in templates_for_artwork:
             before_failures = summary.failures
             process_artwork(
                 printify=printify,
@@ -2835,6 +3092,8 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                 summary=summary,
                 failure_rows=failure_rows,
                 run_rows=run_rows,
+                launch_plan_row=str(launch_row.row_number),
+                launch_plan_row_id=launch_row.row_id,
             )
             if summary.failures > before_failures:
                 if fail_fast:
@@ -2843,8 +3102,51 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                 if stop_after_failures > 0 and summary.failures >= stop_after_failures:
                     stop_requested = True
                     break
-        if stop_requested:
-            break
+    else:
+        for artwork in artworks:
+            templates_for_artwork: List[ProductTemplate] = []
+            for template in templates:
+                if batch_size > 0 and combinations_processed >= batch_size:
+                    stop_requested = True
+                    break
+                if resume and is_state_key_successful(state, f"{artwork.slug}:{template.key}"):
+                    continue
+                templates_for_artwork.append(template)
+                combinations_processed += 1
+            for template in templates_for_artwork:
+                before_failures = summary.failures
+                process_artwork(
+                    printify=printify,
+                    shopify=shopify,
+                    shop_id=shop_id,
+                    artwork=artwork,
+                    templates=[template],
+                    state=state,
+                    force=force,
+                    export_dir=export_dir,
+                    state_path=state_path,
+                    artwork_options=artwork_options,
+                    upload_strategy=upload_strategy,
+                    r2_config=r2_config,
+                    create_only=create_only,
+                    update_only=update_only,
+                    rebuild_product=rebuild_product,
+                    publish_mode=publish_mode,
+                    verify_publish=verify_publish,
+                    auto_rebuild_on_incompatible_update=auto_rebuild_on_incompatible_update,
+                    summary=summary,
+                    failure_rows=failure_rows,
+                    run_rows=run_rows,
+                )
+                if summary.failures > before_failures:
+                    if fail_fast:
+                        stop_requested = True
+                        break
+                    if stop_after_failures > 0 and summary.failures >= stop_after_failures:
+                        stop_requested = True
+                        break
+            if stop_requested:
+                break
 
     summary.combinations_processed = len(run_rows)
     summary.combinations_success = sum(1 for row in run_rows if row.status == "success")
@@ -2925,6 +3227,8 @@ if __name__ == "__main__":
             export_failure_report=args.export_failure_report,
             export_run_report=args.export_run_report,
             preview_listing_copy_only=args.preview_listing_copy,
+            launch_plan_path=args.launch_plan,
+            export_launch_plan_template=args.export_launch_plan_template,
         )
     except CatalogCliUsageError as exc:
         print(f"Catalog CLI error: {exc}")
