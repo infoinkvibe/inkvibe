@@ -69,6 +69,8 @@ from printify_shopify_sync_pipeline import (
     template_blueprint_type_warning,
     generate_mug_template_snippet,
     parse_launch_plan_csv,
+    compute_placement_transform_for_artwork,
+    export_launch_plan_from_images,
     resolve_launch_plan_rows,
     build_resolved_template,
     build_printify_product_payload,
@@ -1680,7 +1682,7 @@ def test_build_printify_product_payload_uses_placement_transform():
         upload_map={"front": {"id": "upload-1"}},
     )
     image = payload["print_areas"][0]["placeholders"][0]["images"][0]
-    assert image["scale"] == 0.78
+    assert image["scale"] == 0.58
     assert image["x"] == 0.5
     assert image["y"] == 0.5
     assert image["angle"] == 0.0
@@ -1741,3 +1743,59 @@ def test_run_uses_launch_plan_selection(tmp_path: Path, monkeypatch):
     )
 
     assert calls == [("one.png", "row-1")]
+
+
+def test_compute_placement_transform_for_mug_landscape_caps_scale():
+    artwork = Artwork(
+        slug="wide",
+        src_path=Path("wide.png"),
+        title="Wide",
+        description_html="",
+        tags=[],
+        image_width=2200,
+        image_height=1000,
+    )
+    placement = PlacementRequirement("front", 2700, 1120, placement_scale=0.78, placement_x=0.4, placement_y=0.6, placement_angle=0.0)
+    transform = compute_placement_transform_for_artwork(placement, artwork, "mug_11oz")
+    assert transform.scale == 0.54
+    assert transform.x == 0.4
+    assert transform.y == 0.6
+
+
+def test_export_launch_plan_from_images_uses_real_files(tmp_path: Path):
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    Image.new("RGBA", (100, 100), (1, 2, 3, 255)).save(image_dir / "one.png")
+    Image.new("RGBA", (100, 100), (1, 2, 3, 255)).save(image_dir / "two.png")
+
+    out_csv = tmp_path / "launch.csv"
+    rows = export_launch_plan_from_images(
+        path=out_csv,
+        image_dir=image_dir,
+        templates=[_launch_template()],
+        include_disabled_template_rows=False,
+        default_enabled=True,
+    )
+    parsed = parse_launch_plan_csv(out_csv)
+    assert rows == 2
+    assert {row["artwork_file"] for row in parsed} == {"one.png", "two.png"}
+    assert {row["template_key"] for row in parsed} == {"tshirt_gildan"}
+    assert all(row["enabled"] == "true" for row in parsed)
+
+
+def test_export_launch_plan_from_images_can_include_disabled_rows(tmp_path: Path):
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    Image.new("RGBA", (100, 100), (1, 2, 3, 255)).save(image_dir / "one.png")
+
+    out_csv = tmp_path / "launch.csv"
+    rows = export_launch_plan_from_images(
+        path=out_csv,
+        image_dir=image_dir,
+        templates=[_launch_template()],
+        include_disabled_template_rows=True,
+        default_enabled=False,
+    )
+    parsed = parse_launch_plan_csv(out_csv)
+    assert rows == 2
+    assert [row["enabled"] for row in parsed] == ["false", "false"]
