@@ -50,7 +50,11 @@
         "placement_name": "front",
         "width_px": 4500,
         "height_px": 5400,
-        "allow_upscale": false
+        "allow_upscale": false,
+        "placement_scale": 0.9,
+        "placement_x": 0.5,
+        "placement_y": 0.5,
+        "placement_angle": 0
       }
     ]
   },
@@ -104,7 +108,11 @@
         "placement_name": "front",
         "width_px": 2700,
         "height_px": 1120,
-        "allow_upscale": false
+        "allow_upscale": false,
+        "placement_scale": 0.78,
+        "placement_x": 0.5,
+        "placement_y": 0.5,
+        "placement_angle": 0
       }
     ]
   }

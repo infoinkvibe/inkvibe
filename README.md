@@ -252,6 +252,52 @@ python printify_shopify_sync_pipeline.py --allow-upscale --force --max-artworks 
 > Upscaling low-resolution source art can reduce final print quality, even when the pipeline completes successfully.
 
 
+
+## Launch plan CSV workflow
+
+Use a launch-plan CSV when you want explicit artwork/template pair control and per-row overrides.
+
+```bash
+# 1) Export a starter file with headers + sample tee/mug rows
+python printify_shopify_sync_pipeline.py --export-launch-plan-template ./launch_plan.csv
+
+# 2) Edit rows: set enabled=true only for rows you want to run
+#    and optionally set *_override fields
+
+# 3) Run with launch plan (replaces folder cross-product behavior for this run)
+python printify_shopify_sync_pipeline.py --launch-plan ./launch_plan.csv --dry-run
+```
+
+Supported CSV columns:
+- `artwork_file`, `template_key`, `enabled`
+- `title_override`, `description_override`, `tags_override`
+- `audience_override`, `style_keywords_override`, `seo_keywords_override`
+- `base_price_override`, `markup_type_override`, `markup_value_override`, `compare_at_price_override`
+- `publish_after_create_override`
+- optional `row_id` (propagates to run/failure reports)
+
+Example rows:
+
+```csv
+artwork_file,template_key,enabled,title_override,tags_override,row_id
+tee-artwork.png,tshirt_gildan,true,{artwork_title} T-Shirt,"shirt,graphic,launch",tee-001
+mug-artwork.png,mug_11oz,true,,"mug,coffee,launch",mug-001
+```
+
+## Placement transform tuning (mockup sizing)
+
+Each placement supports optional transform fields:
+- `placement_scale` (visual size)
+- `placement_x`, `placement_y` (anchor position)
+- `placement_angle` (rotation)
+
+Defaults remain centered (`x=0.5`, `y=0.5`) and unrotated (`angle=0`).
+`placement_scale` is now tuned smaller by default for:
+- `tshirt_gildan` front: `0.9`
+- `mug_11oz` front: `0.78`
+
+Use dry-run logs to inspect the exact transform values applied per template/placement.
+
 ## Verifying a successful run
 
 After a non-dry-run execution, verify success by checking logs for:
