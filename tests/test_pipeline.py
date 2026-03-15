@@ -135,6 +135,98 @@ def test_choose_variants_from_catalog_accepts_wrapped_dict_shape():
     assert [v["id"] for v in chosen] == [10]
 
 
+
+def test_choose_variants_from_catalog_ignores_color_filter_when_color_dimension_missing(caplog):
+    template = ProductTemplate(
+        key="mug_11oz",
+        printify_blueprint_id=68,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_colors=["White"],
+        enabled_sizes=["11oz"],
+    )
+    variants = [
+        {"id": 21, "is_available": True, "options": {"size": "11oz"}},
+        {"id": 22, "is_available": False, "options": {"size": "11oz"}},
+    ]
+
+    with caplog.at_level("WARNING"):
+        chosen = choose_variants_from_catalog(variants, template)
+
+    assert [v["id"] for v in chosen] == [21]
+    assert "specifies enabled_colors" in caplog.text
+    assert "blueprint 68/provider 1" in caplog.text
+
+
+def test_choose_variants_from_catalog_ignores_size_filter_when_size_dimension_missing(caplog):
+    template = ProductTemplate(
+        key="poster",
+        printify_blueprint_id=700,
+        printify_print_provider_id=44,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_colors=["Black"],
+        enabled_sizes=["18x24"],
+    )
+    variants = [
+        {"id": 31, "is_available": True, "options": {"color": "Black"}},
+        {"id": 32, "is_available": True, "options": {"color": "White"}},
+    ]
+
+    with caplog.at_level("WARNING"):
+        chosen = choose_variants_from_catalog(variants, template)
+
+    assert [v["id"] for v in chosen] == [31]
+    assert "specifies enabled_sizes" in caplog.text
+    assert "blueprint 700/provider 44" in caplog.text
+
+
+def test_choose_variants_from_catalog_ignores_color_and_size_when_both_dimensions_missing(caplog):
+    template = ProductTemplate(
+        key="single_variant",
+        printify_blueprint_id=900,
+        printify_print_provider_id=2,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_colors=["White"],
+        enabled_sizes=["One Size"],
+    )
+    variants = [
+        {"id": 41, "is_available": True, "options": {}},
+        {"id": 42, "is_available": False, "options": {}},
+    ]
+
+    with caplog.at_level("WARNING"):
+        chosen = choose_variants_from_catalog(variants, template)
+
+    assert [v["id"] for v in chosen] == [41]
+    assert "specifies enabled_colors" in caplog.text
+    assert "specifies enabled_sizes" in caplog.text
+
+
+def test_choose_variants_from_catalog_keeps_strict_filtering_when_dimensions_exist():
+    template = ProductTemplate(
+        key="tee",
+        printify_blueprint_id=6,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_colors=["Black"],
+        enabled_sizes=["M"],
+    )
+    variants = [
+        {"id": 51, "is_available": True, "options": {"color": "Black", "size": "M"}},
+        {"id": 52, "is_available": True, "options": {"color": "White", "size": "M"}},
+        {"id": 53, "is_available": True, "options": {"color": "Black", "size": "L"}},
+        {"id": 54, "is_available": True, "options": {"color": "White", "size": "L"}},
+    ]
+
+    chosen = choose_variants_from_catalog(variants, template)
+
+    assert [v["id"] for v in chosen] == [51]
+
+
 def test_normalize_catalog_variants_response_rejects_malformed_string():
     with pytest.raises(ValueError, match="got type=str"):
         normalize_catalog_variants_response("bad payload")

@@ -1553,6 +1553,27 @@ def choose_variants_from_catalog(catalog_variants: Any, template: ProductTemplat
     catalog_variants = normalize_catalog_variants_response(catalog_variants)
     chosen: List[Dict[str, Any]] = []
     option_filters = {str(k).lower().strip(): {str(v).strip() for v in values} for k, values in (template.enabled_variant_option_filters or {}).items() if values}
+    color_option_exists = any(_variant_option_value(variant, "color") for variant in catalog_variants)
+    size_option_exists = any(_variant_option_value(variant, "size") for variant in catalog_variants)
+
+    should_filter_colors = bool(template.enabled_colors) and color_option_exists
+    should_filter_sizes = bool(template.enabled_sizes) and size_option_exists
+
+    if template.enabled_colors and not color_option_exists:
+        logger.warning(
+            "Template %s specifies enabled_colors, but blueprint %s/provider %s exposes no color option; ignoring color filter.",
+            template.key,
+            template.printify_blueprint_id,
+            template.printify_print_provider_id,
+        )
+    if template.enabled_sizes and not size_option_exists:
+        logger.warning(
+            "Template %s specifies enabled_sizes, but blueprint %s/provider %s exposes no size option; ignoring size filter.",
+            template.key,
+            template.printify_blueprint_id,
+            template.printify_print_provider_id,
+        )
+
     for variant in catalog_variants:
         color = _variant_option_value(variant, "color")
         size = _variant_option_value(variant, "size")
@@ -1563,7 +1584,10 @@ def choose_variants_from_catalog(catalog_variants: Any, template: ProductTemplat
                 option_filter_ok = False
                 break
 
-        if (not template.enabled_colors or color in template.enabled_colors) and (not template.enabled_sizes or size in template.enabled_sizes) and option_filter_ok and is_available:
+        color_ok = (not should_filter_colors) or color in template.enabled_colors
+        size_ok = (not should_filter_sizes) or size in template.enabled_sizes
+
+        if color_ok and size_ok and option_filter_ok and is_available:
             chosen.append(variant)
     effective_limit = template.max_enabled_variants if template.max_enabled_variants is not None else DEFAULT_MAX_ENABLED_VARIANTS
     if effective_limit > 0 and len(chosen) > effective_limit:
