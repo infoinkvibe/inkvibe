@@ -75,6 +75,7 @@ from printify_shopify_sync_pipeline import (
     build_resolved_template,
     build_printify_product_payload,
     normalize_printify_transform,
+    resolve_artwork_for_placement,
 )
 
 
@@ -262,7 +263,7 @@ def _create_artwork(tmp_path: Path, width: int, height: int) -> Artwork:
 def test_strict_default_failure_on_undersized_image(tmp_path: Path):
     artwork = _create_artwork(tmp_path, 495, 504)
     template = _template_for_variant_tests()
-    placement = PlacementRequirement("front", 4500, 5400)
+    placement = PlacementRequirement("front", 4500, 5400, artwork_fit_mode="cover")
     with pytest.raises(ValueError, match="image too small"):
         prepare_artwork_export(artwork, template, placement, tmp_path / "exports", ArtworkProcessingOptions())
 
@@ -270,7 +271,7 @@ def test_strict_default_failure_on_undersized_image(tmp_path: Path):
 def test_skip_behavior_with_skip_undersized(tmp_path: Path):
     artwork = _create_artwork(tmp_path, 495, 504)
     template = _template_for_variant_tests()
-    placement = PlacementRequirement("front", 4500, 5400)
+    placement = PlacementRequirement("front", 4500, 5400, artwork_fit_mode="cover")
     result = prepare_artwork_export(
         artwork,
         template,
@@ -284,7 +285,7 @@ def test_skip_behavior_with_skip_undersized(tmp_path: Path):
 def test_upscale_behavior_with_allow_upscale(tmp_path: Path):
     artwork = _create_artwork(tmp_path, 495, 504)
     template = _template_for_variant_tests()
-    placement = PlacementRequirement("front", 4500, 5400)
+    placement = PlacementRequirement("front", 4500, 5400, artwork_fit_mode="cover")
     result = prepare_artwork_export(
         artwork,
         template,
@@ -1825,3 +1826,122 @@ def test_export_launch_plan_from_images_can_include_disabled_rows(tmp_path: Path
     parsed = parse_launch_plan_csv(out_csv)
     assert rows == 2
     assert [row["enabled"] for row in parsed] == ["false", "false"]
+
+
+def test_contain_mode_preserves_full_image_bounds_with_padding(tmp_path: Path):
+    path = tmp_path / "wide.png"
+    image = Image.new("RGBA", (1000, 500), (0, 0, 0, 0))
+    image.paste((255, 0, 0, 255), (0, 0, 1000, 500))
+    image.save(path)
+    artwork = Artwork(
+        slug="wide",
+        src_path=path,
+        title="Wide",
+        description_html="<p>Wide</p>",
+        tags=[],
+        image_width=1000,
+        image_height=500,
+    )
+    placement = PlacementRequirement("front", 1000, 1000, artwork_fit_mode="contain")
+
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        allow_upscale=False,
+        upscale_method="lanczos",
+        skip_undersized=False,
+    )
+
+    assert result.action == "contained_padded"
+    assert result.final_size == (1000, 1000)
+    assert result.resized_size == (1000, 500)
+    top_pixel = result.image.getpixel((500, 100))
+    center_pixel = result.image.getpixel((500, 500))
+    assert top_pixel[3] == 0
+    assert center_pixel[:3] == (255, 0, 0)
+
+
+def test_cover_mode_crops_to_fill(tmp_path: Path):
+    path = tmp_path / "wide-cover.png"
+    image = Image.new("RGBA", (1000, 500), (0, 0, 0, 0))
+    image.paste((0, 255, 0, 255), (0, 0, 1000, 250))
+    image.paste((0, 0, 255, 255), (0, 250, 1000, 500))
+    image.save(path)
+    artwork = Artwork(
+        slug="wide-cover",
+        src_path=path,
+        title="Wide Cover",
+        description_html="<p>Wide Cover</p>",
+        tags=[],
+        image_width=1000,
+        image_height=500,
+    )
+    placement = PlacementRequirement("front", 1000, 1000, artwork_fit_mode="cover")
+
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        allow_upscale=True,
+        upscale_method="lanczos",
+        skip_undersized=False,
+    )
+
+    assert result.action == "covered_cropped_upscale"
+    assert result.final_size == (1000, 1000)
+    assert result.resized_size == (2000, 1000)
+    assert result.image.getpixel((500, 10))[:3] == (0, 255, 0)
+    assert result.image.getpixel((500, 990))[:3] == (0, 0, 255)
+
+
+def test_contain_mode_preserves_aspect_ratio_when_upscaled(tmp_path: Path):
+    path = tmp_path / "small.png"
+    Image.new("RGBA", (300, 150), (255, 128, 0, 255)).save(path)
+    artwork = Artwork(
+        slug="small",
+        src_path=path,
+        title="Small",
+        description_html="<p>Small</p>",
+        tags=[],
+        image_width=300,
+        image_height=150,
+    )
+    placement = PlacementRequirement("front", 900, 900, artwork_fit_mode="contain")
+
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        allow_upscale=True,
+        upscale_method="nearest",
+        skip_undersized=False,
+    )
+
+    assert result.action == "contained_padded_upscale"
+    assert result.upscaled is True
+    assert result.final_size == (900, 900)
+    assert result.resized_size == (900, 450)
+
+
+def test_template_validation_rejects_invalid_artwork_fit_mode(tmp_path: Path):
+    config = tmp_path / "product_templates.json"
+    config.write_text(
+        json.dumps(
+            [
+                {
+                    "key": "t1",
+                    "printify_blueprint_id": 6,
+                    "printify_print_provider_id": 99,
+                    "placements": [
+                        {
+                            "placement_name": "front",
+                            "width_px": 1000,
+                            "height_px": 1000,
+                            "artwork_fit_mode": "stretch",
+                        }
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(TemplateValidationError, match=r"artwork_fit_mode must be contain\|cover"):
+        load_templates(config)

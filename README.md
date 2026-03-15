@@ -206,6 +206,9 @@ Each placement requires:
 - `width_px`
 - `height_px`
 
+Placement fields (optional):
+- `artwork_fit_mode` (`contain` or `cover`, default `contain`)
+
 Pricing fields (optional):
 - `base_price`
 - `markup_type` (`fixed` or `percent`)
@@ -234,10 +237,17 @@ Pricing notes:
 Many Printify placements require large source files (for example, a front print area of `4500x5400`). Small source images may be rejected by strict validation because they cannot satisfy print-area requirements without interpolation.
 
 By default, InkVibeAuto keeps strict validation. You can now choose controlled fallback behavior:
-- `--allow-upscale`: upscale undersized artwork proportionally to cover the required placement area, then crop/fit to exact dimensions.
+- `--allow-upscale`: allow enlarging undersized artwork before placement fitting.
 - `--upscale-method nearest|lanczos`: choose the upscaling resampling method (default: `lanczos`).
 - `--skip-undersized`: skip undersized artwork/template placements with a warning instead of stopping the run.
 - `--force`: rerun artworks even if previously marked completed in `state.json`.
+
+Each placement can also set `artwork_fit_mode`:
+- `contain` (default): safer mode; preserves full artwork, keeps aspect ratio, and centers on a transparent canvas at placement size (no cropping).
+- `cover`: fills the full print area while preserving aspect ratio, which may crop edges.
+
+Recommendation:
+- Shirts and mugs should usually use `artwork_fit_mode: contain` unless you intentionally want a full-bleed/cropped look.
 
 Example commands:
 
