@@ -217,6 +217,8 @@ Variant-control fields (optional):
 - `max_enabled_variants`
 - `enabled_variant_option_filters`
 
+Note: some Printify blueprint/provider combinations expose only one option dimension (for example, size without color). When `enabled_colors` or `enabled_sizes` are configured but that option dimension does not exist in the catalog response, InkVibeAuto ignores the missing dimension filter and logs a warning; existing dimensions remain strictly filtered.
+
 SEO/listing fields (optional):
 - `seo_keywords`
 - `audience`
