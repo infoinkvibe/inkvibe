@@ -944,10 +944,19 @@ def _row_status(row: Dict[str, Any]) -> str:
     result = row.get("result", {}) if isinstance(row.get("result"), dict) else {}
     if result.get("error"):
         return "failure"
+    completion_status = str(row.get("completion_status") or "").strip().lower()
+    if completion_status == "dry-run-only":
+        return "dry-run"
     printify_result = result.get("printify", {}) if isinstance(result.get("printify"), dict) else {}
+    if bool(row.get("dry_run", False)):
+        return "dry-run"
+    if str(printify_result.get("status") or "").lower() == "dry-run":
+        return "dry-run"
     if str(printify_result.get("status") or "").lower() == "skipped":
         return "skipped"
     status = str(result.get("status") or "").lower()
+    if status == "dry-run":
+        return "dry-run"
     if status.startswith("skipped") or status == "no_matching_variants":
         return "skipped"
     return "success"
@@ -962,6 +971,15 @@ def is_state_key_successful(state: Dict[str, Any], state_key: str) -> bool:
     if not row:
         return False
     return _row_status(row) == "success"
+
+
+def row_completion_label(row: Dict[str, Any]) -> str:
+    status = _row_status(row)
+    if status == "success":
+        return "real-completed"
+    if status == "dry-run":
+        return "dry-run-only"
+    return status
 
 
 def write_csv_report(path: pathlib.Path, rows: List[Dict[str, Any]]) -> None:
@@ -2214,6 +2232,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     "title_source": title_info.title_source,
                     "rendered_title": rendered_title,
                     "result": result,
+                    "dry_run": bool(printify.dry_run),
+                    "completion_status": "dry-run-only" if printify.dry_run else "real-completed",
                 })
                 if run_rows is not None:
                     run_rows.append(RunReportRow(
@@ -2315,6 +2335,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 "title_source": title_info.title_source,
                 "rendered_title": rendered_title,
                 "result": result,
+                "dry_run": bool(printify.dry_run),
+                "completion_status": "dry-run-only" if printify.dry_run else "real-completed",
             }
             record["products"].append(row)
             if run_rows is not None:
@@ -2368,6 +2390,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 "title_source": title_info.title_source,
                 "rendered_title": rendered_title,
                 "result": error_result,
+                "dry_run": bool(printify.dry_run),
+                "completion_status": "failure",
             })
             if failure_rows is not None:
                 failure_rows.append(FailureReportRow(
@@ -2690,15 +2714,19 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
 
     state = ensure_state_shape(load_json(state_path, {}))
     if list_state_keys_only:
+        index = latest_rows_by_state_key(state)
         for key in list_state_keys(state):
-            print(key)
+            row = index.get(key, {})
+            print(f"{key}	{row_completion_label(row)}")
         return
     if inspect_state_key_value:
         row = inspect_state_key(state, inspect_state_key_value)
         if row is None:
             print(json.dumps({"state_key": inspect_state_key_value, "found": False}, ensure_ascii=False))
         else:
-            print(json.dumps(row, indent=2, ensure_ascii=False))
+            view = dict(row)
+            view.setdefault("completion_status", row_completion_label(row))
+            print(json.dumps(view, indent=2, ensure_ascii=False))
         return
 
     if list_failures_only:
