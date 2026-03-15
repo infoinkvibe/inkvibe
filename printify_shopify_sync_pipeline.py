@@ -116,6 +116,7 @@ class PlacementRequirement:
     placement_x: float = 0.5
     placement_y: float = 0.5
     placement_angle: float = 0.0
+    artwork_fit_mode: str = "contain"
 
 
 @dataclass
@@ -267,6 +268,7 @@ class ArtworkResolution:
     upscaled: bool
     original_size: Tuple[int, int]
     final_size: Tuple[int, int]
+    resized_size: Tuple[int, int]
 
 
 LAUNCH_PLAN_OVERRIDE_COLUMNS = [
@@ -1636,12 +1638,21 @@ def resolve_artwork_for_placement(
         image = ImageOps.exif_transpose(opened).convert("RGBA")
     original_size = (image.width, image.height)
     required_size = (placement.width_px, placement.height_px)
-    too_small = image.width < placement.width_px or image.height < placement.height_px
+    fit_mode = str(placement.artwork_fit_mode or "contain").strip().lower()
+    if fit_mode not in {"contain", "cover"}:
+        logger.warning(
+            "Unknown artwork_fit_mode=%s for placement=%s; defaulting to contain",
+            fit_mode,
+            placement.placement_name,
+        )
+        fit_mode = "contain"
+    too_small = fit_mode == "cover" and (image.width < placement.width_px or image.height < placement.height_px)
 
     logger.info(
-        "Artwork %s placement=%s original=%sx%s required=%sx%s",
+        "Artwork %s placement=%s fit_mode=%s original=%sx%s required=%sx%s",
         artwork.src_path.name,
         placement.placement_name,
+        fit_mode,
         original_size[0],
         original_size[1],
         required_size[0],
@@ -1651,13 +1662,14 @@ def resolve_artwork_for_placement(
     if too_small and not allow_upscale:
         if skip_undersized:
             logger.warning(
-                "Skipping undersized artwork %s for placement %s: %sx%s < %sx%s (action=skip)",
+                "Skipping undersized artwork %s for placement %s: %sx%s < %sx%s (action=skip fit_mode=%s)",
                 artwork.src_path.name,
                 placement.placement_name,
                 original_size[0],
                 original_size[1],
                 required_size[0],
                 required_size[1],
+                fit_mode,
             )
             return ArtworkResolution(
                 image=image,
@@ -1665,11 +1677,13 @@ def resolve_artwork_for_placement(
                 upscaled=False,
                 original_size=original_size,
                 final_size=original_size,
+                resized_size=original_size,
             )
         logger.error(
-            "Undersized artwork action=fail artwork=%s placement=%s original=%sx%s required=%sx%s",
+            "Undersized artwork action=fail artwork=%s placement=%s fit_mode=%s original=%sx%s required=%sx%s",
             artwork.src_path.name,
             placement.placement_name,
+            fit_mode,
             original_size[0],
             original_size[1],
             required_size[0],
@@ -1680,40 +1694,51 @@ def resolve_artwork_for_placement(
             f"placement {placement.placement_name} ({required_size[0]}x{required_size[1]})"
         )
 
-    scale = max(placement.width_px / image.width, placement.height_px / image.height)
+    if fit_mode == "cover":
+        scale = max(placement.width_px / image.width, placement.height_px / image.height)
+    else:
+        scale = min(placement.width_px / image.width, placement.height_px / image.height)
+        if not allow_upscale:
+            scale = min(scale, 1.0)
     upscaled = scale > 1
-    if upscaled and allow_upscale:
-        resized = image.resize((math.ceil(image.width * scale), math.ceil(image.height * scale)), _upscale_filter(upscale_method))
+    resize_filter = _upscale_filter(upscale_method) if upscaled else Image.LANCZOS
+    resized_size = (math.ceil(image.width * scale), math.ceil(image.height * scale))
+    resized = image.resize(resized_size, resize_filter)
+
+    if fit_mode == "cover":
         left = max(0, (resized.width - placement.width_px) // 2)
         top = max(0, (resized.height - placement.height_px) // 2)
         final = resized.crop((left, top, left + placement.width_px, top + placement.height_px))
-        logger.info(
-            "Upscaled artwork from %sx%s to %sx%s for placement %s",
-            original_size[0],
-            original_size[1],
-            placement.width_px,
-            placement.height_px,
-            placement.placement_name,
-        )
-        return ArtworkResolution(
-            image=final,
-            action="upscale",
-            upscaled=True,
-            original_size=original_size,
-            final_size=(final.width, final.height),
-        )
+        action = "covered_cropped_upscale" if upscaled else "covered_cropped"
+    else:
+        final = Image.new("RGBA", required_size, (0, 0, 0, 0))
+        left = max(0, (placement.width_px - resized.width) // 2)
+        top = max(0, (placement.height_px - resized.height) // 2)
+        final.alpha_composite(resized, (left, top))
+        action = "contained_padded_upscale" if upscaled else "contained_padded"
 
-    resized = image.resize((math.ceil(image.width * scale), math.ceil(image.height * scale)), Image.LANCZOS)
-    left = max(0, (resized.width - placement.width_px) // 2)
-    top = max(0, (resized.height - placement.height_px) // 2)
-    final = resized.crop((left, top, left + placement.width_px, top + placement.height_px))
-    logger.info("Artwork resolution action=fit placement=%s final=%sx%s", placement.placement_name, final.width, final.height)
+    logger.info(
+        "Artwork resolution action=%s placement=%s fit_mode=%s original=%sx%s resized=%sx%s final_canvas=%sx%s upscaled=%s",
+        action,
+        placement.placement_name,
+        fit_mode,
+        original_size[0],
+        original_size[1],
+        resized.width,
+        resized.height,
+        final.width,
+        final.height,
+        upscaled,
+    )
+    resized.close()
+
     return ArtworkResolution(
         image=final,
-        action="fit",
-        upscaled=False,
+        action=action,
+        upscaled=upscaled,
         original_size=original_size,
         final_size=(final.width, final.height),
+        resized_size=(resized_size[0], resized_size[1]),
     )
 
 
@@ -1765,6 +1790,8 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
         for field_name in ["placement_name", "width_px", "height_px"]:
             if field_name not in placement:
                 raise TemplateValidationError(f"Template[{index}] placement[{pidx}] missing '{field_name}'")
+        if str(placement.get("artwork_fit_mode", "contain")).strip().lower() not in {"contain", "cover"}:
+            raise TemplateValidationError(f"Template[{index}] placement[{pidx}] artwork_fit_mode must be contain|cover")
         if "placement_scale" in placement and float(placement["placement_scale"]) <= 0:
             raise TemplateValidationError(f"Template[{index}] placement[{pidx}] placement_scale must be > 0")
     if row.get("markup_type", "fixed") not in {"fixed", "percent"}:
