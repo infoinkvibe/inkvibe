@@ -65,6 +65,9 @@ from printify_shopify_sync_pipeline import (
     _row_status,
     write_csv_report,
     run,
+    format_run_summary,
+    template_blueprint_type_warning,
+    generate_mug_template_snippet,
 )
 
 
@@ -1314,3 +1317,72 @@ def test_run_summary_logging_does_not_raise_format_error(tmp_path: Path, monkeyp
 
     monkeypatch.setattr(pipeline, "process_artwork", fake_process_artwork)
     run(tmp_path / "templates.json", image_dir=tmp_path, export_dir=tmp_path / "exp", state_path=tmp_path / "state.json", skip_audit=True)
+
+
+def test_format_run_summary_includes_all_fields():
+    summary = RunSummary(
+        artworks_scanned=1,
+        templates_processed=2,
+        combinations_processed=3,
+        combinations_success=2,
+        combinations_failed=1,
+        combinations_skipped=0,
+        products_created=1,
+        products_updated=1,
+        products_rebuilt=0,
+        products_skipped=1,
+        failures=1,
+        publish_attempts=1,
+        publish_verified=1,
+        verification_warnings=0,
+    )
+    rendered = format_run_summary(summary)
+    assert "artworks_scanned=1" in rendered
+    assert "templates_processed=2" in rendered
+    assert "verification_warnings=0" in rendered
+
+
+def test_template_blueprint_type_warning_detects_mismatch():
+    template = ProductTemplate(
+        key="mug_11oz",
+        printify_blueprint_id=68,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        product_type_label="11oz Mug",
+    )
+    warning = template_blueprint_type_warning(template=template, blueprint_title="Unisex Heavy Cotton Tee")
+    assert warning is not None
+    assert "mug" in warning.lower()
+
+
+def test_template_blueprint_type_warning_allows_matching_family():
+    template = ProductTemplate(
+        key="mug_11oz",
+        printify_blueprint_id=68,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        product_type_label="11oz Mug",
+    )
+    assert template_blueprint_type_warning(template=template, blueprint_title="Accent Coffee Mug") is None
+
+
+def test_generate_mug_template_snippet_prefers_mug_defaults():
+    variants = [
+        {"id": 1, "is_available": True, "options": {"color": "White", "size": "11oz"}, "placeholders": [{"position": "front"}]},
+        {"id": 2, "is_available": True, "options": {"color": "Black", "size": "11oz"}, "placeholders": [{"position": "front"}]},
+    ]
+    snippet = generate_mug_template_snippet(key="mug_11oz", blueprint_id=68, provider_id=1, variants=variants)
+    assert snippet["printify_blueprint_id"] == 68
+    assert snippet["printify_print_provider_id"] == 1
+    assert snippet["enabled_colors"] == ["White"]
+    assert snippet["enabled_sizes"] == ["11oz"]
+
+
+def test_mug_sample_template_points_to_real_pair_and_safe_cap():
+    templates = load_templates(Path("product_templates.json"))
+    mug = next(t for t in templates if t.key == "mug_11oz")
+    assert mug.printify_blueprint_id == 68
+    assert mug.printify_print_provider_id == 1
+    assert mug.max_enabled_variants is not None and mug.max_enabled_variants <= 24

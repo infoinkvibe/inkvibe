@@ -5,13 +5,31 @@
     "printify_print_provider_id": 99,
     "title_pattern": "{artwork_title} {product_type_label}",
     "description_pattern": "{generated_description}<p>Best for {audience}. Style notes: {style_keywords}.</p>",
-    "enabled_colors": ["Black", "White"],
-    "enabled_sizes": ["S", "M", "L", "XL"],
-    "tags": ["shirt", "graphic"],
-    "seo_keywords": ["graphic tee", "gift idea", "streetwear"],
+    "enabled_colors": [
+      "Black",
+      "White"
+    ],
+    "enabled_sizes": [
+      "S",
+      "M",
+      "L",
+      "XL"
+    ],
+    "tags": [
+      "shirt",
+      "graphic"
+    ],
+    "seo_keywords": [
+      "graphic tee",
+      "gift idea",
+      "streetwear"
+    ],
     "audience": "casual streetwear fans",
     "product_type_label": "T-Shirt",
-    "style_keywords": ["minimal", "vintage"],
+    "style_keywords": [
+      "minimal",
+      "vintage"
+    ],
     "shopify_product_type": "Apparel",
     "publish_to_shopify": false,
     "push_via_printify": true,
@@ -38,22 +56,40 @@
   },
   {
     "key": "mug_11oz",
-    "printify_blueprint_id": 9,
-    "printify_print_provider_id": 99,
+    "printify_blueprint_id": 68,
+    "printify_print_provider_id": 1,
     "title_pattern": "{artwork_title} {product_type_label}",
     "description_pattern": "<p>{artwork_title} on a durable {product_type_label}.</p><p>Made for {audience}. Keywords: {seo_keywords}</p>",
-    "enabled_colors": ["White"],
-    "enabled_sizes": ["11oz"],
-    "max_enabled_variants": 24,
+    "enabled_colors": [
+      "White"
+    ],
+    "enabled_sizes": [
+      "11oz"
+    ],
+    "max_enabled_variants": 12,
     "enabled_variant_option_filters": {
-      "color": ["White"],
-      "size": ["11oz"]
+      "color": [
+        "White"
+      ],
+      "size": [
+        "11oz"
+      ]
     },
-    "tags": ["mug", "coffee"],
-    "seo_keywords": ["coffee mug", "desk accessory", "gift for coworkers"],
+    "tags": [
+      "mug",
+      "coffee"
+    ],
+    "seo_keywords": [
+      "coffee mug",
+      "desk accessory",
+      "gift for coworkers"
+    ],
     "audience": "coffee drinkers and office gifting",
     "product_type_label": "11oz Mug",
-    "style_keywords": ["clean", "playful"],
+    "style_keywords": [
+      "clean",
+      "playful"
+    ],
     "shopify_product_type": "Drinkware",
     "publish_to_shopify": false,
     "push_via_printify": true,

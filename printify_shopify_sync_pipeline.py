@@ -564,6 +564,100 @@ def generate_template_snippet(
     }
 
 
+def generate_mug_template_snippet(
+    *,
+    key: str,
+    blueprint_id: int,
+    provider_id: int,
+    variants: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    snippet = generate_template_snippet(
+        key=key,
+        blueprint_id=blueprint_id,
+        provider_id=provider_id,
+        variants=variants,
+    )
+    summary = summarize_variant_options(variants)
+    preferred_colors = [color for color in summary["colors"] if color.lower() in {"white", "white glossy"}]
+    preferred_sizes = [size for size in summary["sizes"] if "11" in size]
+    if not preferred_colors:
+        preferred_colors = summary["colors"][:1]
+    if not preferred_sizes:
+        preferred_sizes = summary["sizes"][:1]
+
+    snippet.update(
+        {
+            "title_pattern": "{artwork_title} {product_type_label}",
+            "description_pattern": "<p>{artwork_title} on a durable {product_type_label}.</p><p>Made for {audience}. Keywords: {seo_keywords}</p>",
+            "enabled_colors": preferred_colors,
+            "enabled_sizes": preferred_sizes,
+            "enabled_variant_option_filters": {
+                "color": preferred_colors,
+                "size": preferred_sizes,
+            },
+            "max_enabled_variants": min(24, max(1, len(preferred_colors) * len(preferred_sizes))),
+            "base_price": "12.00",
+            "markup_type": "percent",
+            "markup_value": "35",
+            "rounding_mode": "whole_dollar",
+            "seo_keywords": ["coffee mug", "desk accessory", "gift for coworkers"],
+            "audience": "coffee drinkers and office gifting",
+            "product_type_label": "11oz Mug",
+            "style_keywords": ["clean", "playful"],
+            "shopify_product_type": "Drinkware",
+        }
+    )
+    return snippet
+
+
+def template_blueprint_type_warning(*, template: ProductTemplate, blueprint_title: str) -> Optional[str]:
+    def _family(text: str) -> Optional[str]:
+        lowered = text.lower()
+        if any(token in lowered for token in ("mug", "cup")):
+            return "mug"
+        if any(token in lowered for token in ("tee", "t-shirt", "shirt")):
+            return "shirt"
+        if any(token in lowered for token in ("hoodie", "sweatshirt", "crewneck")):
+            return "sweatshirt"
+        return None
+
+    template_hint = " ".join(
+        [
+            template.key,
+            template.product_type_label or "",
+            template.shopify_product_type or "",
+        ]
+    )
+    template_family = _family(template_hint)
+    blueprint_family = _family(blueprint_title)
+    if template_family and blueprint_family and template_family != blueprint_family:
+        return (
+            f"Template {template.key} looks like '{template_family}' but blueprint '{blueprint_title}' "
+            f"looks like '{blueprint_family}'."
+        )
+    return None
+
+
+def format_run_summary(summary: RunSummary) -> str:
+    return (
+        "Run summary "
+        f"artworks_scanned={summary.artworks_scanned} "
+        f"templates_processed={summary.templates_processed} "
+        f"combinations_processed={summary.combinations_processed} "
+        f"successes={summary.combinations_success} "
+        f"failures={summary.combinations_failed} "
+        f"skipped={summary.combinations_skipped} "
+        f"products_created={summary.products_created} "
+        f"products_updated={summary.products_updated} "
+        f"products_rebuilt={summary.products_rebuilt} "
+        f"products_skipped={summary.products_skipped} "
+        f"template_failures={summary.failures} "
+        f"publish_attempts={summary.publish_attempts} "
+        f"publish_verified={summary.publish_verified} "
+        f"verification_warnings={summary.verification_warnings}"
+    )
+
+
 def build_generic_description_html(artwork_title: str) -> str:
     return (
         f"<p><strong>{artwork_title}</strong> adds an easy style upgrade to your everyday wardrobe.</p>"
@@ -2303,6 +2397,10 @@ def audit_printify_integration(printify: PrintifyClient, templates: List[Product
         if template.printify_blueprint_id not in blueprints:
             logger.warning("Template %s uses missing blueprint_id=%s", template.key, template.printify_blueprint_id)
             continue
+        blueprint_title = str(blueprints[template.printify_blueprint_id].get("title", ""))
+        type_warning = template_blueprint_type_warning(template=template, blueprint_title=blueprint_title)
+        if type_warning:
+            logger.warning("Template blueprint-type mismatch: %s", type_warning)
         providers = printify.list_print_providers(template.printify_blueprint_id)
         if not any(int(p["id"]) == template.printify_print_provider_id for p in providers if "id" in p):
             logger.warning("Template %s provider_id=%s not available for blueprint=%s", template.key, template.printify_print_provider_id, template.printify_blueprint_id)
@@ -2550,7 +2648,8 @@ def run_catalog_cli(
 
         if generate_template_snippet_flag:
             key = snippet_key or f"blueprint_{blueprint_id}_provider_{selected_provider_id}"
-            snippet = generate_template_snippet(key=key, blueprint_id=blueprint_id, provider_id=selected_provider_id, variants=variants)
+            snippet_factory = generate_mug_template_snippet if "mug" in key.lower() else generate_template_snippet
+            snippet = snippet_factory(key=key, blueprint_id=blueprint_id, provider_id=selected_provider_id, variants=variants)
             rendered = json.dumps(snippet, indent=2)
             if template_output_file:
                 pathlib.Path(template_output_file).write_text(rendered + "\n", encoding="utf-8")
@@ -2708,23 +2807,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         logger.info("Run report exported path=%s rows=%s", export_run_report, len(run_rows))
 
     save_json_atomic(state_path, state)
-    logger.info(
-        "Run summary artworks_scanned=%s templates_processed=%s combinations_processed=%s successes=%s failures=%s skipped=%s products_created=%s products_updated=%s products_rebuilt=%s products_skipped=%s template_failures=%s publish_attempts=%s publish_verified=%s verification_warnings=%s",
-        summary.artworks_scanned,
-        summary.templates_processed,
-        summary.combinations_processed,
-        summary.combinations_success,
-        summary.combinations_failed,
-        summary.combinations_skipped,
-        summary.products_created,
-        summary.products_updated,
-        summary.products_rebuilt,
-        summary.products_skipped,
-        summary.failures,
-        summary.publish_attempts,
-        summary.publish_verified,
-        summary.verification_warnings,
-    )
+    logger.info(format_run_summary(summary))
     if failure_rows:
         logger.info("Failures encountered (showing up to 5):")
         for row in failure_rows[:5]:
