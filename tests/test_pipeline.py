@@ -1611,8 +1611,10 @@ def test_shirt_template_enables_allow_upscale_while_mug_stays_conservative():
 
     assert shirt.placements[0].artwork_fit_mode == "contain"
     assert shirt.placements[0].allow_upscale is True
+    assert shirt.placements[0].max_upscale_factor == 4.0
     assert mug.placements[0].artwork_fit_mode == "contain"
     assert mug.placements[0].allow_upscale is False
+    assert mug.placements[0].max_upscale_factor is None
 
 
 def test_shirt_contain_export_upscales_but_mug_contain_export_does_not(tmp_path: Path):
@@ -1629,12 +1631,54 @@ def test_shirt_contain_export_upscales_but_mug_contain_export_does_not(tmp_path:
     prepared_mug = prepare_artwork_export(artwork, mug, mug.placements[0], tmp_path / "exports", options)
 
     assert prepared_shirt is not None and prepared_shirt.upscaled is True
-    assert prepared_shirt.effective_upscale_factor > 1.0
+    assert prepared_shirt.requested_upscale_factor > prepared_shirt.applied_upscale_factor
+    assert prepared_shirt.applied_upscale_factor == 4.0
+    assert prepared_shirt.upscale_capped is True
+    assert prepared_shirt.effective_upscale_factor == prepared_shirt.applied_upscale_factor
     assert prepared_shirt.exported_canvas_size == (4500, 5400)
 
     assert prepared_mug is not None and prepared_mug.upscaled is False
     assert prepared_mug.effective_upscale_factor == 1.0
+    assert prepared_mug.requested_upscale_factor == 1.0
+    assert prepared_mug.applied_upscale_factor == 1.0
+    assert prepared_mug.upscale_capped is False
     assert prepared_mug.exported_canvas_size == (2700, 1120)
+
+
+def test_shirt_upscale_cap_logs_warning_and_mug_path_unchanged(tmp_path: Path, caplog):
+    path = tmp_path / "tiny-art.png"
+    Image.new("RGBA", (600, 300), (0, 128, 255, 255)).save(path)
+    artwork = Artwork("tiny-art", path, "Tiny Art", "", [], 600, 300)
+
+    shirt_placement = PlacementRequirement("front", 4500, 5400, artwork_fit_mode="contain", allow_upscale=True, max_upscale_factor=3.0)
+    mug_placement = PlacementRequirement("front", 2700, 1120, artwork_fit_mode="contain", allow_upscale=False)
+
+    caplog.set_level(logging.WARNING)
+    shirt_result = resolve_artwork_for_placement(
+        artwork,
+        shirt_placement,
+        allow_upscale=True,
+        upscale_method="lanczos",
+        skip_undersized=False,
+        max_upscale_factor=shirt_placement.max_upscale_factor,
+    )
+    mug_result = resolve_artwork_for_placement(
+        artwork,
+        mug_placement,
+        allow_upscale=False,
+        upscale_method="lanczos",
+        skip_undersized=False,
+        max_upscale_factor=None,
+    )
+
+    assert shirt_result.requested_upscale_factor > 3.0
+    assert shirt_result.applied_upscale_factor == 3.0
+    assert shirt_result.upscale_capped is True
+    assert "Upscale cap applied" in caplog.text
+
+    assert mug_result.requested_upscale_factor == 1.0
+    assert mug_result.applied_upscale_factor == 1.0
+    assert mug_result.upscale_capped is False
 
 
 def _launch_template() -> ProductTemplate:
@@ -2262,6 +2306,26 @@ def test_template_validation_rejects_invalid_trim_preset(tmp_path: Path):
         encoding="utf-8",
     )
     with pytest.raises(TemplateValidationError, match=r"trim_bounds_preset must be one of"):
+        load_templates(config)
+
+
+def test_template_validation_rejects_invalid_max_upscale_factor(tmp_path: Path):
+    config = tmp_path / "product_templates.json"
+    config.write_text(
+        json.dumps(
+            [
+                {
+                    "key": "t1",
+                    "printify_blueprint_id": 6,
+                    "printify_print_provider_id": 99,
+                    "max_upscale_factor": 0,
+                    "placements": [{"placement_name": "front", "width_px": 1000, "height_px": 1000}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(TemplateValidationError, match=r"max_upscale_factor must be > 0"):
         load_templates(config)
 
 
