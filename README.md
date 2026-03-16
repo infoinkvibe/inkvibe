@@ -208,6 +208,7 @@ Each placement requires:
 
 Placement fields (optional):
 - `artwork_fit_mode` (`contain` or `cover`, default `contain`)
+- `allow_upscale` (`true`/`false`, default `false`; per-placement override that allows contain/cover upscale for undersized art)
 - `trim_artwork_bounds` (`true`/`false`, default `false`; trims transparent margins before fit)
 
 Pricing fields (optional):
@@ -254,6 +255,7 @@ Template-level optional preprocessing:
 
 Recommendation:
 - Shirts and mugs should usually use `artwork_fit_mode: contain` unless you intentionally want a full-bleed/cropped look.
+- Current defaults are intentionally split: `tshirt_gildan` front placement enables `allow_upscale: true` (controlled contain upscale), while `mug_11oz` keeps `allow_upscale: false` (conservative/no interpolation by default).
 
 Example commands:
 
@@ -417,6 +419,7 @@ Bulk safety controls:
 Reporting exports:
 - `--export-failure-report <path>`: CSV report for failed combinations.
 - `--export-run-report <path>`: CSV report for all processed combinations (success/failure/skipped).
+- Run report now includes `effective_upscale_factor` (for example `1.000` when no upscale, `>1.000` when controlled upscale is applied).
 
 Examples:
 

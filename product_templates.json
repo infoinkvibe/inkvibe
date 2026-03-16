@@ -50,7 +50,7 @@
         "placement_name": "front",
         "width_px": 4500,
         "height_px": 5400,
-        "allow_upscale": false,
+        "allow_upscale": true,
         "placement_scale": 0.9,
         "placement_x": 0.5,
         "placement_y": 0.5,
