@@ -58,7 +58,11 @@
         "artwork_fit_mode": "contain"
       }
     ],
-    "trim_artwork_bounds": false
+    "trim_artwork_bounds": false,
+    "trim_artwork_bounds_for_shirts": true,
+    "trim_bounds_min_alpha": 8,
+    "trim_bounds_padding_pct": 0.015,
+    "trim_bounds_min_reduction_pct": 0.01
   },
   {
     "key": "mug_11oz",

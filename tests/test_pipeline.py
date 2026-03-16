@@ -1804,10 +1804,55 @@ def test_optional_trim_artwork_bounds_reduces_transparent_margin_when_enabled(tm
         trim_artwork_bounds=True,
     )
 
-    assert result.trimmed_size == (400, 200)
-    assert result.resized_size == (1000, 500)
+    assert result.trimmed_size == (430, 230)
+    assert result.resized_size == (1001, 535)
     assert result.final_size == (1000, 1000)
     assert result.image.getpixel((500, 500))[:3] == (255, 0, 0)
+
+
+def test_trim_padding_guard_keeps_safe_margin_and_reports_bounds_pct(tmp_path: Path):
+    path = tmp_path / "trim-guard.png"
+    image = Image.new("RGBA", (1000, 1000), (0, 0, 0, 0))
+    image.paste((255, 0, 0, 255), (300, 400, 700, 600))
+    image.save(path)
+
+    artwork = Artwork("trim-guard", path, "Trim Guard", "", [], 1000, 1000)
+    placement = PlacementRequirement("front", 1000, 1000, artwork_fit_mode="contain")
+
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        allow_upscale=True,
+        upscale_method="lanczos",
+        skip_undersized=False,
+        trim_artwork_bounds=True,
+        trim_padding_pct=0.05,
+    )
+
+    assert result.trimmed_size == (500, 300)
+    assert result.trim_bounds_pct == (50.0, 30.0)
+
+
+def test_trim_guard_skips_trimming_when_reduction_too_small(tmp_path: Path):
+    path = tmp_path / "trim-too-small.png"
+    image = Image.new("RGBA", (1000, 1000), (0, 0, 0, 255))
+    image.save(path)
+
+    artwork = Artwork("trim-too-small", path, "Trim Too Small", "", [], 1000, 1000)
+    placement = PlacementRequirement("front", 1000, 1000, artwork_fit_mode="contain")
+
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        allow_upscale=False,
+        upscale_method="lanczos",
+        skip_undersized=False,
+        trim_artwork_bounds=True,
+        trim_min_reduction_pct=0.5,
+    )
+
+    assert result.trimmed_size == (1000, 1000)
+    assert result.trim_bounds_pct == (100.0, 100.0)
 
 
 def test_contain_mode_unchanged_when_trimming_disabled(tmp_path: Path):
@@ -1833,6 +1878,42 @@ def test_contain_mode_unchanged_when_trimming_disabled(tmp_path: Path):
     assert result.final_size == (1000, 1000)
     assert result.image.getpixel((500, 500))[:3] == (255, 0, 0)
     assert result.image.getpixel((100, 100))[3] == 0
+
+
+def test_template_level_shirt_only_trim_toggle_does_not_trim_mugs(tmp_path: Path):
+    path = tmp_path / "margin-art-template.png"
+    image = Image.new("RGBA", (1000, 1000), (0, 0, 0, 0))
+    image.paste((255, 0, 0, 255), (300, 400, 700, 600))
+    image.save(path)
+
+    artwork = Artwork("margin-art-template", path, "Margin Art", "", [], 1000, 1000)
+    placement = PlacementRequirement("front", 1000, 1000, artwork_fit_mode="contain")
+    options = ArtworkProcessingOptions(allow_upscale=True)
+
+    shirt_template = ProductTemplate(
+        key="tshirt_gildan",
+        printify_blueprint_id=6,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[placement],
+        trim_artwork_bounds_for_shirts=True,
+    )
+    mug_template = ProductTemplate(
+        key="mug_11oz",
+        printify_blueprint_id=68,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[placement],
+        trim_artwork_bounds_for_shirts=True,
+    )
+
+    prepared_shirt = prepare_artwork_export(artwork, shirt_template, placement, tmp_path / "exports", options)
+    prepared_mug = prepare_artwork_export(artwork, mug_template, placement, tmp_path / "exports", options)
+
+    assert prepared_shirt is not None and prepared_shirt.trimmed_size == (430, 230)
+    assert prepared_mug is not None and prepared_mug.trimmed_size is None
 def test_compute_placement_transform_for_mug_landscape_caps_scale():
     artwork = Artwork(
         slug="wide",
@@ -2005,6 +2086,26 @@ def test_template_validation_rejects_invalid_artwork_fit_mode(tmp_path: Path):
         encoding="utf-8",
     )
     with pytest.raises(TemplateValidationError, match=r"artwork_fit_mode must be contain\|cover"):
+        load_templates(config)
+
+
+def test_template_validation_rejects_invalid_trim_thresholds(tmp_path: Path):
+    config = tmp_path / "product_templates.json"
+    config.write_text(
+        json.dumps(
+            [
+                {
+                    "key": "t1",
+                    "printify_blueprint_id": 6,
+                    "printify_print_provider_id": 99,
+                    "trim_bounds_min_alpha": 300,
+                    "placements": [{"placement_name": "front", "width_px": 1000, "height_px": 1000}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(TemplateValidationError, match=r"trim_bounds_min_alpha must be between 0 and 255"):
         load_templates(config)
 
 def test_filename_slug_to_title_handles_ugly_flat_tokens():
