@@ -176,6 +176,10 @@ class ProductTemplate:
     rounding_mode: str = "none"
     compare_at_price: Optional[str] = None
     trim_artwork_bounds: bool = False
+    trim_artwork_bounds_for_shirts: bool = False
+    trim_bounds_min_alpha: int = 8
+    trim_bounds_padding_pct: float = 0.015
+    trim_bounds_min_reduction_pct: float = 0.01
     seo_keywords: List[str] = field(default_factory=list)
     audience: Optional[str] = None
     product_type_label: Optional[str] = None
@@ -295,6 +299,7 @@ class ArtworkResolution:
     trimmed_size: Optional[Tuple[int, int]]
     final_size: Tuple[int, int]
     resized_size: Tuple[int, int]
+    trim_bounds_pct: Optional[Tuple[float, float]] = None
 
 
 LAUNCH_PLAN_OVERRIDE_COLUMNS = [
@@ -1123,6 +1128,11 @@ def _orientation_bucket(width: int, height: int) -> str:
     return "square"
 
 
+def _is_shirt_template_key(template_key: str) -> bool:
+    key = str(template_key or "").lower()
+    return any(token in key for token in ["shirt", "tee", "hoodie", "sweatshirt"])
+
+
 def compute_placement_transform_for_artwork(placement: PlacementRequirement, artwork: Artwork, template_key: str = "") -> PlacementTransform:
     orientation = _orientation_bucket(artwork.image_width, artwork.image_height)
     key = template_key.lower()
@@ -1604,16 +1614,39 @@ def _upscale_filter(method: str) -> int:
     return Image.NEAREST if method == "nearest" else Image.LANCZOS
 
 
-def _trim_artwork_bounds(image: Image.Image) -> Tuple[Image.Image, Optional[Tuple[int, int]]]:
+def _trim_artwork_bounds(
+    image: Image.Image,
+    *,
+    min_alpha: int = 8,
+    padding_pct: float = 0.015,
+    min_reduction_pct: float = 0.01,
+) -> Tuple[Image.Image, Optional[Tuple[int, int]]]:
     alpha = image.getchannel("A")
+    if min_alpha > 1:
+        alpha = alpha.point(lambda px: 255 if px >= min_alpha else 0)
     bbox = alpha.getbbox()
     alpha.close()
     if bbox is None:
         return image, None
     left, top, right, bottom = bbox
+    pad = max(1, int(math.ceil(max(image.width, image.height) * max(0.0, padding_pct))))
+    left = max(0, left - pad)
+    top = max(0, top - pad)
+    right = min(image.width, right + pad)
+    bottom = min(image.height, bottom + pad)
+
+    original_area = image.width * image.height
+    trimmed_w = max(1, right - left)
+    trimmed_h = max(1, bottom - top)
+    trimmed_area = trimmed_w * trimmed_h
+    reduction_pct = 0.0 if original_area <= 0 else max(0.0, 1.0 - (trimmed_area / original_area))
+
+    if reduction_pct < max(0.0, min_reduction_pct):
+        return image, (image.width, image.height)
+
     if left == 0 and top == 0 and right == image.width and bottom == image.height:
         return image, (image.width, image.height)
-    trimmed = image.crop(bbox)
+    trimmed = image.crop((left, top, right, bottom))
     image.close()
     return trimmed, (trimmed.width, trimmed.height)
 
@@ -1626,13 +1659,27 @@ def resolve_artwork_for_placement(
     upscale_method: str,
     skip_undersized: bool,
     trim_artwork_bounds: bool = False,
+    trim_min_alpha: int = 8,
+    trim_padding_pct: float = 0.015,
+    trim_min_reduction_pct: float = 0.01,
 ) -> ArtworkResolution:
     with Image.open(artwork.src_path) as opened:
         image = ImageOps.exif_transpose(opened).convert("RGBA")
     original_size = (image.width, image.height)
     trimmed_size: Optional[Tuple[int, int]] = None
     if trim_artwork_bounds:
-        image, trimmed_size = _trim_artwork_bounds(image)
+        image, trimmed_size = _trim_artwork_bounds(
+            image,
+            min_alpha=trim_min_alpha,
+            padding_pct=trim_padding_pct,
+            min_reduction_pct=trim_min_reduction_pct,
+        )
+    trim_bounds_pct: Optional[Tuple[float, float]] = None
+    if trimmed_size:
+        trim_bounds_pct = (
+            0.0 if original_size[0] <= 0 else round((trimmed_size[0] / original_size[0]) * 100.0, 2),
+            0.0 if original_size[1] <= 0 else round((trimmed_size[1] / original_size[1]) * 100.0, 2),
+        )
     required_size = (placement.width_px, placement.height_px)
     fit_mode = str(placement.artwork_fit_mode or "contain").strip().lower()
     if fit_mode not in {"contain", "cover"}:
@@ -1655,6 +1702,14 @@ def resolve_artwork_for_placement(
         required_size[0],
         required_size[1],
     )
+    if trim_bounds_pct:
+        logger.info(
+            "Trim debug artwork=%s placement=%s original_bounds_pct=100x100 trimmed_bounds_pct=%.2fx%.2f",
+            artwork.src_path.name,
+            placement.placement_name,
+            trim_bounds_pct[0],
+            trim_bounds_pct[1],
+        )
 
     if too_small and not allow_upscale:
         if skip_undersized:
@@ -1676,6 +1731,7 @@ def resolve_artwork_for_placement(
                 trimmed_size=trimmed_size,
                 final_size=original_size,
                 resized_size=original_size,
+                trim_bounds_pct=trim_bounds_pct,
             )
         logger.error(
             "Undersized artwork action=fail artwork=%s placement=%s fit_mode=%s original=%sx%s required=%sx%s",
@@ -1739,6 +1795,7 @@ def resolve_artwork_for_placement(
         trimmed_size=trimmed_size,
         final_size=(final.width, final.height),
         resized_size=(resized_size[0], resized_size[1]),
+        trim_bounds_pct=trim_bounds_pct,
     )
 
 
@@ -1775,7 +1832,13 @@ def prepare_artwork_export(
         allow_upscale=options.allow_upscale or placement.allow_upscale,
         upscale_method=options.upscale_method,
         skip_undersized=options.skip_undersized,
-        trim_artwork_bounds=template.trim_artwork_bounds,
+        trim_artwork_bounds=(
+            template.trim_artwork_bounds
+            or (template.trim_artwork_bounds_for_shirts and _is_shirt_template_key(template.key))
+        ),
+        trim_min_alpha=template.trim_bounds_min_alpha,
+        trim_padding_pct=template.trim_bounds_padding_pct,
+        trim_min_reduction_pct=template.trim_bounds_min_reduction_pct,
     )
     if resolution.action == "skip":
         return None
@@ -1825,6 +1888,16 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
             raise TemplateValidationError(f"Template[{index}] placement[{pidx}] placement_scale must be > 0")
     if "trim_artwork_bounds" in row and not isinstance(row.get("trim_artwork_bounds"), bool):
         raise TemplateValidationError(f"Template[{index}] trim_artwork_bounds must be a boolean when provided")
+    if "trim_artwork_bounds_for_shirts" in row and not isinstance(row.get("trim_artwork_bounds_for_shirts"), bool):
+        raise TemplateValidationError(f"Template[{index}] trim_artwork_bounds_for_shirts must be a boolean when provided")
+    if row.get("trim_bounds_min_alpha") is not None:
+        min_alpha = int(row.get("trim_bounds_min_alpha", 8))
+        if min_alpha < 0 or min_alpha > 255:
+            raise TemplateValidationError(f"Template[{index}] trim_bounds_min_alpha must be between 0 and 255")
+    if row.get("trim_bounds_padding_pct") is not None and float(row.get("trim_bounds_padding_pct", 0.0)) < 0:
+        raise TemplateValidationError(f"Template[{index}] trim_bounds_padding_pct must be >= 0")
+    if row.get("trim_bounds_min_reduction_pct") is not None and float(row.get("trim_bounds_min_reduction_pct", 0.0)) < 0:
+        raise TemplateValidationError(f"Template[{index}] trim_bounds_min_reduction_pct must be >= 0")
     if row.get("markup_type", "fixed") not in {"fixed", "percent"}:
         raise TemplateValidationError(f"Template[{index}] markup_type must be fixed|percent")
     if row.get("rounding_mode", "none") not in {"none", "whole_dollar", "x_99"}:
@@ -1879,6 +1952,10 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
                 rounding_mode=str(row.get("rounding_mode", "none")),
                 compare_at_price=str(row["compare_at_price"]) if "compare_at_price" in row and row.get("compare_at_price") is not None else None,
                 trim_artwork_bounds=bool(row.get("trim_artwork_bounds", False)),
+                trim_artwork_bounds_for_shirts=bool(row.get("trim_artwork_bounds_for_shirts", False)),
+                trim_bounds_min_alpha=int(row.get("trim_bounds_min_alpha", 8)),
+                trim_bounds_padding_pct=float(row.get("trim_bounds_padding_pct", 0.015)),
+                trim_bounds_min_reduction_pct=float(row.get("trim_bounds_min_reduction_pct", 0.01)),
                 seo_keywords=[str(v) for v in row.get("seo_keywords", [])],
                 audience=str(row.get("audience", "")).strip() or None,
                 product_type_label=str(row.get("product_type_label", "")).strip() or None,
