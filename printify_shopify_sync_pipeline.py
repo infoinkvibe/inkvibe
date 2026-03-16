@@ -119,6 +119,7 @@ class PlacementRequirement:
     placement_y: float = 0.5
     placement_angle: float = 0.0
     artwork_fit_mode: str = "contain"
+    max_upscale_factor: Optional[float] = None
 
 
 @dataclass
@@ -185,6 +186,7 @@ class ProductTemplate:
     audience: Optional[str] = None
     product_type_label: Optional[str] = None
     style_keywords: List[str] = field(default_factory=list)
+    max_upscale_factor: Optional[float] = None
     max_enabled_variants: Optional[int] = None
     enabled_variant_option_filters: Dict[str, List[str]] = field(default_factory=dict)
 
@@ -245,6 +247,9 @@ class RunReportRow:
     exported_canvas_size: str = ""
     placement_scale_used: str = ""
     effective_upscale_factor: str = ""
+    requested_upscale_factor: str = ""
+    applied_upscale_factor: str = ""
+    upscale_capped: bool = False
     orientation_bucket: str = ""
     launch_plan_row: str = ""
     launch_plan_row_id: str = ""
@@ -284,6 +289,9 @@ class PreparedArtwork:
     exported_canvas_size: Tuple[int, int] = (0, 0)
     upscaled: bool = False
     effective_upscale_factor: float = 1.0
+    requested_upscale_factor: float = 1.0
+    applied_upscale_factor: float = 1.0
+    upscale_capped: bool = False
     trim_applied: bool = False
     trim_skip_reason: Optional[str] = None
 
@@ -306,6 +314,9 @@ class ArtworkResolution:
     trimmed_size: Optional[Tuple[int, int]]
     final_size: Tuple[int, int]
     resized_size: Tuple[int, int]
+    requested_upscale_factor: float = 1.0
+    applied_upscale_factor: float = 1.0
+    upscale_capped: bool = False
     effective_upscale_factor: float = 1.0
     trim_bounds_pct: Optional[Tuple[float, float]] = None
     trim_applied: bool = False
@@ -1713,6 +1724,20 @@ def _resolve_trim_bounds_settings(template: ProductTemplate) -> Tuple[int, float
     return min_alpha, padding_pct, min_reduction_pct
 
 
+def _resolve_max_upscale_factor(template: ProductTemplate, placement: PlacementRequirement) -> Optional[float]:
+    """Resolve optional upscale cap with shirt-only safety behavior.
+
+    Precedence: placement override -> template default. Applies only to shirt templates.
+    """
+    if not _is_shirt_template_key(template.key):
+        return None
+    if placement.max_upscale_factor is not None:
+        return float(placement.max_upscale_factor)
+    if template.max_upscale_factor is not None:
+        return float(template.max_upscale_factor)
+    return None
+
+
 def resolve_artwork_for_placement(
     artwork: Artwork,
     placement: PlacementRequirement,
@@ -1724,6 +1749,7 @@ def resolve_artwork_for_placement(
     trim_min_alpha: int = 8,
     trim_padding_pct: float = 0.015,
     trim_min_reduction_pct: float = 0.01,
+    max_upscale_factor: Optional[float] = None,
 ) -> ArtworkResolution:
     with Image.open(artwork.src_path) as opened:
         image = ImageOps.exif_transpose(opened).convert("RGBA")
@@ -1827,11 +1853,27 @@ def resolve_artwork_for_placement(
         )
 
     if fit_mode == "cover":
-        scale = max(placement.width_px / image.width, placement.height_px / image.height)
+        requested_scale = max(placement.width_px / image.width, placement.height_px / image.height)
     else:
-        scale = min(placement.width_px / image.width, placement.height_px / image.height)
+        requested_scale = min(placement.width_px / image.width, placement.height_px / image.height)
         if not allow_upscale:
-            scale = min(scale, 1.0)
+            requested_scale = min(requested_scale, 1.0)
+    requested_upscale_factor = requested_scale if requested_scale > 1.0 else 1.0
+    scale = requested_scale
+    upscale_capped = False
+    if scale > 1.0 and max_upscale_factor is not None and max_upscale_factor > 0 and scale > max_upscale_factor:
+        scale = max_upscale_factor
+        upscale_capped = True
+        logger.warning(
+            "Upscale cap applied artwork=%s placement=%s fit_mode=%s requested_upscale_factor=%.3f applied_upscale_factor=%.3f max_upscale_factor=%.3f",
+            artwork.src_path.name,
+            placement.placement_name,
+            fit_mode,
+            requested_upscale_factor,
+            scale,
+            max_upscale_factor,
+        )
+    applied_upscale_factor = scale if scale > 1.0 else 1.0
     upscaled = scale > 1
     resize_filter = _upscale_filter(upscale_method) if upscaled else Image.LANCZOS
     resized_size = (math.ceil(image.width * scale), math.ceil(image.height * scale))
@@ -1850,7 +1892,7 @@ def resolve_artwork_for_placement(
         action = "contained_padded_upscale" if upscaled else "contained_padded"
 
     logger.info(
-        "Artwork resolution action=%s placement=%s fit_mode=%s original=%sx%s trimmed=%s resized=%sx%s final_canvas=%sx%s upscaled=%s effective_upscale_factor=%.3f",
+        "Artwork resolution action=%s placement=%s fit_mode=%s original=%sx%s trimmed=%s resized=%sx%s final_canvas=%sx%s upscaled=%s requested_upscale_factor=%.3f applied_upscale_factor=%.3f upscale_capped=%s effective_upscale_factor=%.3f",
         action,
         placement.placement_name,
         fit_mode,
@@ -1862,7 +1904,10 @@ def resolve_artwork_for_placement(
         final.width,
         final.height,
         upscaled,
-        (scale if scale > 1.0 else 1.0),
+        requested_upscale_factor,
+        applied_upscale_factor,
+        upscale_capped,
+        applied_upscale_factor,
     )
     resized.close()
 
@@ -1874,7 +1919,10 @@ def resolve_artwork_for_placement(
         trimmed_size=trimmed_size,
         final_size=(final.width, final.height),
         resized_size=(resized_size[0], resized_size[1]),
-        effective_upscale_factor=(scale if scale > 1.0 else 1.0),
+        requested_upscale_factor=requested_upscale_factor,
+        applied_upscale_factor=applied_upscale_factor,
+        upscale_capped=upscale_capped,
+        effective_upscale_factor=applied_upscale_factor,
         trim_bounds_pct=trim_bounds_pct,
         trim_applied=trim_applied,
         trim_skip_reason=trim_skip_reason,
@@ -1923,6 +1971,7 @@ def prepare_artwork_export(
         trim_min_alpha=trim_min_alpha,
         trim_padding_pct=trim_padding_pct,
         trim_min_reduction_pct=trim_min_reduction_pct,
+        max_upscale_factor=_resolve_max_upscale_factor(template, placement),
     )
     if not trim_artwork_bounds and shirt_only_trim_requested and not is_shirt_template:
         resolution.trim_skip_reason = "non_shirt_template"
@@ -1957,6 +2006,9 @@ def prepare_artwork_export(
         trimmed_size=resolution.trimmed_size,
         exported_canvas_size=resolution.final_size,
         upscaled=resolution.upscaled,
+        requested_upscale_factor=resolution.requested_upscale_factor,
+        applied_upscale_factor=resolution.applied_upscale_factor,
+        upscale_capped=resolution.upscale_capped,
         effective_upscale_factor=resolution.effective_upscale_factor,
         trim_applied=resolution.trim_applied,
         trim_skip_reason=resolution.trim_skip_reason,
@@ -1983,6 +2035,8 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
             raise TemplateValidationError(f"Template[{index}] placement[{pidx}] artwork_fit_mode must be contain|cover")
         if "placement_scale" in placement and float(placement["placement_scale"]) <= 0:
             raise TemplateValidationError(f"Template[{index}] placement[{pidx}] placement_scale must be > 0")
+        if "max_upscale_factor" in placement and placement.get("max_upscale_factor") is not None and float(placement.get("max_upscale_factor", 0)) <= 0:
+            raise TemplateValidationError(f"Template[{index}] placement[{pidx}] max_upscale_factor must be > 0 when provided")
     if "trim_artwork_bounds" in row and not isinstance(row.get("trim_artwork_bounds"), bool):
         raise TemplateValidationError(f"Template[{index}] trim_artwork_bounds must be a boolean when provided")
     if "trim_artwork_bounds_for_shirts" in row and not isinstance(row.get("trim_artwork_bounds_for_shirts"), bool):
@@ -2007,6 +2061,8 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
         raise TemplateValidationError(f"Template[{index}] rounding_mode must be none|whole_dollar|x_99")
     if row.get("max_enabled_variants") is not None and int(row.get("max_enabled_variants", 0)) <= 0:
         raise TemplateValidationError(f"Template[{index}] max_enabled_variants must be > 0 when provided")
+    if row.get("max_upscale_factor") is not None and float(row.get("max_upscale_factor", 0)) <= 0:
+        raise TemplateValidationError(f"Template[{index}] max_upscale_factor must be > 0 when provided")
     option_filters = row.get("enabled_variant_option_filters")
     if option_filters is not None and not isinstance(option_filters, dict):
         raise TemplateValidationError(f"Template[{index}] enabled_variant_option_filters must be an object")
@@ -2064,6 +2120,7 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
                 audience=str(row.get("audience", "")).strip() or None,
                 product_type_label=str(row.get("product_type_label", "")).strip() or None,
                 style_keywords=[str(v) for v in row.get("style_keywords", [])],
+                max_upscale_factor=float(row["max_upscale_factor"]) if row.get("max_upscale_factor") is not None else None,
                 max_enabled_variants=int(row["max_enabled_variants"]) if row.get("max_enabled_variants") is not None else None,
                 enabled_variant_option_filters={str(k): [str(v) for v in vals] for k, vals in (row.get("enabled_variant_option_filters") or {}).items()},
                 placements=[PlacementRequirement(**p) for p in row.get("placements", [])],
@@ -2745,6 +2802,9 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
         exported_canvas_report = ""
         placement_scale_report = ""
         effective_upscale_factor_report = ""
+        requested_upscale_factor_report = ""
+        applied_upscale_factor_report = ""
+        upscale_capped_report = False
         orientation_report = _orientation_bucket(artwork.image_width, artwork.image_height)
         try:
             if action == "skip":
@@ -2798,7 +2858,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 result = {"status": "no_matching_variants"}
                 record["products"].append({"template": template.key, "state_key": state_key, "title_source": title_info.title_source, "rendered_title": rendered_title, "result": result})
                 if run_rows is not None:
-                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", template.printify_blueprint_id, template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, "", "", "", "", "", "", orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
+                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", template.printify_blueprint_id, template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, "", "", "", "", "", "", "", "", False, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
@@ -2822,6 +2882,9 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 placement_transform = compute_placement_transform_for_artwork(first_prepared.placement, artwork, template.key)
                 placement_scale_report = f"{placement_transform.scale:.3f}"
                 effective_upscale_factor_report = f"{first_prepared.effective_upscale_factor:.3f}"
+                requested_upscale_factor_report = f"{first_prepared.requested_upscale_factor:.3f}"
+                applied_upscale_factor_report = f"{first_prepared.applied_upscale_factor:.3f}"
+                upscale_capped_report = first_prepared.upscale_capped
 
             if skipped_placements:
                 all_templates_successful = False
@@ -2842,7 +2905,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     "result": result,
                 })
                 if run_rows is not None:
-                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", template.printify_blueprint_id, template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, source_size_report, trimmed_bounds_report, "", exported_canvas_report, placement_scale_report, effective_upscale_factor_report, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
+                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", template.printify_blueprint_id, template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, source_size_report, trimmed_bounds_report, "", exported_canvas_report, placement_scale_report, effective_upscale_factor_report, requested_upscale_factor_report, applied_upscale_factor_report, upscale_capped_report, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
@@ -2915,6 +2978,9 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     exported_canvas_size=exported_canvas_report,
                     placement_scale_used=placement_scale_report,
                     effective_upscale_factor=effective_upscale_factor_report,
+                    requested_upscale_factor=requested_upscale_factor_report,
+                    applied_upscale_factor=applied_upscale_factor_report,
+                    upscale_capped=upscale_capped_report,
                     orientation_bucket=orientation_report,
                     launch_plan_row=launch_plan_row,
                     launch_plan_row_id=launch_plan_row_id,
@@ -2988,7 +3054,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     launch_plan_row_id=launch_plan_row_id,
                 ))
             if run_rows is not None:
-                run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "failure", action, template.printify_blueprint_id, template.printify_print_provider_id, summarize_upload_strategy(upload_map), "", False, False, rendered_title, source_size_report, trimmed_bounds_report, "", exported_canvas_report, placement_scale_report, effective_upscale_factor_report, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
+                run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "failure", action, template.printify_blueprint_id, template.printify_print_provider_id, summarize_upload_strategy(upload_map), "", False, False, rendered_title, source_size_report, trimmed_bounds_report, "", exported_canvas_report, placement_scale_report, effective_upscale_factor_report, requested_upscale_factor_report, applied_upscale_factor_report, upscale_capped_report, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
             log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": error_result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action=action, upload_map=upload_map)
         save_json_atomic(state_path, state)
         logger.info("State persisted after template processing state_path=%s", state_path)

@@ -55,14 +55,16 @@
         "placement_x": 0.5,
         "placement_y": 0.5,
         "placement_angle": 0,
-        "artwork_fit_mode": "contain"
+        "artwork_fit_mode": "contain",
+        "max_upscale_factor": 4.0
       }
     ],
     "trim_artwork_bounds": false,
     "trim_artwork_bounds_for_shirts": true,
     "trim_bounds_min_alpha": 8,
     "trim_bounds_padding_pct": 0.015,
-    "trim_bounds_min_reduction_pct": 0.01
+    "trim_bounds_min_reduction_pct": 0.01,
+    "max_upscale_factor": 4.0
   },
   {
     "key": "mug_11oz",
