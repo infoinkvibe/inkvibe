@@ -177,6 +177,7 @@ class ProductTemplate:
     compare_at_price: Optional[str] = None
     trim_artwork_bounds: bool = False
     trim_artwork_bounds_for_shirts: bool = False
+    trim_bounds_preset: Optional[str] = None
     trim_bounds_min_alpha: int = 8
     trim_bounds_padding_pct: float = 0.015
     trim_bounds_min_reduction_pct: float = 0.01
@@ -240,6 +241,7 @@ class RunReportRow:
     rendered_title: str
     source_size: str = ""
     trimmed_bounds_size: str = ""
+    trim_skip_reason: str = ""
     exported_canvas_size: str = ""
     placement_scale_used: str = ""
     orientation_bucket: str = ""
@@ -279,6 +281,8 @@ class PreparedArtwork:
     source_size: Tuple[int, int] = (0, 0)
     trimmed_size: Optional[Tuple[int, int]] = None
     exported_canvas_size: Tuple[int, int] = (0, 0)
+    trim_applied: bool = False
+    trim_skip_reason: Optional[str] = None
 
 
 @dataclass
@@ -300,6 +304,35 @@ class ArtworkResolution:
     final_size: Tuple[int, int]
     resized_size: Tuple[int, int]
     trim_bounds_pct: Optional[Tuple[float, float]] = None
+    trim_applied: bool = False
+    trim_skip_reason: Optional[str] = None
+
+
+@dataclass
+class TrimBoundsResult:
+    image: Image.Image
+    trimmed_size: Optional[Tuple[int, int]]
+    applied: bool
+    skip_reason: Optional[str] = None
+
+
+TRIM_PRESETS: Dict[str, Dict[str, float]] = {
+    "conservative": {
+        "trim_bounds_min_alpha": 16,
+        "trim_bounds_padding_pct": 0.02,
+        "trim_bounds_min_reduction_pct": 0.03,
+    },
+    "normal": {
+        "trim_bounds_min_alpha": 8,
+        "trim_bounds_padding_pct": 0.015,
+        "trim_bounds_min_reduction_pct": 0.01,
+    },
+    "aggressive": {
+        "trim_bounds_min_alpha": 1,
+        "trim_bounds_padding_pct": 0.005,
+        "trim_bounds_min_reduction_pct": 0.002,
+    },
+}
 
 
 LAUNCH_PLAN_OVERRIDE_COLUMNS = [
@@ -1620,14 +1653,14 @@ def _trim_artwork_bounds(
     min_alpha: int = 8,
     padding_pct: float = 0.015,
     min_reduction_pct: float = 0.01,
-) -> Tuple[Image.Image, Optional[Tuple[int, int]]]:
+) -> TrimBoundsResult:
     alpha = image.getchannel("A")
     if min_alpha > 1:
         alpha = alpha.point(lambda px: 255 if px >= min_alpha else 0)
     bbox = alpha.getbbox()
     alpha.close()
     if bbox is None:
-        return image, None
+        return TrimBoundsResult(image=image, trimmed_size=None, applied=False, skip_reason="no_meaningful_alpha_bounds")
     left, top, right, bottom = bbox
     pad = max(1, int(math.ceil(max(image.width, image.height) * max(0.0, padding_pct))))
     left = max(0, left - pad)
@@ -1642,13 +1675,38 @@ def _trim_artwork_bounds(
     reduction_pct = 0.0 if original_area <= 0 else max(0.0, 1.0 - (trimmed_area / original_area))
 
     if reduction_pct < max(0.0, min_reduction_pct):
-        return image, (image.width, image.height)
+        return TrimBoundsResult(
+            image=image,
+            trimmed_size=(image.width, image.height),
+            applied=False,
+            skip_reason="below_reduction_threshold",
+        )
 
     if left == 0 and top == 0 and right == image.width and bottom == image.height:
-        return image, (image.width, image.height)
+        return TrimBoundsResult(
+            image=image,
+            trimmed_size=(image.width, image.height),
+            applied=False,
+            skip_reason="below_reduction_threshold",
+        )
     trimmed = image.crop((left, top, right, bottom))
     image.close()
-    return trimmed, (trimmed.width, trimmed.height)
+    return TrimBoundsResult(image=trimmed, trimmed_size=(trimmed.width, trimmed.height), applied=True)
+def _resolve_trim_bounds_settings(template: ProductTemplate) -> Tuple[int, float, float]:
+    preset_name = (template.trim_bounds_preset or "").strip().lower()
+    preset = TRIM_PRESETS.get(preset_name, {})
+    min_alpha = int(preset.get("trim_bounds_min_alpha", template.trim_bounds_min_alpha))
+    padding_pct = float(preset.get("trim_bounds_padding_pct", template.trim_bounds_padding_pct))
+    min_reduction_pct = float(preset.get("trim_bounds_min_reduction_pct", template.trim_bounds_min_reduction_pct))
+
+    # Explicit numeric overrides always win over preset defaults.
+    if template.trim_bounds_min_alpha != 8:
+        min_alpha = int(template.trim_bounds_min_alpha)
+    if template.trim_bounds_padding_pct != 0.015:
+        padding_pct = float(template.trim_bounds_padding_pct)
+    if template.trim_bounds_min_reduction_pct != 0.01:
+        min_reduction_pct = float(template.trim_bounds_min_reduction_pct)
+    return min_alpha, padding_pct, min_reduction_pct
 
 
 def resolve_artwork_for_placement(
@@ -1667,13 +1725,19 @@ def resolve_artwork_for_placement(
         image = ImageOps.exif_transpose(opened).convert("RGBA")
     original_size = (image.width, image.height)
     trimmed_size: Optional[Tuple[int, int]] = None
+    trim_applied = False
+    trim_skip_reason: Optional[str] = None
     if trim_artwork_bounds:
-        image, trimmed_size = _trim_artwork_bounds(
+        trim_result = _trim_artwork_bounds(
             image,
             min_alpha=trim_min_alpha,
             padding_pct=trim_padding_pct,
             min_reduction_pct=trim_min_reduction_pct,
         )
+        image = trim_result.image
+        trimmed_size = trim_result.trimmed_size
+        trim_applied = trim_result.applied
+        trim_skip_reason = trim_result.skip_reason
     trim_bounds_pct: Optional[Tuple[float, float]] = None
     if trimmed_size:
         trim_bounds_pct = (
@@ -1710,6 +1774,13 @@ def resolve_artwork_for_placement(
             trim_bounds_pct[0],
             trim_bounds_pct[1],
         )
+    if trim_artwork_bounds and not trim_applied and trim_skip_reason:
+        logger.info(
+            "Trim skipped artwork=%s placement=%s reason=%s",
+            artwork.src_path.name,
+            placement.placement_name,
+            trim_skip_reason,
+        )
 
     if too_small and not allow_upscale:
         if skip_undersized:
@@ -1732,6 +1803,8 @@ def resolve_artwork_for_placement(
                 final_size=original_size,
                 resized_size=original_size,
                 trim_bounds_pct=trim_bounds_pct,
+                trim_applied=trim_applied,
+                trim_skip_reason=trim_skip_reason,
             )
         logger.error(
             "Undersized artwork action=fail artwork=%s placement=%s fit_mode=%s original=%sx%s required=%sx%s",
@@ -1796,6 +1869,8 @@ def resolve_artwork_for_placement(
         final_size=(final.width, final.height),
         resized_size=(resized_size[0], resized_size[1]),
         trim_bounds_pct=trim_bounds_pct,
+        trim_applied=trim_applied,
+        trim_skip_reason=trim_skip_reason,
     )
 
 
@@ -1826,20 +1901,31 @@ def prepare_artwork_export(
     export_path = export_dir / template.key / f"{artwork.slug}-{placement.placement_name}.png"
     export_path.parent.mkdir(parents=True, exist_ok=True)
 
+    shirt_only_trim_requested = template.trim_artwork_bounds_for_shirts
+    is_shirt_template = _is_shirt_template_key(template.key)
+    trim_artwork_bounds = template.trim_artwork_bounds or (shirt_only_trim_requested and is_shirt_template)
+    trim_min_alpha, trim_padding_pct, trim_min_reduction_pct = _resolve_trim_bounds_settings(template)
+
     resolution = resolve_artwork_for_placement(
         artwork,
         placement,
         allow_upscale=options.allow_upscale or placement.allow_upscale,
         upscale_method=options.upscale_method,
         skip_undersized=options.skip_undersized,
-        trim_artwork_bounds=(
-            template.trim_artwork_bounds
-            or (template.trim_artwork_bounds_for_shirts and _is_shirt_template_key(template.key))
-        ),
-        trim_min_alpha=template.trim_bounds_min_alpha,
-        trim_padding_pct=template.trim_bounds_padding_pct,
-        trim_min_reduction_pct=template.trim_bounds_min_reduction_pct,
+        trim_artwork_bounds=trim_artwork_bounds,
+        trim_min_alpha=trim_min_alpha,
+        trim_padding_pct=trim_padding_pct,
+        trim_min_reduction_pct=trim_min_reduction_pct,
     )
+    if not trim_artwork_bounds and shirt_only_trim_requested and not is_shirt_template:
+        resolution.trim_skip_reason = "non_shirt_template"
+        logger.info(
+            "Trim skipped artwork=%s placement=%s template=%s reason=%s",
+            artwork.src_path.name,
+            placement.placement_name,
+            template.key,
+            resolution.trim_skip_reason,
+        )
     if resolution.action == "skip":
         return None
 
@@ -1863,6 +1949,8 @@ def prepare_artwork_export(
         source_size=resolution.original_size,
         trimmed_size=resolution.trimmed_size,
         exported_canvas_size=resolution.final_size,
+        trim_applied=resolution.trim_applied,
+        trim_skip_reason=resolution.trim_skip_reason,
     )
 
 
@@ -1890,6 +1978,12 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
         raise TemplateValidationError(f"Template[{index}] trim_artwork_bounds must be a boolean when provided")
     if "trim_artwork_bounds_for_shirts" in row and not isinstance(row.get("trim_artwork_bounds_for_shirts"), bool):
         raise TemplateValidationError(f"Template[{index}] trim_artwork_bounds_for_shirts must be a boolean when provided")
+    if row.get("trim_bounds_preset") is not None:
+        preset = str(row.get("trim_bounds_preset", "")).strip().lower()
+        if preset not in TRIM_PRESETS:
+            raise TemplateValidationError(
+                f"Template[{index}] trim_bounds_preset must be one of {sorted(TRIM_PRESETS.keys())}"
+            )
     if row.get("trim_bounds_min_alpha") is not None:
         min_alpha = int(row.get("trim_bounds_min_alpha", 8))
         if min_alpha < 0 or min_alpha > 255:
@@ -1953,6 +2047,7 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
                 compare_at_price=str(row["compare_at_price"]) if "compare_at_price" in row and row.get("compare_at_price") is not None else None,
                 trim_artwork_bounds=bool(row.get("trim_artwork_bounds", False)),
                 trim_artwork_bounds_for_shirts=bool(row.get("trim_artwork_bounds_for_shirts", False)),
+                trim_bounds_preset=str(row.get("trim_bounds_preset", "")).strip().lower() or None,
                 trim_bounds_min_alpha=int(row.get("trim_bounds_min_alpha", 8)),
                 trim_bounds_padding_pct=float(row.get("trim_bounds_padding_pct", 0.015)),
                 trim_bounds_min_reduction_pct=float(row.get("trim_bounds_min_reduction_pct", 0.01)),
@@ -2637,6 +2732,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
         upload_map: Dict[str, Dict[str, Any]] = {}
         source_size_report = ""
         trimmed_bounds_report = ""
+        trim_skip_reason_report = ""
         exported_canvas_report = ""
         placement_scale_report = ""
         orientation_report = _orientation_bucket(artwork.image_width, artwork.image_height)
@@ -2692,7 +2788,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 result = {"status": "no_matching_variants"}
                 record["products"].append({"template": template.key, "state_key": state_key, "title_source": title_info.title_source, "rendered_title": rendered_title, "result": result})
                 if run_rows is not None:
-                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", template.printify_blueprint_id, template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, "", "", "", "", orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
+                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", template.printify_blueprint_id, template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, "", "", "", "", "", orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
@@ -2710,6 +2806,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 source_size_report = f"{first_prepared.source_size[0]}x{first_prepared.source_size[1]}"
                 if first_prepared.trimmed_size:
                     trimmed_bounds_report = f"{first_prepared.trimmed_size[0]}x{first_prepared.trimmed_size[1]}"
+                if first_prepared.trim_skip_reason:
+                    trim_skip_reason_report = first_prepared.trim_skip_reason
                 exported_canvas_report = f"{first_prepared.exported_canvas_size[0]}x{first_prepared.exported_canvas_size[1]}"
                 placement_transform = compute_placement_transform_for_artwork(first_prepared.placement, artwork, template.key)
                 placement_scale_report = f"{placement_transform.scale:.3f}"
@@ -2733,7 +2831,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     "result": result,
                 })
                 if run_rows is not None:
-                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", template.printify_blueprint_id, template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, source_size_report, trimmed_bounds_report, exported_canvas_report, placement_scale_report, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
+                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", template.printify_blueprint_id, template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, source_size_report, trimmed_bounds_report, "", exported_canvas_report, placement_scale_report, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
@@ -2802,6 +2900,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     rendered_title=rendered_title,
                     source_size=source_size_report,
                     trimmed_bounds_size=trimmed_bounds_report,
+                    trim_skip_reason=trim_skip_reason_report,
                     exported_canvas_size=exported_canvas_report,
                     placement_scale_used=placement_scale_report,
                     orientation_bucket=orientation_report,
@@ -2877,7 +2976,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     launch_plan_row_id=launch_plan_row_id,
                 ))
             if run_rows is not None:
-                run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "failure", action, template.printify_blueprint_id, template.printify_print_provider_id, summarize_upload_strategy(upload_map), "", False, False, rendered_title, source_size_report, trimmed_bounds_report, exported_canvas_report, placement_scale_report, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
+                run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "failure", action, template.printify_blueprint_id, template.printify_print_provider_id, summarize_upload_strategy(upload_map), "", False, False, rendered_title, source_size_report, trimmed_bounds_report, "", exported_canvas_report, placement_scale_report, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
             log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": error_result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action=action, upload_map=upload_map)
         save_json_atomic(state_path, state)
         logger.info("State persisted after template processing state_path=%s", state_path)

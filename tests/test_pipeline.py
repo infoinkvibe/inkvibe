@@ -1,4 +1,5 @@
 import json
+import logging
 import sys
 import types
 from pathlib import Path
@@ -76,6 +77,7 @@ from printify_shopify_sync_pipeline import (
     build_printify_product_payload,
     normalize_printify_transform,
     resolve_artwork_for_placement,
+    _resolve_trim_bounds_settings,
 )
 
 
@@ -1914,6 +1916,106 @@ def test_template_level_shirt_only_trim_toggle_does_not_trim_mugs(tmp_path: Path
 
     assert prepared_shirt is not None and prepared_shirt.trimmed_size == (430, 230)
     assert prepared_mug is not None and prepared_mug.trimmed_size is None
+
+
+def test_trim_logs_skip_reason_for_no_meaningful_alpha_bounds(tmp_path: Path, caplog):
+    path = tmp_path / "all-transparent.png"
+    Image.new("RGBA", (1000, 1000), (0, 0, 0, 0)).save(path)
+
+    artwork = Artwork("transparent", path, "Transparent", "", [], 1000, 1000)
+    placement = PlacementRequirement("front", 1000, 1000, artwork_fit_mode="contain")
+
+    with caplog.at_level(logging.INFO):
+        result = resolve_artwork_for_placement(
+            artwork,
+            placement,
+            allow_upscale=False,
+            upscale_method="lanczos",
+            skip_undersized=False,
+            trim_artwork_bounds=True,
+        )
+
+    assert result.trim_applied is False
+    assert result.trim_skip_reason == "no_meaningful_alpha_bounds"
+    assert "reason=no_meaningful_alpha_bounds" in caplog.text
+
+
+def test_trim_logs_skip_reason_for_reduction_threshold(tmp_path: Path, caplog):
+    path = tmp_path / "full-alpha.png"
+    Image.new("RGBA", (1000, 1000), (255, 0, 0, 255)).save(path)
+
+    artwork = Artwork("full", path, "Full", "", [], 1000, 1000)
+    placement = PlacementRequirement("front", 1000, 1000, artwork_fit_mode="contain")
+
+    with caplog.at_level(logging.INFO):
+        result = resolve_artwork_for_placement(
+            artwork,
+            placement,
+            allow_upscale=False,
+            upscale_method="lanczos",
+            skip_undersized=False,
+            trim_artwork_bounds=True,
+            trim_min_reduction_pct=0.5,
+        )
+
+    assert result.trim_applied is False
+    assert result.trim_skip_reason == "below_reduction_threshold"
+    assert "reason=below_reduction_threshold" in caplog.text
+
+
+def test_template_level_shirt_only_trim_reports_non_shirt_template_reason(tmp_path: Path, caplog):
+    path = tmp_path / "margin-art-template-reason.png"
+    image = Image.new("RGBA", (1000, 1000), (0, 0, 0, 0))
+    image.paste((255, 0, 0, 255), (300, 400, 700, 600))
+    image.save(path)
+
+    artwork = Artwork("margin-art-template-reason", path, "Margin Art", "", [], 1000, 1000)
+    placement = PlacementRequirement("front", 1000, 1000, artwork_fit_mode="contain")
+    options = ArtworkProcessingOptions(allow_upscale=True)
+
+    mug_template = ProductTemplate(
+        key="mug_11oz",
+        printify_blueprint_id=68,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[placement],
+        trim_artwork_bounds_for_shirts=True,
+    )
+
+    with caplog.at_level(logging.INFO):
+        prepared_mug = prepare_artwork_export(artwork, mug_template, placement, tmp_path / "exports", options)
+
+    assert prepared_mug is not None
+    assert prepared_mug.trimmed_size is None
+    assert prepared_mug.trim_skip_reason == "non_shirt_template"
+    assert "reason=non_shirt_template" in caplog.text
+
+
+def test_trim_preset_resolution_uses_preset_defaults_and_numeric_overrides():
+    template = ProductTemplate(
+        key="tshirt_gildan",
+        printify_blueprint_id=6,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[PlacementRequirement("front", 1000, 1000)],
+        trim_bounds_preset="aggressive",
+    )
+    assert _resolve_trim_bounds_settings(template) == (1, 0.005, 0.002)
+
+    template_override = ProductTemplate(
+        key="tshirt_gildan",
+        printify_blueprint_id=6,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[PlacementRequirement("front", 1000, 1000)],
+        trim_bounds_preset="aggressive",
+        trim_bounds_min_alpha=12,
+    )
+    assert _resolve_trim_bounds_settings(template_override) == (12, 0.005, 0.002)
+
 def test_compute_placement_transform_for_mug_landscape_caps_scale():
     artwork = Artwork(
         slug="wide",
@@ -2107,6 +2209,26 @@ def test_template_validation_rejects_invalid_trim_thresholds(tmp_path: Path):
     )
     with pytest.raises(TemplateValidationError, match=r"trim_bounds_min_alpha must be between 0 and 255"):
         load_templates(config)
+
+def test_template_validation_rejects_invalid_trim_preset(tmp_path: Path):
+    config = tmp_path / "product_templates.json"
+    config.write_text(
+        json.dumps(
+            [
+                {
+                    "key": "t1",
+                    "printify_blueprint_id": 6,
+                    "printify_print_provider_id": 99,
+                    "trim_bounds_preset": "wild",
+                    "placements": [{"placement_name": "front", "width_px": 1000, "height_px": 1000}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(TemplateValidationError, match=r"trim_bounds_preset must be one of"):
+        load_templates(config)
+
 
 def test_filename_slug_to_title_handles_ugly_flat_tokens():
     assert filename_slug_to_title("flat,750x,075,f-pad,750x1000,f8f8f8") == "Untitled Design"
