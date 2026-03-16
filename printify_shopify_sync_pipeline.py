@@ -182,6 +182,9 @@ class ProductTemplate:
     trim_bounds_min_alpha: int = 8
     trim_bounds_padding_pct: float = 0.015
     trim_bounds_min_reduction_pct: float = 0.01
+    aggressive_subject_trim_for_shirts: bool = False
+    aggressive_subject_trim_mode: Optional[str] = None
+    shirt_subject_fill_target: Optional[float] = None
     seo_keywords: List[str] = field(default_factory=list)
     audience: Optional[str] = None
     product_type_label: Optional[str] = None
@@ -259,6 +262,10 @@ class RunReportRow:
     launch_name: str = ""
     campaign: str = ""
     merch_theme: str = ""
+    subject_bounds_before_aggressive_trim: str = ""
+    subject_bounds_after_aggressive_trim: str = ""
+    subject_fill_target: str = ""
+    aggressive_trim_used: bool = False
 
 
 @dataclass
@@ -294,6 +301,10 @@ class PreparedArtwork:
     upscale_capped: bool = False
     trim_applied: bool = False
     trim_skip_reason: Optional[str] = None
+    subject_bounds_before_aggressive_trim: Optional[Tuple[int, int, int, int]] = None
+    subject_bounds_after_aggressive_trim: Optional[Tuple[int, int, int, int]] = None
+    subject_fill_target: Optional[float] = None
+    aggressive_trim_used: bool = False
 
 
 @dataclass
@@ -321,6 +332,10 @@ class ArtworkResolution:
     trim_bounds_pct: Optional[Tuple[float, float]] = None
     trim_applied: bool = False
     trim_skip_reason: Optional[str] = None
+    subject_bounds_before_aggressive_trim: Optional[Tuple[int, int, int, int]] = None
+    subject_bounds_after_aggressive_trim: Optional[Tuple[int, int, int, int]] = None
+    subject_fill_target: Optional[float] = None
+    aggressive_trim_used: bool = False
 
 
 @dataclass
@@ -329,6 +344,8 @@ class TrimBoundsResult:
     trimmed_size: Optional[Tuple[int, int]]
     applied: bool
     skip_reason: Optional[str] = None
+    subject_bounds_before: Optional[Tuple[int, int, int, int]] = None
+    subject_bounds_after: Optional[Tuple[int, int, int, int]] = None
 
 
 TRIM_PRESETS: Dict[str, Dict[str, float]] = {
@@ -1707,6 +1724,123 @@ def _trim_artwork_bounds(
     trimmed = image.crop((left, top, right, bottom))
     image.close()
     return TrimBoundsResult(image=trimmed, trimmed_size=(trimmed.width, trimmed.height), applied=True)
+
+
+def _compute_alpha_bbox(image: Image.Image, *, min_alpha: int = 1) -> Optional[Tuple[int, int, int, int]]:
+    alpha = image.getchannel("A")
+    if min_alpha > 1:
+        alpha = alpha.point(lambda px: 255 if px >= min_alpha else 0)
+    bbox = alpha.getbbox()
+    alpha.close()
+    return bbox
+
+
+def _connected_components_bbox(mask: List[List[bool]], mode: str) -> Optional[Tuple[int, int, int, int]]:
+    h = len(mask)
+    w = len(mask[0]) if h else 0
+    if w == 0 or h == 0:
+        return None
+    seen = [[False for _ in range(w)] for _ in range(h)]
+    best: Optional[Tuple[int, int, int, int]] = None
+    best_score = -1.0
+    cx = (w - 1) / 2.0
+    cy = (h - 1) / 2.0
+    diag = max(1.0, math.hypot(cx, cy))
+    for y in range(h):
+        for x in range(w):
+            if seen[y][x] or not mask[y][x]:
+                continue
+            stack = [(x, y)]
+            seen[y][x] = True
+            left = right = x
+            top = bottom = y
+            count = 0
+            sum_x = 0.0
+            sum_y = 0.0
+            while stack:
+                px, py = stack.pop()
+                count += 1
+                sum_x += px
+                sum_y += py
+                left = min(left, px)
+                right = max(right, px)
+                top = min(top, py)
+                bottom = max(bottom, py)
+                for nx, ny in ((px - 1, py), (px + 1, py), (px, py - 1), (px, py + 1)):
+                    if 0 <= nx < w and 0 <= ny < h and not seen[ny][nx] and mask[ny][nx]:
+                        seen[ny][nx] = True
+                        stack.append((nx, ny))
+            area = float(count)
+            if mode == "clipart_central":
+                comp_cx = sum_x / count
+                comp_cy = sum_y / count
+                center_penalty = math.hypot(comp_cx - cx, comp_cy - cy) / diag
+                score = area * max(0.1, 1.0 - (center_penalty * 0.6))
+            else:
+                score = area
+            if score > best_score:
+                best_score = score
+                best = (left, top, right + 1, bottom + 1)
+    return best
+
+
+def _aggressive_subject_trim(
+    image: Image.Image,
+    *,
+    min_alpha: int = 1,
+    min_reduction_pct: float = 0.002,
+    mode: str = "clipart_central",
+    subject_fill_target: Optional[float] = None,
+) -> TrimBoundsResult:
+    before_bbox = _compute_alpha_bbox(image, min_alpha=min_alpha)
+    if before_bbox is None:
+        result = TrimBoundsResult(image=image, trimmed_size=None, applied=False, skip_reason="no_meaningful_alpha_bounds")
+        result.subject_bounds_before = None
+        result.subject_bounds_after = None
+        return result
+
+    alpha = image.getchannel("A")
+    pixels = alpha.load()
+    w, h = image.size
+    mask = [[pixels[x, y] >= min_alpha for x in range(w)] for y in range(h)]
+    alpha.close()
+
+    after_bbox = _connected_components_bbox(mask, mode) or before_bbox
+    left, top, right, bottom = after_bbox
+
+    if subject_fill_target is not None and 0 < subject_fill_target <= 1.0:
+        sw = max(1, right - left)
+        sh = max(1, bottom - top)
+        expand_x = max(0, int(math.ceil((sw / subject_fill_target - sw) / 2.0)))
+        expand_y = max(0, int(math.ceil((sh / subject_fill_target - sh) / 2.0)))
+        left = max(0, left - expand_x)
+        top = max(0, top - expand_y)
+        right = min(image.width, right + expand_x)
+        bottom = min(image.height, bottom + expand_y)
+
+    trimmed_w = max(1, right - left)
+    trimmed_h = max(1, bottom - top)
+    original_area = image.width * image.height
+    reduction_pct = 0.0 if original_area <= 0 else max(0.0, 1.0 - ((trimmed_w * trimmed_h) / original_area))
+    if reduction_pct < max(0.0, min_reduction_pct):
+        result = TrimBoundsResult(image=image, trimmed_size=(image.width, image.height), applied=False, skip_reason="below_reduction_threshold")
+        result.subject_bounds_before = before_bbox
+        result.subject_bounds_after = (left, top, right, bottom)
+        return result
+
+    if left == 0 and top == 0 and right == image.width and bottom == image.height:
+        result = TrimBoundsResult(image=image, trimmed_size=(image.width, image.height), applied=False, skip_reason="below_reduction_threshold")
+        result.subject_bounds_before = before_bbox
+        result.subject_bounds_after = (left, top, right, bottom)
+        return result
+
+    trimmed = image.crop((left, top, right, bottom))
+    image.close()
+    result = TrimBoundsResult(image=trimmed, trimmed_size=(trimmed.width, trimmed.height), applied=True)
+    result.subject_bounds_before = before_bbox
+    result.subject_bounds_after = (left, top, right, bottom)
+    return result
+
 def _resolve_trim_bounds_settings(template: ProductTemplate) -> Tuple[int, float, float]:
     preset_name = (template.trim_bounds_preset or "").strip().lower()
     preset = TRIM_PRESETS.get(preset_name, {})
@@ -1750,6 +1884,8 @@ def resolve_artwork_for_placement(
     trim_padding_pct: float = 0.015,
     trim_min_reduction_pct: float = 0.01,
     max_upscale_factor: Optional[float] = None,
+    aggressive_subject_trim_mode: Optional[str] = None,
+    subject_fill_target: Optional[float] = None,
 ) -> ArtworkResolution:
     with Image.open(artwork.src_path) as opened:
         image = ImageOps.exif_transpose(opened).convert("RGBA")
@@ -1757,6 +1893,9 @@ def resolve_artwork_for_placement(
     trimmed_size: Optional[Tuple[int, int]] = None
     trim_applied = False
     trim_skip_reason: Optional[str] = None
+    subject_bounds_before_aggressive_trim: Optional[Tuple[int, int, int, int]] = None
+    subject_bounds_after_aggressive_trim: Optional[Tuple[int, int, int, int]] = None
+    aggressive_trim_used = False
     if trim_artwork_bounds:
         trim_result = _trim_artwork_bounds(
             image,
@@ -1768,6 +1907,23 @@ def resolve_artwork_for_placement(
         trimmed_size = trim_result.trimmed_size
         trim_applied = trim_result.applied
         trim_skip_reason = trim_result.skip_reason
+
+    if trim_artwork_bounds and aggressive_subject_trim_mode:
+        aggressive_trim_result = _aggressive_subject_trim(
+            image,
+            min_alpha=max(1, trim_min_alpha),
+            min_reduction_pct=trim_min_reduction_pct,
+            mode=aggressive_subject_trim_mode,
+            subject_fill_target=subject_fill_target,
+        )
+        subject_bounds_before_aggressive_trim = getattr(aggressive_trim_result, "subject_bounds_before", None)
+        subject_bounds_after_aggressive_trim = getattr(aggressive_trim_result, "subject_bounds_after", None)
+        aggressive_trim_used = aggressive_trim_result.applied
+        image = aggressive_trim_result.image
+        trimmed_size = aggressive_trim_result.trimmed_size
+        trim_applied = trim_applied or aggressive_trim_result.applied
+        if aggressive_trim_result.skip_reason:
+            trim_skip_reason = aggressive_trim_result.skip_reason
     trim_bounds_pct: Optional[Tuple[float, float]] = None
     if trimmed_size:
         trim_bounds_pct = (
@@ -1804,6 +1960,18 @@ def resolve_artwork_for_placement(
             trim_bounds_pct[0],
             trim_bounds_pct[1],
         )
+    if aggressive_subject_trim_mode:
+        logger.info(
+            "Aggressive trim debug artwork=%s placement=%s mode=%s used=%s subject_bounds_before=%s subject_bounds_after=%s subject_fill_target=%s",
+            artwork.src_path.name,
+            placement.placement_name,
+            aggressive_subject_trim_mode,
+            aggressive_trim_used,
+            subject_bounds_before_aggressive_trim,
+            subject_bounds_after_aggressive_trim,
+            subject_fill_target,
+        )
+
     if trim_artwork_bounds and not trim_applied and trim_skip_reason:
         logger.info(
             "Trim skipped artwork=%s placement=%s reason=%s",
@@ -1926,6 +2094,10 @@ def resolve_artwork_for_placement(
         trim_bounds_pct=trim_bounds_pct,
         trim_applied=trim_applied,
         trim_skip_reason=trim_skip_reason,
+        subject_bounds_before_aggressive_trim=subject_bounds_before_aggressive_trim,
+        subject_bounds_after_aggressive_trim=subject_bounds_after_aggressive_trim,
+        subject_fill_target=subject_fill_target,
+        aggressive_trim_used=aggressive_trim_used,
     )
 
 
@@ -1960,6 +2132,9 @@ def prepare_artwork_export(
     is_shirt_template = _is_shirt_template_key(template.key)
     trim_artwork_bounds = template.trim_artwork_bounds or (shirt_only_trim_requested and is_shirt_template)
     trim_min_alpha, trim_padding_pct, trim_min_reduction_pct = _resolve_trim_bounds_settings(template)
+    use_aggressive_trim = bool(template.aggressive_subject_trim_for_shirts and is_shirt_template and placement.placement_name.strip().lower() == "front")
+    aggressive_subject_trim_mode = (template.aggressive_subject_trim_mode or "clipart_central") if use_aggressive_trim else None
+    subject_fill_target = template.shirt_subject_fill_target if use_aggressive_trim else None
 
     resolution = resolve_artwork_for_placement(
         artwork,
@@ -1972,6 +2147,8 @@ def prepare_artwork_export(
         trim_padding_pct=trim_padding_pct,
         trim_min_reduction_pct=trim_min_reduction_pct,
         max_upscale_factor=_resolve_max_upscale_factor(template, placement),
+        aggressive_subject_trim_mode=aggressive_subject_trim_mode,
+        subject_fill_target=subject_fill_target,
     )
     if not trim_artwork_bounds and shirt_only_trim_requested and not is_shirt_template:
         resolution.trim_skip_reason = "non_shirt_template"
@@ -2012,6 +2189,10 @@ def prepare_artwork_export(
         effective_upscale_factor=resolution.effective_upscale_factor,
         trim_applied=resolution.trim_applied,
         trim_skip_reason=resolution.trim_skip_reason,
+        subject_bounds_before_aggressive_trim=resolution.subject_bounds_before_aggressive_trim,
+        subject_bounds_after_aggressive_trim=resolution.subject_bounds_after_aggressive_trim,
+        subject_fill_target=resolution.subject_fill_target,
+        aggressive_trim_used=resolution.aggressive_trim_used,
     )
 
 
@@ -2055,6 +2236,16 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
         raise TemplateValidationError(f"Template[{index}] trim_bounds_padding_pct must be >= 0")
     if row.get("trim_bounds_min_reduction_pct") is not None and float(row.get("trim_bounds_min_reduction_pct", 0.0)) < 0:
         raise TemplateValidationError(f"Template[{index}] trim_bounds_min_reduction_pct must be >= 0")
+    if "aggressive_subject_trim_for_shirts" in row and not isinstance(row.get("aggressive_subject_trim_for_shirts"), bool):
+        raise TemplateValidationError(f"Template[{index}] aggressive_subject_trim_for_shirts must be a boolean when provided")
+    if row.get("aggressive_subject_trim_mode") is not None:
+        mode = str(row.get("aggressive_subject_trim_mode", "")).strip().lower()
+        if mode not in {"clipart_central"}:
+            raise TemplateValidationError(f"Template[{index}] aggressive_subject_trim_mode must be one of ['clipart_central']")
+    if row.get("shirt_subject_fill_target") is not None:
+        fill_target = float(row.get("shirt_subject_fill_target", 0))
+        if fill_target <= 0 or fill_target > 1:
+            raise TemplateValidationError(f"Template[{index}] shirt_subject_fill_target must be > 0 and <= 1 when provided")
     if row.get("markup_type", "fixed") not in {"fixed", "percent"}:
         raise TemplateValidationError(f"Template[{index}] markup_type must be fixed|percent")
     if row.get("rounding_mode", "none") not in {"none", "whole_dollar", "x_99"}:
@@ -2116,6 +2307,9 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
                 trim_bounds_min_alpha=int(row.get("trim_bounds_min_alpha", 8)),
                 trim_bounds_padding_pct=float(row.get("trim_bounds_padding_pct", 0.015)),
                 trim_bounds_min_reduction_pct=float(row.get("trim_bounds_min_reduction_pct", 0.01)),
+                aggressive_subject_trim_for_shirts=bool(row.get("aggressive_subject_trim_for_shirts", False)),
+                aggressive_subject_trim_mode=str(row.get("aggressive_subject_trim_mode", "")).strip().lower() or None,
+                shirt_subject_fill_target=float(row["shirt_subject_fill_target"]) if row.get("shirt_subject_fill_target") is not None else None,
                 seo_keywords=[str(v) for v in row.get("seo_keywords", [])],
                 audience=str(row.get("audience", "")).strip() or None,
                 product_type_label=str(row.get("product_type_label", "")).strip() or None,
@@ -2805,6 +2999,10 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
         requested_upscale_factor_report = ""
         applied_upscale_factor_report = ""
         upscale_capped_report = False
+        subject_bounds_before_aggressive_trim_report = ""
+        subject_bounds_after_aggressive_trim_report = ""
+        subject_fill_target_report = ""
+        aggressive_trim_used_report = False
         orientation_report = _orientation_bucket(artwork.image_width, artwork.image_height)
         try:
             if action == "skip":
@@ -2885,6 +3083,15 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 requested_upscale_factor_report = f"{first_prepared.requested_upscale_factor:.3f}"
                 applied_upscale_factor_report = f"{first_prepared.applied_upscale_factor:.3f}"
                 upscale_capped_report = first_prepared.upscale_capped
+                if first_prepared.subject_bounds_before_aggressive_trim:
+                    b = first_prepared.subject_bounds_before_aggressive_trim
+                    subject_bounds_before_aggressive_trim_report = f"{b[0]},{b[1]},{b[2]},{b[3]}"
+                if first_prepared.subject_bounds_after_aggressive_trim:
+                    b = first_prepared.subject_bounds_after_aggressive_trim
+                    subject_bounds_after_aggressive_trim_report = f"{b[0]},{b[1]},{b[2]},{b[3]}"
+                if first_prepared.subject_fill_target is not None:
+                    subject_fill_target_report = f"{first_prepared.subject_fill_target:.3f}"
+                aggressive_trim_used_report = first_prepared.aggressive_trim_used
 
             if skipped_placements:
                 all_templates_successful = False
@@ -2990,6 +3197,10 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     launch_name=launch_name,
                     campaign=campaign,
                     merch_theme=merch_theme,
+                    subject_bounds_before_aggressive_trim=subject_bounds_before_aggressive_trim_report,
+                    subject_bounds_after_aggressive_trim=subject_bounds_after_aggressive_trim_report,
+                    subject_fill_target=subject_fill_target_report,
+                    aggressive_trim_used=aggressive_trim_used_report,
                 ))
             if summary is not None:
                 printify_action = (result.get("printify", {}) or {}).get("action", action)

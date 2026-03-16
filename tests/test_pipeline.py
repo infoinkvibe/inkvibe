@@ -2071,6 +2071,102 @@ def test_template_level_shirt_only_trim_reports_non_shirt_template_reason(tmp_pa
     assert "reason=non_shirt_template" in caplog.text
 
 
+
+
+def test_aggressive_subject_trim_makes_small_central_subject_visibly_larger(tmp_path: Path):
+    path = tmp_path / "cat-style-small-subject.png"
+    image = Image.new("RGBA", (1000, 1000), (0, 0, 0, 0))
+    image.paste((255, 80, 80, 255), (420, 420, 580, 580))
+    image.putpixel((980, 980), (255, 255, 255, 255))
+    image.save(path)
+
+    artwork = Artwork("cat-style", path, "Cat Style", "", [], 1000, 1000)
+    placement = PlacementRequirement("front", 1000, 1000, artwork_fit_mode="contain")
+
+    baseline = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        allow_upscale=True,
+        upscale_method="lanczos",
+        skip_undersized=False,
+        trim_artwork_bounds=True,
+        trim_min_alpha=1,
+    )
+    aggressive = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        allow_upscale=True,
+        upscale_method="lanczos",
+        skip_undersized=False,
+        trim_artwork_bounds=True,
+        trim_min_alpha=1,
+        aggressive_subject_trim_mode="clipart_central",
+        subject_fill_target=0.9,
+    )
+
+    assert aggressive.resized_size[0] > baseline.resized_size[0]
+    assert aggressive.resized_size[1] > baseline.resized_size[1]
+    assert aggressive.aggressive_trim_used is True
+    assert aggressive.subject_fill_target == 0.9
+    assert aggressive.subject_bounds_before_aggressive_trim is not None
+    assert aggressive.subject_bounds_after_aggressive_trim is not None
+
+
+def test_aggressive_shirt_trim_flags_do_not_change_mug_behavior(tmp_path: Path):
+    path = tmp_path / "mug-unchanged.png"
+    image = Image.new("RGBA", (1000, 1000), (0, 0, 0, 0))
+    image.paste((255, 0, 0, 255), (350, 350, 650, 650))
+    image.save(path)
+
+    artwork = Artwork("mug-unchanged", path, "Mug Unchanged", "", [], 1000, 1000)
+    placement = PlacementRequirement("front", 1000, 1000, artwork_fit_mode="contain")
+    options = ArtworkProcessingOptions(allow_upscale=True)
+
+    mug_template = ProductTemplate(
+        key="mug_11oz",
+        printify_blueprint_id=68,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[placement],
+        trim_artwork_bounds_for_shirts=True,
+        aggressive_subject_trim_for_shirts=True,
+        aggressive_subject_trim_mode="clipart_central",
+        shirt_subject_fill_target=0.9,
+    )
+
+    prepared_mug = prepare_artwork_export(artwork, mug_template, placement, tmp_path / "exports", options)
+    assert prepared_mug is not None
+    assert prepared_mug.trimmed_size is None
+    assert prepared_mug.aggressive_trim_used is False
+    assert prepared_mug.subject_bounds_before_aggressive_trim is None
+
+
+def test_aggressive_trim_still_respects_max_upscale_factor_for_large_art(tmp_path: Path):
+    path = tmp_path / "large-art-safe.png"
+    image = Image.new("RGBA", (1600, 1600), (0, 0, 0, 0))
+    image.paste((255, 0, 0, 255), (500, 500, 1100, 1100))
+    image.putpixel((30, 30), (255, 255, 255, 255))
+    image.save(path)
+
+    artwork = Artwork("large-safe", path, "Large Safe", "", [], 1600, 1600)
+    placement = PlacementRequirement("front", 2200, 2200, artwork_fit_mode="contain")
+
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        allow_upscale=True,
+        upscale_method="lanczos",
+        skip_undersized=False,
+        trim_artwork_bounds=True,
+        trim_min_alpha=1,
+        max_upscale_factor=1.1,
+        aggressive_subject_trim_mode="clipart_central",
+        subject_fill_target=0.85,
+    )
+
+    assert result.upscale_capped is True
+    assert result.applied_upscale_factor == pytest.approx(1.1)
 def test_trim_preset_resolution_uses_preset_defaults_and_numeric_overrides():
     template = ProductTemplate(
         key="tshirt_gildan",
