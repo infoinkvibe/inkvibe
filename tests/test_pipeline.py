@@ -1772,6 +1772,67 @@ def test_run_uses_launch_plan_selection(tmp_path: Path, monkeypatch):
     assert calls == [("one.png", "row-1")]
 
 
+
+
+def test_compute_placement_transform_for_shirt_uses_updated_orientation_caps():
+    placement = PlacementRequirement("front", 4500, 5400, placement_scale=0.9)
+
+    portrait = Artwork("p", Path("p.png"), "P", "", [], 1000, 1800)
+    square = Artwork("s", Path("s.png"), "S", "", [], 1200, 1200)
+    landscape = Artwork("l", Path("l.png"), "L", "", [], 1800, 1000)
+
+    assert compute_placement_transform_for_artwork(placement, portrait, "tshirt_gildan").scale == 0.72
+    assert compute_placement_transform_for_artwork(placement, square, "tshirt_gildan").scale == 0.70
+    assert compute_placement_transform_for_artwork(placement, landscape, "tshirt_gildan").scale == 0.66
+
+
+def test_optional_trim_artwork_bounds_reduces_transparent_margin_when_enabled(tmp_path: Path):
+    path = tmp_path / "margin-art.png"
+    image = Image.new("RGBA", (1000, 1000), (0, 0, 0, 0))
+    image.paste((255, 0, 0, 255), (300, 400, 700, 600))
+    image.save(path)
+
+    artwork = Artwork("margin-art", path, "Margin Art", "", [], 1000, 1000)
+    placement = PlacementRequirement("front", 1000, 1000, artwork_fit_mode="contain")
+
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        allow_upscale=True,
+        upscale_method="lanczos",
+        skip_undersized=False,
+        trim_artwork_bounds=True,
+    )
+
+    assert result.trimmed_size == (400, 200)
+    assert result.resized_size == (1000, 500)
+    assert result.final_size == (1000, 1000)
+    assert result.image.getpixel((500, 500))[:3] == (255, 0, 0)
+
+
+def test_contain_mode_unchanged_when_trimming_disabled(tmp_path: Path):
+    path = tmp_path / "margin-art-disabled.png"
+    image = Image.new("RGBA", (1000, 1000), (0, 0, 0, 0))
+    image.paste((255, 0, 0, 255), (300, 400, 700, 600))
+    image.save(path)
+
+    artwork = Artwork("margin-art-disabled", path, "Margin Art", "", [], 1000, 1000)
+    placement = PlacementRequirement("front", 1000, 1000, artwork_fit_mode="contain")
+
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        allow_upscale=False,
+        upscale_method="lanczos",
+        skip_undersized=False,
+        trim_artwork_bounds=False,
+    )
+
+    assert result.trimmed_size is None
+    assert result.resized_size == (1000, 1000)
+    assert result.final_size == (1000, 1000)
+    assert result.image.getpixel((500, 500))[:3] == (255, 0, 0)
+    assert result.image.getpixel((100, 100))[3] == 0
 def test_compute_placement_transform_for_mug_landscape_caps_scale():
     artwork = Artwork(
         slug="wide",
