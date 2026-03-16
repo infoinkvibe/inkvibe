@@ -208,6 +208,7 @@ Each placement requires:
 
 Placement fields (optional):
 - `artwork_fit_mode` (`contain` or `cover`, default `contain`)
+- `trim_artwork_bounds` (`true`/`false`, default `false`; trims transparent margins before fit)
 
 Pricing fields (optional):
 - `base_price`
@@ -245,6 +246,11 @@ By default, InkVibeAuto keeps strict validation. You can now choose controlled f
 Each placement can also set `artwork_fit_mode`:
 - `contain` (default): safer mode; preserves full artwork, keeps aspect ratio, and centers on a transparent canvas at placement size (no cropping).
 - `cover`: fills the full print area while preserving aspect ratio, which may crop edges.
+
+Template-level optional preprocessing:
+- `trim_artwork_bounds: true` trims transparent bounds before contain/cover fitting.
+- Default is `false` (no behavior change from previous runs).
+- This helps when source images include large transparent margins that make visible artwork appear too small.
 
 Recommendation:
 - Shirts and mugs should usually use `artwork_fit_mode: contain` unless you intentionally want a full-bleed/cropped look.
@@ -308,7 +314,7 @@ Each placement supports optional transform fields:
 - `placement_angle` (rotation)
 
 Defaults remain centered (`x=0.5`, `y=0.5`) and unrotated (`angle=0`).
-`placement_scale` is now tuned smaller by default for:
+`placement_scale` template caps remain:
 - `tshirt_gildan` front: `0.9`
 - `mug_11oz` front: `0.78`
 
@@ -317,6 +323,8 @@ Use dry-run logs to inspect the exact transform values applied per template/plac
 InkVibeAuto now also applies orientation-aware mockup scaling automatically at payload build time:
 - orientation buckets: `portrait`, `square`, `landscape`
 - template families: mugs use smaller caps than shirts
+- shirt orientation presets: portrait=`0.72`, square=`0.70`, landscape=`0.66`
+- mug orientation presets (unchanged): portrait=`0.60`, square=`0.58`, landscape=`0.54`
 - the runtime scale is `min(template placement_scale, orientation preset)` so manual template overrides are preserved as an upper bound.
 
 ## Verifying a successful run

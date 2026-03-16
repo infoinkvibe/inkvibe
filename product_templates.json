@@ -57,7 +57,8 @@
         "placement_angle": 0,
         "artwork_fit_mode": "contain"
       }
-    ]
+    ],
+    "trim_artwork_bounds": false
   },
   {
     "key": "mug_11oz",

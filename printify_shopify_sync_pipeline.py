@@ -175,6 +175,7 @@ class ProductTemplate:
     markup_value: str = "0"
     rounding_mode: str = "none"
     compare_at_price: Optional[str] = None
+    trim_artwork_bounds: bool = False
     seo_keywords: List[str] = field(default_factory=list)
     audience: Optional[str] = None
     product_type_label: Optional[str] = None
@@ -233,6 +234,11 @@ class RunReportRow:
     publish_attempted: bool
     publish_verified: bool
     rendered_title: str
+    source_size: str = ""
+    trimmed_bounds_size: str = ""
+    exported_canvas_size: str = ""
+    placement_scale_used: str = ""
+    orientation_bucket: str = ""
     launch_plan_row: str = ""
     launch_plan_row_id: str = ""
     collection_handle: str = ""
@@ -266,6 +272,9 @@ class PreparedArtwork:
     export_path: pathlib.Path
     width_px: int
     height_px: int
+    source_size: Tuple[int, int] = (0, 0)
+    trimmed_size: Optional[Tuple[int, int]] = None
+    exported_canvas_size: Tuple[int, int] = (0, 0)
 
 
 @dataclass
@@ -283,6 +292,7 @@ class ArtworkResolution:
     action: str
     upscaled: bool
     original_size: Tuple[int, int]
+    trimmed_size: Optional[Tuple[int, int]]
     final_size: Tuple[int, int]
     resized_size: Tuple[int, int]
 
@@ -1122,7 +1132,7 @@ def compute_placement_transform_for_artwork(placement: PlacementRequirement, art
     if is_mug:
         scale_by_orientation = {"portrait": 0.60, "square": 0.58, "landscape": 0.54}
     elif is_shirt:
-        scale_by_orientation = {"portrait": 0.66, "square": 0.63, "landscape": 0.59}
+        scale_by_orientation = {"portrait": 0.72, "square": 0.70, "landscape": 0.66}
     else:
         scale_by_orientation = {"portrait": 0.68, "square": 0.64, "landscape": 0.60}
 
@@ -1594,6 +1604,20 @@ def _upscale_filter(method: str) -> int:
     return Image.NEAREST if method == "nearest" else Image.LANCZOS
 
 
+def _trim_artwork_bounds(image: Image.Image) -> Tuple[Image.Image, Optional[Tuple[int, int]]]:
+    alpha = image.getchannel("A")
+    bbox = alpha.getbbox()
+    alpha.close()
+    if bbox is None:
+        return image, None
+    left, top, right, bottom = bbox
+    if left == 0 and top == 0 and right == image.width and bottom == image.height:
+        return image, (image.width, image.height)
+    trimmed = image.crop(bbox)
+    image.close()
+    return trimmed, (trimmed.width, trimmed.height)
+
+
 def resolve_artwork_for_placement(
     artwork: Artwork,
     placement: PlacementRequirement,
@@ -1601,10 +1625,14 @@ def resolve_artwork_for_placement(
     allow_upscale: bool,
     upscale_method: str,
     skip_undersized: bool,
+    trim_artwork_bounds: bool = False,
 ) -> ArtworkResolution:
     with Image.open(artwork.src_path) as opened:
         image = ImageOps.exif_transpose(opened).convert("RGBA")
     original_size = (image.width, image.height)
+    trimmed_size: Optional[Tuple[int, int]] = None
+    if trim_artwork_bounds:
+        image, trimmed_size = _trim_artwork_bounds(image)
     required_size = (placement.width_px, placement.height_px)
     fit_mode = str(placement.artwork_fit_mode or "contain").strip().lower()
     if fit_mode not in {"contain", "cover"}:
@@ -1617,12 +1645,13 @@ def resolve_artwork_for_placement(
     too_small = fit_mode == "cover" and (image.width < placement.width_px or image.height < placement.height_px)
 
     logger.info(
-        "Artwork %s placement=%s fit_mode=%s original=%sx%s required=%sx%s",
+        "Artwork %s placement=%s fit_mode=%s original=%sx%s trimmed=%s required=%sx%s",
         artwork.src_path.name,
         placement.placement_name,
         fit_mode,
         original_size[0],
         original_size[1],
+        f"{trimmed_size[0]}x{trimmed_size[1]}" if trimmed_size else "n/a",
         required_size[0],
         required_size[1],
     )
@@ -1644,6 +1673,7 @@ def resolve_artwork_for_placement(
                 action="skip",
                 upscaled=False,
                 original_size=original_size,
+                trimmed_size=trimmed_size,
                 final_size=original_size,
                 resized_size=original_size,
             )
@@ -1686,12 +1716,13 @@ def resolve_artwork_for_placement(
         action = "contained_padded_upscale" if upscaled else "contained_padded"
 
     logger.info(
-        "Artwork resolution action=%s placement=%s fit_mode=%s original=%sx%s resized=%sx%s final_canvas=%sx%s upscaled=%s",
+        "Artwork resolution action=%s placement=%s fit_mode=%s original=%sx%s trimmed=%s resized=%sx%s final_canvas=%sx%s upscaled=%s",
         action,
         placement.placement_name,
         fit_mode,
         original_size[0],
         original_size[1],
+        f"{trimmed_size[0]}x{trimmed_size[1]}" if trimmed_size else "n/a",
         resized.width,
         resized.height,
         final.width,
@@ -1705,6 +1736,7 @@ def resolve_artwork_for_placement(
         action=action,
         upscaled=upscaled,
         original_size=original_size,
+        trimmed_size=trimmed_size,
         final_size=(final.width, final.height),
         resized_size=(resized_size[0], resized_size[1]),
     )
@@ -1743,6 +1775,7 @@ def prepare_artwork_export(
         allow_upscale=options.allow_upscale or placement.allow_upscale,
         upscale_method=options.upscale_method,
         skip_undersized=options.skip_undersized,
+        trim_artwork_bounds=template.trim_artwork_bounds,
     )
     if resolution.action == "skip":
         return None
@@ -1764,6 +1797,9 @@ def prepare_artwork_export(
         export_path=export_path,
         width_px=placement.width_px,
         height_px=placement.height_px,
+        source_size=resolution.original_size,
+        trimmed_size=resolution.trimmed_size,
+        exported_canvas_size=resolution.final_size,
     )
 
 
@@ -1787,6 +1823,8 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
             raise TemplateValidationError(f"Template[{index}] placement[{pidx}] artwork_fit_mode must be contain|cover")
         if "placement_scale" in placement and float(placement["placement_scale"]) <= 0:
             raise TemplateValidationError(f"Template[{index}] placement[{pidx}] placement_scale must be > 0")
+    if "trim_artwork_bounds" in row and not isinstance(row.get("trim_artwork_bounds"), bool):
+        raise TemplateValidationError(f"Template[{index}] trim_artwork_bounds must be a boolean when provided")
     if row.get("markup_type", "fixed") not in {"fixed", "percent"}:
         raise TemplateValidationError(f"Template[{index}] markup_type must be fixed|percent")
     if row.get("rounding_mode", "none") not in {"none", "whole_dollar", "x_99"}:
@@ -1840,6 +1878,7 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
                 markup_value=str(row.get("markup_value", "0")),
                 rounding_mode=str(row.get("rounding_mode", "none")),
                 compare_at_price=str(row["compare_at_price"]) if "compare_at_price" in row and row.get("compare_at_price") is not None else None,
+                trim_artwork_bounds=bool(row.get("trim_artwork_bounds", False)),
                 seo_keywords=[str(v) for v in row.get("seo_keywords", [])],
                 audience=str(row.get("audience", "")).strip() or None,
                 product_type_label=str(row.get("product_type_label", "")).strip() or None,
@@ -2519,6 +2558,11 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
             summary.templates_processed += 1
 
         upload_map: Dict[str, Dict[str, Any]] = {}
+        source_size_report = ""
+        trimmed_bounds_report = ""
+        exported_canvas_report = ""
+        placement_scale_report = ""
+        orientation_report = _orientation_bucket(artwork.image_width, artwork.image_height)
         try:
             if action == "skip":
                 result = {"printify": {"status": "skipped", "action": "skip", "printify_product_id": existing_product_id}}
@@ -2571,7 +2615,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 result = {"status": "no_matching_variants"}
                 record["products"].append({"template": template.key, "state_key": state_key, "title_source": title_info.title_source, "rendered_title": rendered_title, "result": result})
                 if run_rows is not None:
-                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", template.printify_blueprint_id, template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
+                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", template.printify_blueprint_id, template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, "", "", "", "", orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
@@ -2583,6 +2627,15 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     skipped_placements.append(placement.placement_name)
                     continue
                 prepared_assets.append(prepared)
+
+            if prepared_assets:
+                first_prepared = prepared_assets[0]
+                source_size_report = f"{first_prepared.source_size[0]}x{first_prepared.source_size[1]}"
+                if first_prepared.trimmed_size:
+                    trimmed_bounds_report = f"{first_prepared.trimmed_size[0]}x{first_prepared.trimmed_size[1]}"
+                exported_canvas_report = f"{first_prepared.exported_canvas_size[0]}x{first_prepared.exported_canvas_size[1]}"
+                placement_transform = compute_placement_transform_for_artwork(first_prepared.placement, artwork, template.key)
+                placement_scale_report = f"{placement_transform.scale:.3f}"
 
             if skipped_placements:
                 all_templates_successful = False
@@ -2603,7 +2656,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     "result": result,
                 })
                 if run_rows is not None:
-                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", template.printify_blueprint_id, template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
+                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", template.printify_blueprint_id, template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, source_size_report, trimmed_bounds_report, exported_canvas_report, placement_scale_report, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
@@ -2670,6 +2723,11 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     publish_attempted=bool(row.get("publish_attempted")),
                     publish_verified=bool(row.get("publish_verified")),
                     rendered_title=rendered_title,
+                    source_size=source_size_report,
+                    trimmed_bounds_size=trimmed_bounds_report,
+                    exported_canvas_size=exported_canvas_report,
+                    placement_scale_used=placement_scale_report,
+                    orientation_bucket=orientation_report,
                     launch_plan_row=launch_plan_row,
                     launch_plan_row_id=launch_plan_row_id,
                     collection_handle=collection_handle,
@@ -2742,7 +2800,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     launch_plan_row_id=launch_plan_row_id,
                 ))
             if run_rows is not None:
-                run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "failure", action, template.printify_blueprint_id, template.printify_print_provider_id, summarize_upload_strategy(upload_map), "", False, False, rendered_title, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
+                run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "failure", action, template.printify_blueprint_id, template.printify_print_provider_id, summarize_upload_strategy(upload_map), "", False, False, rendered_title, source_size_report, trimmed_bounds_report, exported_canvas_report, placement_scale_report, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
             log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": error_result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action=action, upload_map=upload_map)
         save_json_atomic(state_path, state)
         logger.info("State persisted after template processing state_path=%s", state_path)
