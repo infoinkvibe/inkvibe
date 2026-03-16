@@ -1602,6 +1602,41 @@ def test_mug_sample_template_points_to_real_pair_and_safe_cap():
     assert mug.max_enabled_variants is not None and mug.max_enabled_variants <= 24
 
 
+
+
+def test_shirt_template_enables_allow_upscale_while_mug_stays_conservative():
+    templates = load_templates(Path("product_templates.json"))
+    shirt = next(t for t in templates if t.key == "tshirt_gildan")
+    mug = next(t for t in templates if t.key == "mug_11oz")
+
+    assert shirt.placements[0].artwork_fit_mode == "contain"
+    assert shirt.placements[0].allow_upscale is True
+    assert mug.placements[0].artwork_fit_mode == "contain"
+    assert mug.placements[0].allow_upscale is False
+
+
+def test_shirt_contain_export_upscales_but_mug_contain_export_does_not(tmp_path: Path):
+    path = tmp_path / "small-art.png"
+    Image.new("RGBA", (1000, 500), (255, 0, 0, 255)).save(path)
+    artwork = Artwork("small-art", path, "Small Art", "", [], 1000, 500)
+    options = ArtworkProcessingOptions()
+
+    templates = load_templates(Path("product_templates.json"))
+    shirt = next(t for t in templates if t.key == "tshirt_gildan")
+    mug = next(t for t in templates if t.key == "mug_11oz")
+
+    prepared_shirt = prepare_artwork_export(artwork, shirt, shirt.placements[0], tmp_path / "exports", options)
+    prepared_mug = prepare_artwork_export(artwork, mug, mug.placements[0], tmp_path / "exports", options)
+
+    assert prepared_shirt is not None and prepared_shirt.upscaled is True
+    assert prepared_shirt.effective_upscale_factor > 1.0
+    assert prepared_shirt.exported_canvas_size == (4500, 5400)
+
+    assert prepared_mug is not None and prepared_mug.upscaled is False
+    assert prepared_mug.effective_upscale_factor == 1.0
+    assert prepared_mug.exported_canvas_size == (2700, 1120)
+
+
 def _launch_template() -> ProductTemplate:
     return ProductTemplate(
         key="tshirt_gildan",
