@@ -1,13 +1,35 @@
 # secrets
 .env
-state.json
+.env.*
 
 # python
 __pycache__/
 *.pyc
+.pytest_cache/
 
-# exports
+# state / runtime artifacts
+state.json
+state.json.*
+*.state.json
+
+# reports and generated launch plans
 exports/
+reports/
+run_report*.csv
+failure_report*.csv
+launch_plan*.csv
+*_launch_plan.csv
+
+# scratch / backups / temp
+scratch/
+tmp/
+artifacts/
+*.tmp
+*.bak
+*.corrupt
+
+# archives
+*.zip
 
 # OS
 .DS_Store

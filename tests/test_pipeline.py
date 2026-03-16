@@ -1945,3 +1945,123 @@ def test_template_validation_rejects_invalid_artwork_fit_mode(tmp_path: Path):
     )
     with pytest.raises(TemplateValidationError, match=r"artwork_fit_mode must be contain\|cover"):
         load_templates(config)
+
+def test_filename_slug_to_title_handles_ugly_flat_tokens():
+    assert filename_slug_to_title("flat,750x,075,f-pad,750x1000,f8f8f8") == "Untitled Design"
+
+
+def test_resolve_launch_plan_rows_parses_collection_metadata(tmp_path: Path):
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    Image.new("RGBA", (100, 100), (255, 0, 0, 255)).save(image_dir / "ok.png")
+    csv_path = tmp_path / "launch.csv"
+    csv_path.write_text(
+        "artwork_file,template_key,enabled,row_id,collection_handle,collection_title,collection_description,launch_name,campaign,merch_theme\n"
+        "ok.png,tshirt_gildan,true,row-ok,animals,Animals,Animal art,spring-launch,spring,playful\n",
+        encoding="utf-8",
+    )
+    rows, failures = resolve_launch_plan_rows(
+        launch_plan_path=csv_path,
+        templates=[_launch_template()],
+        image_dir=image_dir,
+    )
+    assert not failures
+    assert rows[0].collection_handle == "animals"
+    assert rows[0].campaign == "spring"
+
+
+def test_prepare_artwork_export_preview_smoke(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1200, 1200)
+    template = ProductTemplate(
+        key="tshirt_gildan",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[PlacementRequirement("front", 1000, 1000)],
+    )
+    placement = template.placements[0]
+    prepared = prepare_artwork_export(
+        art,
+        template,
+        placement,
+        tmp_path / "exports",
+        ArtworkProcessingOptions(placement_preview=True, preview_dir=tmp_path / "exports" / "previews"),
+    )
+    assert prepared is not None
+    previews = list((tmp_path / "exports" / "previews").glob("*.png"))
+    assert previews
+
+
+def test_process_artwork_success_run_row_includes_launch_plan_metadata(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    class DummyPrintify:
+        dry_run = False
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [{"id": 1, "is_available": True, "options": {}, "price": 1200}]
+
+    monkeypatch.setattr(pipeline, "choose_variants_from_catalog", lambda variants, template: variants)
+    monkeypatch.setattr(
+        pipeline,
+        "prepare_artwork_export",
+        lambda artwork, template, placement, export_dir, options: PreparedArtwork(
+            artwork=artwork,
+            template=template,
+            placement=placement,
+            export_path=tmp_path / "x.png",
+            width_px=placement.width_px,
+            height_px=placement.height_px,
+        ),
+    )
+    monkeypatch.setattr(pipeline, "upload_assets_to_printify", lambda *a, **k: {"front": {"id": "up-1"}})
+    monkeypatch.setattr(
+        pipeline,
+        "upsert_in_printify",
+        lambda **kwargs: {
+            "status": "ok",
+            "action": "create",
+            "printify_product_id": "p1",
+            "publish_attempted": True,
+            "publish_verified": True,
+            "verification": {"ok": True, "verified_title": "X", "verified_variant_count": 1},
+        },
+    )
+
+    art = _create_artwork(tmp_path, 1200, 1200)
+    tpl = ProductTemplate(
+        key="tshirt_gildan",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[PlacementRequirement("front", 1000, 1000)],
+    )
+    state = ensure_state_shape({})
+    run_rows = []
+
+    pipeline.process_artwork(
+        printify=DummyPrintify(),
+        shopify=None,
+        shop_id=1,
+        artwork=art,
+        templates=[tpl],
+        state=state,
+        force=False,
+        export_dir=tmp_path / "exports",
+        state_path=tmp_path / "state.json",
+        artwork_options=ArtworkProcessingOptions(),
+        upload_strategy="auto",
+        r2_config=None,
+        run_rows=run_rows,
+        launch_plan_row="2",
+        launch_plan_row_id="row-2",
+        collection_handle="animals",
+        campaign="spring",
+    )
+
+    assert run_rows[0].launch_plan_row == "2"
+    assert run_rows[0].launch_plan_row_id == "row-2"
+    assert run_rows[0].collection_handle == "animals"
+    assert run_rows[0].campaign == "spring"

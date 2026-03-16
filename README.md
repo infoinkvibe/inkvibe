@@ -538,3 +538,29 @@ python printify_ui_automation.py \
 ```
 
 > Live mode requires Playwright (`pip install playwright` and browser install) and an authenticated Printify session context.
+
+## Known-good baseline commands
+
+- `python printify_shopify_sync_pipeline.py --dry-run --template-key tshirt_gildan`
+- `python printify_shopify_sync_pipeline.py --dry-run --template-key mug_11oz`
+- `python printify_shopify_sync_pipeline.py --publish --verify-publish`
+- `python printify_shopify_sync_pipeline.py --rebuild-product --resume`
+- `python printify_shopify_sync_pipeline.py --export-launch-plan-from-images ./exports/launch_plan.csv`
+
+## Reporting and launch-plan metadata
+
+Run report rows now include launch-plan row context (`launch_plan_row`, `launch_plan_row_id`) for successful rows and can also carry optional collection metadata columns (`collection_handle`, `collection_title`, `collection_description`, `launch_name`, `campaign`, `merch_theme`) when provided in launch-plan CSV mode.
+
+## Compact state behavior and migration
+
+State handling is centralized in `state_store.py`. Legacy `state.json` rows still load through migration helpers, and status semantics for resume are preserved (`dry-run-only` remains resumable, `real-completed` remains non-resumable).
+
+See migration note: `docs/state-migration-note.md`.
+
+## When to use --skip-audit
+
+Use `--skip-audit` when iterating quickly in local dry-run/testing loops where Printify catalog/shop reachability is already known and you want faster startup. Keep audits enabled for production launches.
+
+## Placement QA preview mode
+
+Use `--placement-preview` to emit local preview composites to `exports/previews/` before upload. This mode is read-only and optional.
