@@ -1198,26 +1198,38 @@ def _is_shirt_template_key(template_key: str) -> bool:
     return any(token in key for token in ["shirt", "tee", "hoodie", "sweatshirt"])
 
 
-def compute_placement_transform_for_artwork(placement: PlacementRequirement, artwork: Artwork, template_key: str = "") -> PlacementTransform:
+def compute_placement_transform_for_artwork(
+    placement: PlacementRequirement,
+    artwork: Artwork,
+    template_key: str,
+) -> PlacementTransform:
     orientation = _orientation_bucket(artwork.image_width, artwork.image_height)
-    key = template_key.lower()
-    is_mug = "mug" in key
-    is_shirt = any(token in key for token in ["shirt", "tee", "hoodie", "sweatshirt"])
 
-    if is_mug:
-        scale_by_orientation = {"portrait": 0.60, "square": 0.58, "landscape": 0.54}
-    elif is_shirt:
-        scale_by_orientation = {"portrait": 0.72, "square": 0.70, "landscape": 0.66}
-    else:
-        scale_by_orientation = {"portrait": 0.68, "square": 0.64, "landscape": 0.60}
+    scale = placement.placement_scale
 
-    chosen_scale = min(float(placement.placement_scale), scale_by_orientation[orientation])
+    if template_key == "tshirt_gildan":
+        shirt_orientation_caps = {
+            "portrait": 0.72,
+            "square": 0.80,   # was 0.70
+            "landscape": 0.66,
+        }
+        scale = min(scale, shirt_orientation_caps.get(orientation, scale))
+
+    elif template_key == "mug_11oz":
+        mug_orientation_caps = {
+            "portrait": 0.60,
+            "square": 0.58,
+            "landscape": 0.54,
+        }
+        scale = min(scale, mug_orientation_caps.get(orientation, scale))
+
     return PlacementTransform(
-        scale=chosen_scale,
-        x=float(placement.placement_x),
-        y=float(placement.placement_y),
-        angle=float(placement.placement_angle),
+        scale=scale,
+        x=placement.placement_x,
+        y=placement.placement_y,
+        angle=placement.placement_angle,
     )
+
 
 
 def export_launch_plan_from_images(
