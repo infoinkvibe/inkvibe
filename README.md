@@ -76,13 +76,13 @@ python printify_shopify_sync_pipeline.py \
 python printify_shopify_sync_pipeline.py --templates ./product_templates.json --list-templates
 
 # Process one artwork with selected templates
-python printify_shopify_sync_pipeline.py --max-artworks 1 --template-key tshirt_gildan --template-key mug_11oz
+python printify_shopify_sync_pipeline.py --max-artworks 1 --template-key hoodie_gildan --template-key mug_new
 
 # Keep only first selected template after filtering
-python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --template-key mug_11oz --limit-templates 1
+python printify_shopify_sync_pipeline.py --template-key hoodie_gildan --template-key mug_new --limit-templates 1
 
 # Regenerate a valid mug snippet (blueprint 68 + auto-selected provider)
-python printify_shopify_sync_pipeline.py --generate-template-snippet --blueprint-id 68 --auto-provider --key mug_11oz --template-output-file ./mug_template.json
+python printify_shopify_sync_pipeline.py --generate-template-snippet --blueprint-id 68 --auto-provider --key mug_new --template-output-file ./mug_template.json
 ```
 
 ## Catalog exploration workflows
@@ -100,7 +100,7 @@ python printify_shopify_sync_pipeline.py --list-providers --blueprint-id 6 --lim
 python printify_shopify_sync_pipeline.py --inspect-variants --blueprint-id 6 --provider-id 99
 
 # Recommend best provider for a blueprint (optionally use template key constraints)
-python printify_shopify_sync_pipeline.py --recommend-provider --blueprint-id 6 --template-file ./product_templates.json --key tshirt_gildan
+python printify_shopify_sync_pipeline.py --recommend-provider --blueprint-id 6 --template-file ./product_templates.json --key hoodie_gildan
 
 # Generate starter snippet JSON for product_templates.json
 python printify_shopify_sync_pipeline.py --generate-template-snippet --blueprint-id 6 --provider-id 99 --key tshirt_new
@@ -135,19 +135,19 @@ By default, InkVibeAuto checks `state.json` for each `artwork_slug:template_key`
 
 ```bash
 # Default behavior: update existing products when state has ids
-python printify_shopify_sync_pipeline.py --template-key tshirt_gildan
+python printify_shopify_sync_pipeline.py --template-key hoodie_gildan
 
 # Create-only mode: skip rows that already have a product id
-python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --create-only
+python printify_shopify_sync_pipeline.py --template-key hoodie_gildan --create-only
 
 # Update-only mode: skip rows with no existing product id in state
-python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --update-only
+python printify_shopify_sync_pipeline.py --template-key hoodie_gildan --update-only
 
 # Rebuild mode: create fresh product and replace active state references on next run
-python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --rebuild-product
+python printify_shopify_sync_pipeline.py --template-key hoodie_gildan --rebuild-product
 
 # Auto-rebuild mode: attempt update first, rebuild only on compatibility failures
-python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --auto-rebuild-on-incompatible-update
+python printify_shopify_sync_pipeline.py --template-key hoodie_gildan --auto-rebuild-on-incompatible-update
 ```
 
 Per-template logs now include action (`create/update/rebuild/skip`), product id, provider id, and blueprint id. Run summary now includes created/updated/rebuilt/skipped totals.
@@ -256,7 +256,7 @@ Template-level optional preprocessing:
 
 Recommendation:
 - Shirts and mugs should usually use `artwork_fit_mode: contain` unless you intentionally want a full-bleed/cropped look.
-- Current defaults are intentionally split: `tshirt_gildan` front placement enables `allow_upscale: true` with a conservative `max_upscale_factor` cap, while `mug_11oz` keeps `allow_upscale: false` (conservative/no interpolation by default).
+- Current defaults are intentionally split: `hoodie_gildan` front placement enables `allow_upscale: true` with a conservative `max_upscale_factor` cap, while `mug_new` keeps `allow_upscale: false` (conservative/no interpolation by default).
 
 Example commands:
 
@@ -284,7 +284,7 @@ python printify_shopify_sync_pipeline.py --export-launch-plan-template ./launch_
 python printify_shopify_sync_pipeline.py --export-launch-plan-from-images ./launch_plan.csv
 
 #    You can combine with template filtering and defaults
-python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --template-key mug_11oz \
+python printify_shopify_sync_pipeline.py --template-key hoodie_gildan --template-key mug_new \
   --export-launch-plan-from-images ./launch_plan.csv \
   --launch-plan-default-enabled true \
   --include-disabled-template-rows
@@ -305,8 +305,8 @@ Example rows:
 
 ```csv
 artwork_file,template_key,enabled,title_override,tags_override,row_id
-tee-artwork.png,tshirt_gildan,true,{artwork_title} T-Shirt,"shirt,graphic,launch",tee-001
-mug-artwork.png,mug_11oz,true,,"mug,coffee,launch",mug-001
+tee-artwork.png,hoodie_gildan,true,{artwork_title} T-Shirt,"shirt,graphic,launch",tee-001
+mug-artwork.png,mug_new,true,,"mug,coffee,launch",mug-001
 ```
 
 ## Placement transform tuning (mockup sizing)
@@ -318,8 +318,8 @@ Each placement supports optional transform fields:
 
 Defaults remain centered (`x=0.5`, `y=0.5`) and unrotated (`angle=0`).
 `placement_scale` template caps remain:
-- `tshirt_gildan` front: `0.9`
-- `mug_11oz` front: `0.78`
+- `hoodie_gildan` front: `0.9`
+- `mug_new` front: `0.78`
 
 Use dry-run logs to inspect the exact transform values applied per template/placement.
 
@@ -426,17 +426,17 @@ Examples:
 
 ```bash
 # Create/update without publish
-python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --skip-publish
+python printify_shopify_sync_pipeline.py --template-key hoodie_gildan --skip-publish
 
 # Create/update and force publish
-python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --publish
+python printify_shopify_sync_pipeline.py --template-key hoodie_gildan --publish
 
 # Create/update + publish + verification readback
-python printify_shopify_sync_pipeline.py --template-key tshirt_gildan --publish --verify-publish
+python printify_shopify_sync_pipeline.py --template-key hoodie_gildan --publish --verify-publish
 
 # Inspect state entries
 python printify_shopify_sync_pipeline.py --list-state-keys
-python printify_shopify_sync_pipeline.py --inspect-state-key cool-cat:tshirt_gildan
+python printify_shopify_sync_pipeline.py --inspect-state-key cool-cat:hoodie_gildan
 
 # Batch-size examples
 python printify_shopify_sync_pipeline.py --batch-size 10 --resume
@@ -498,13 +498,13 @@ Example sidecar files:
 Preview listing copy without creating/updating products:
 
 ```bash
-python printify_shopify_sync_pipeline.py --preview-listing-copy --template-key tshirt_gildan --max-artworks 5
+python printify_shopify_sync_pipeline.py --preview-listing-copy --template-key hoodie_gildan --max-artworks 5
 ```
 
 Run metadata-backed artwork in dry-run mode:
 
 ```bash
-python printify_shopify_sync_pipeline.py --dry-run --force --template-key mug_11oz --max-artworks 3
+python printify_shopify_sync_pipeline.py --dry-run --force --template-key mug_new --max-artworks 3
 ```
 
 ## Phase 8: Printify UI automation helper
@@ -553,8 +553,8 @@ python printify_ui_automation.py \
 
 ## Known-good baseline commands
 
-- `python printify_shopify_sync_pipeline.py --dry-run --template-key tshirt_gildan`
-- `python printify_shopify_sync_pipeline.py --dry-run --template-key mug_11oz`
+- `python printify_shopify_sync_pipeline.py --dry-run --template-key hoodie_gildan`
+- `python printify_shopify_sync_pipeline.py --dry-run --template-key mug_new`
 - `python printify_shopify_sync_pipeline.py --publish --verify-publish`
 - `python printify_shopify_sync_pipeline.py --rebuild-product --resume`
 - `python printify_shopify_sync_pipeline.py --export-launch-plan-from-images ./exports/launch_plan.csv`
