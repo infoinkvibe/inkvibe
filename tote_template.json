@@ -1,0 +1,46 @@
+[
+  {
+    "key": "tote_basic",
+    "printify_blueprint_id": 467,
+    "printify_print_provider_id": 30,
+    "title_pattern": "{artwork_title}",
+    "description_pattern": "<p>{artwork_title}</p>",
+    "enabled_colors": [
+      "Natural",
+      "Snowwhite"
+    ],
+    "enabled_sizes": [
+      "One size"
+    ],
+    "placements": [
+      {
+        "placement_name": "back",
+        "width_px": 4500,
+        "height_px": 5400,
+        "file_type": "png",
+        "allow_upscale": false
+      },
+      {
+        "placement_name": "front",
+        "width_px": 4500,
+        "height_px": 5400,
+        "file_type": "png",
+        "allow_upscale": false
+      }
+    ],
+    "base_price": "24.99",
+    "markup_type": "fixed",
+    "markup_value": "5.00",
+    "rounding_mode": "x_99",
+    "seo_keywords": [
+      "replace-me-keyword-1",
+      "replace-me-keyword-2"
+    ],
+    "audience": "",
+    "product_type_label": "",
+    "style_keywords": [
+      "minimal",
+      "giftable"
+    ]
+  }
+]

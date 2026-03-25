@@ -1,0 +1,66 @@
+{
+  "key": "sweatshirt_gildan",
+  "printify_blueprint_id": 49,
+  "printify_print_provider_id": 99,
+  "title_pattern": "{artwork_title} {product_type_label}",
+  "description_pattern": "<p>{artwork_title} on a cozy {product_type_label}.</p><p>Best for casual streetwear fans. Style notes: minimal, giftable.</p>",
+  "enabled_colors": [
+    "Black",
+    "Dark Heather",
+    "Navy",
+    "Sport Grey",
+    "White"
+  ],
+  "enabled_sizes": [
+    "S",
+    "M",
+    "L",
+    "XL",
+    "2XL",
+    "3XL"
+  ],
+  "max_enabled_variants": 30,
+  "tags": [
+    "sweatshirt",
+    "graphic",
+    "streetwear"
+  ],
+  "seo_keywords": [
+    "graphic sweatshirt",
+    "gift idea",
+    "casual streetwear"
+  ],
+  "audience": "casual streetwear fans",
+  "product_type_label": "Sweatshirt",
+  "style_keywords": [
+    "minimal",
+    "giftable"
+  ],
+  "publish_to_shopify": false,
+  "push_via_printify": true,
+  "publish_after_create": true,
+  "publish_title": true,
+  "publish_description": true,
+  "publish_images": true,
+  "publish_variants": true,
+  "publish_tags": true,
+  "base_price": "24.99",
+  "markup_type": "fixed",
+  "markup_value": "5.00",
+  "rounding_mode": "x_99",
+  "placements": [
+    {
+      "placement_name": "front",
+      "width_px": 4500,
+      "height_px": 5400,
+      "file_type": "png",
+      "allow_upscale": true,
+      "placement_scale": 0.72,
+      "placement_x": 0.5,
+      "placement_y": 0.5,
+      "placement_angle": 0,
+      "artwork_fit_mode": "contain",
+      "max_upscale_factor": 6.0
+    }
+  ]
+}

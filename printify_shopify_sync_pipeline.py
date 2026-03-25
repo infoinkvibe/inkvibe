@@ -740,6 +740,19 @@ def generate_mug_template_snippet(
             "markup_type": "percent",
             "markup_value": "35",
             "rounding_mode": "whole_dollar",
+            "placements": [
+                {
+                    "placement_name": "front",
+                    "width_px": 2700,
+                    "height_px": 1120,
+                    "allow_upscale": False,
+                    "placement_scale": 0.78,
+                    "placement_x": 0.5,
+                    "placement_y": 0.5,
+                    "placement_angle": 0,
+                    "artwork_fit_mode": "contain",
+                }
+            ],
             "seo_keywords": ["coffee mug", "desk accessory", "gift for coworkers"],
             "audience": "coffee drinkers and office gifting",
             "product_type_label": "11oz Mug",
@@ -1215,7 +1228,7 @@ def compute_placement_transform_for_artwork(
         }
         scale = min(scale, shirt_orientation_caps.get(orientation, scale))
 
-    elif template_key == "mug_11oz":
+    elif "mug" in str(template_key).lower() or "cup" in str(template_key).lower():
         mug_orientation_caps = {
             "portrait": 0.60,
             "square": 0.58,
@@ -2273,8 +2286,10 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
 
 def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
     raw = load_json(config_path, [])
-    if not isinstance(raw, list):
-        raise TemplateValidationError("product_templates.json must contain a top-level JSON array")
+    if isinstance(raw, dict):
+        raw = [raw]
+    elif not isinstance(raw, list):
+        raise TemplateValidationError("product_templates.json must contain a top-level JSON array or object")
 
     keys: set[str] = set()
     templates: List[ProductTemplate] = []
@@ -3573,7 +3588,7 @@ def run_catalog_cli(
             key = snippet_key or f"blueprint_{blueprint_id}_provider_{selected_provider_id}"
             snippet_factory = generate_mug_template_snippet if "mug" in key.lower() else generate_template_snippet
             snippet = snippet_factory(key=key, blueprint_id=blueprint_id, provider_id=selected_provider_id, variants=variants)
-            rendered = json.dumps(snippet, indent=2)
+            rendered = json.dumps([snippet], indent=2)
             if template_output_file:
                 pathlib.Path(template_output_file).write_text(rendered + "\n", encoding="utf-8")
             else:
@@ -3625,6 +3640,13 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             print(f"{template.key}	blueprint={template.printify_blueprint_id}	provider={template.printify_print_provider_id}")
         return
     templates = select_templates(templates, template_keys=template_keys, limit_templates=limit_templates)
+    if template_keys and not templates:
+        available_template_keys = ", ".join(template.key for template in load_templates(config_path)) or "(none)"
+        requested_template_keys = ", ".join(key.strip() for key in template_keys if key.strip()) or "(none)"
+        raise RuntimeError(
+            f"No templates matched the requested --template-key values: {requested_template_keys}. "
+            f"Available template keys: {available_template_keys}"
+        )
     if export_launch_plan_from_images_path:
         exported_count = export_launch_plan_from_images(
             path=pathlib.Path(export_launch_plan_from_images_path),
