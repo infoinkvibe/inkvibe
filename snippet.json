@@ -1,0 +1,49 @@
+[
+  {
+    "key": "mug_new",
+    "printify_blueprint_id": 68,
+    "printify_print_provider_id": 1,
+    "title_pattern": "{artwork_title} {product_type_label}",
+    "description_pattern": "<p>{artwork_title} on a durable {product_type_label}.</p><p>Made for {audience}. Keywords: {seo_keywords}</p>",
+    "enabled_colors": [],
+    "enabled_sizes": [
+      "11oz"
+    ],
+    "placements": [
+      {
+        "placement_name": "front",
+        "width_px": 2700,
+        "height_px": 1120,
+        "allow_upscale": false,
+        "placement_scale": 0.78,
+        "placement_x": 0.5,
+        "placement_y": 0.5,
+        "placement_angle": 0,
+        "artwork_fit_mode": "contain"
+      }
+    ],
+    "base_price": "12.00",
+    "markup_type": "percent",
+    "markup_value": "35",
+    "rounding_mode": "whole_dollar",
+    "seo_keywords": [
+      "coffee mug",
+      "desk accessory",
+      "gift for coworkers"
+    ],
+    "audience": "coffee drinkers and office gifting",
+    "product_type_label": "11oz Mug",
+    "style_keywords": [
+      "clean",
+      "playful"
+    ],
+    "enabled_variant_option_filters": {
+      "color": [],
+      "size": [
+        "11oz"
+      ]
+    },
+    "max_enabled_variants": 1,
+    "shopify_product_type": "Drinkware"
+  }
+]
