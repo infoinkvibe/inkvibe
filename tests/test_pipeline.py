@@ -1766,6 +1766,34 @@ def test_mug_sample_template_points_to_real_pair_and_safe_cap():
     assert mug.max_enabled_variants is not None and mug.max_enabled_variants <= 24
 
 
+def test_tote_sample_template_uses_valid_live_resolved_mapping():
+    templates = load_templates(Path("product_templates.json"))
+    tote = next(t for t in templates if t.key == "tote_basic")
+    assert tote.printify_blueprint_id == 609
+    assert tote.printify_print_provider_id == 74
+
+
+def test_tote_template_file_stays_in_sync_with_product_templates():
+    product_templates = load_templates(Path("product_templates.json"))
+    tote_templates = load_templates(Path("tote_template.json"))
+    tote_primary = next(t for t in product_templates if t.key == "tote_basic")
+    tote_standalone = next(t for t in tote_templates if t.key == "tote_basic")
+    assert tote_primary.printify_blueprint_id == tote_standalone.printify_blueprint_id == 609
+    assert tote_primary.printify_print_provider_id == tote_standalone.printify_print_provider_id == 74
+
+
+def test_non_poster_family_mappings_remain_unchanged():
+    templates = load_templates(Path("product_templates.json"))
+    by_key = {template.key: template for template in templates}
+    assert by_key["hoodie_gildan"].printify_blueprint_id == 77
+    assert by_key["hoodie_gildan"].printify_print_provider_id == 99
+    assert by_key["sweatshirt_gildan"].printify_blueprint_id == 49
+    assert by_key["sweatshirt_gildan"].printify_print_provider_id == 99
+    assert by_key["longsleeve_gildan"].printify_blueprint_id == 80
+    assert by_key["longsleeve_gildan"].printify_print_provider_id == 30
+    assert by_key["mug_new"].printify_blueprint_id == 68
+    assert by_key["mug_new"].printify_print_provider_id == 1
+
 
 
 def test_shirt_template_enables_allow_upscale_while_mug_stays_conservative():
@@ -2053,7 +2081,7 @@ def test_compute_placement_transform_for_poster_uses_tuned_scale():
     assert compute_placement_transform_for_artwork(placement, portrait, "poster_basic").scale == 1.0
 
 
-def test_resolve_artwork_for_placement_applies_poster_cover_override(tmp_path: Path):
+def test_resolve_artwork_for_placement_uses_cover_for_eligible_poster_resolution(tmp_path: Path):
     path = tmp_path / "poster-art.png"
     image = Image.new("RGBA", (1800, 1200), (0, 0, 0, 0))
     image.paste((255, 0, 0, 255), (600, 400, 1200, 800))
@@ -2070,6 +2098,25 @@ def test_resolve_artwork_for_placement_applies_poster_cover_override(tmp_path: P
         skip_undersized=False,
     )
     assert result.action == "covered_cropped"
+
+
+def test_resolve_artwork_for_placement_falls_back_to_contain_for_undersized_poster(tmp_path: Path):
+    path = tmp_path / "poster-small.png"
+    Image.new("RGBA", (500, 700), (255, 0, 0, 255)).save(path)
+    artwork = Artwork("poster-small", path, "Poster Small", "", [], 500, 700)
+    placement = PlacementRequirement("front", 1000, 1000, artwork_fit_mode="contain")
+
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        template_key="poster_basic",
+        allow_upscale=False,
+        upscale_method="lanczos",
+        skip_undersized=False,
+    )
+
+    assert result.action == "contained_padded"
+    assert result.upscaled is False
 
 
 def test_resolve_tote_template_catalog_mapping_fails_for_missing_blueprint():

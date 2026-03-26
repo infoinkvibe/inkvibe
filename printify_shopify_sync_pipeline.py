@@ -2127,15 +2127,49 @@ def resolve_artwork_for_placement(
             placement.placement_name,
         )
         fit_mode = "contain"
-    poster_override_applied = False
-    if template_key == "poster_basic" and fit_mode == "contain":
-        fit_mode = "cover"
-        poster_override_applied = True
+    poster_strategy_path = ""
+    poster_cover_eligible = False
+    if template_key == "poster_basic":
+        poster_cover_eligible = image.width >= placement.width_px and image.height >= placement.height_px
         logger.info(
-            "Poster mockup strategy template=%s placement=%s strategy=cover_override reason=poster_thumbnail_optimization",
-            template_key,
+            "Poster strategy candidate=cover eligible=%s reason=%s placement=%s source=%sx%s required=%sx%s",
+            poster_cover_eligible,
+            "sufficient_resolution" if poster_cover_eligible else "insufficient_resolution",
             placement.placement_name,
+            image.width,
+            image.height,
+            placement.width_px,
+            placement.height_px,
         )
+        if poster_cover_eligible:
+            fit_mode = "cover"
+            poster_strategy_path = "cover"
+            logger.info(
+                "Poster strategy selected template=%s placement=%s strategy=cover reason=eligible_resolution",
+                template_key,
+                placement.placement_name,
+            )
+        else:
+            fit_mode = "contain"
+            poster_strategy_path = "contain_fallback"
+            logger.warning(
+                "Poster strategy fallback=contain reason=insufficient_resolution placement=%s source=%sx%s required=%sx%s",
+                placement.placement_name,
+                image.width,
+                image.height,
+                placement.width_px,
+                placement.height_px,
+            )
+            if allow_upscale:
+                logger.info(
+                    "Poster upscale status=allowed placement=%s note=contain_path_uses_safe_upscale_rules",
+                    placement.placement_name,
+                )
+            else:
+                logger.info(
+                    "Poster upscale status=not_allowed placement=%s reason=template_or_runtime_setting",
+                    placement.placement_name,
+                )
 
     too_small = fit_mode == "cover" and (image.width < placement.width_px or image.height < placement.height_px)
 
@@ -2150,13 +2184,6 @@ def resolve_artwork_for_placement(
         required_size[0],
         required_size[1],
     )
-    if poster_override_applied:
-        logger.info(
-            "Poster transform override applied template=%s placement=%s final_fit_mode=%s",
-            template_key,
-            placement.placement_name,
-            fit_mode,
-        )
     if trim_bounds_pct:
         logger.info(
             "Trim debug artwork=%s placement=%s original_bounds_pct=100x100 trimmed_bounds_pct=%.2fx%.2f",
@@ -2282,6 +2309,42 @@ def resolve_artwork_for_placement(
         upscale_capped,
         applied_upscale_factor,
     )
+    if template_key == "poster_basic":
+        logger.info(
+            "Poster transform final scale=%.3f x=%s y=%s placement=%s",
+            placement.placement_scale,
+            placement.placement_x,
+            placement.placement_y,
+            placement.placement_name,
+        )
+        logger.info(
+            "Poster final resolution path chosen strategy=%s fit_mode=%s action=%s upscaled=%s upscale_capped=%s",
+            poster_strategy_path or fit_mode,
+            fit_mode,
+            action,
+            upscaled,
+            upscale_capped,
+        )
+        if upscaled:
+            logger.info(
+                "Poster upscale applied placement=%s requested_upscale_factor=%.3f applied_upscale_factor=%.3f",
+                placement.placement_name,
+                requested_upscale_factor,
+                applied_upscale_factor,
+            )
+        elif upscale_capped:
+            logger.info(
+                "Poster upscale capped placement=%s requested_upscale_factor=%.3f applied_upscale_factor=%.3f",
+                placement.placement_name,
+                requested_upscale_factor,
+                applied_upscale_factor,
+            )
+        else:
+            logger.info(
+                "Poster upscale not applied placement=%s requested_upscale_factor=%.3f",
+                placement.placement_name,
+                requested_upscale_factor,
+            )
     resized.close()
 
     return ArtworkResolution(
