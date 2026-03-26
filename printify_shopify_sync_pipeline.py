@@ -1375,6 +1375,20 @@ def compute_placement_transform_for_artwork(
             "landscape": 0.54,
         }
         scale = min(scale, mug_orientation_caps.get(orientation, scale))
+    elif template_key == "poster_basic":
+        poster_orientation_caps = {
+            "portrait": 1.0,
+            "square": 1.0,
+            "landscape": 0.97,
+        }
+        scale = min(scale, poster_orientation_caps.get(orientation, scale))
+        logger.info(
+            "Poster transform strategy template=%s placement=%s orientation=%s strategy=tuned_scale scale=%.3f",
+            template_key,
+            placement.placement_name,
+            orientation,
+            scale,
+        )
 
     return PlacementTransform(
         scale=scale,
@@ -2049,6 +2063,7 @@ def resolve_artwork_for_placement(
     artwork: Artwork,
     placement: PlacementRequirement,
     *,
+    template_key: str = "",
     allow_upscale: bool,
     upscale_method: str,
     skip_undersized: bool,
@@ -2112,6 +2127,16 @@ def resolve_artwork_for_placement(
             placement.placement_name,
         )
         fit_mode = "contain"
+    poster_override_applied = False
+    if template_key == "poster_basic" and fit_mode == "contain":
+        fit_mode = "cover"
+        poster_override_applied = True
+        logger.info(
+            "Poster mockup strategy template=%s placement=%s strategy=cover_override reason=poster_thumbnail_optimization",
+            template_key,
+            placement.placement_name,
+        )
+
     too_small = fit_mode == "cover" and (image.width < placement.width_px or image.height < placement.height_px)
 
     logger.info(
@@ -2125,6 +2150,13 @@ def resolve_artwork_for_placement(
         required_size[0],
         required_size[1],
     )
+    if poster_override_applied:
+        logger.info(
+            "Poster transform override applied template=%s placement=%s final_fit_mode=%s",
+            template_key,
+            placement.placement_name,
+            fit_mode,
+        )
     if trim_bounds_pct:
         logger.info(
             "Trim debug artwork=%s placement=%s original_bounds_pct=100x100 trimmed_bounds_pct=%.2fx%.2f",
@@ -2312,6 +2344,7 @@ def prepare_artwork_export(
     resolution = resolve_artwork_for_placement(
         artwork,
         placement,
+        template_key=template.key,
         allow_upscale=options.allow_upscale or placement.allow_upscale,
         upscale_method=options.upscale_method,
         skip_undersized=options.skip_undersized,
@@ -2609,6 +2642,123 @@ def normalize_catalog_variants_response(raw_variants: Any) -> List[Dict[str, Any
 
     logger.debug("Printify variants found: %s", len(variants))
     return variants
+
+
+def _validate_template_catalog_mapping(
+    *,
+    printify: PrintifyClient,
+    template: ProductTemplate,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    blueprints = printify.list_blueprints()
+    if not any(int(blueprint.get("id", 0)) == template.printify_blueprint_id for blueprint in blueprints):
+        raise TemplateValidationError(
+            f"Template {template.key} catalog validation failed: missing blueprint blueprint_id={template.printify_blueprint_id}"
+        )
+
+    providers = printify.list_print_providers(template.printify_blueprint_id)
+    provider_ids = {int(provider.get("id", 0)) for provider in providers}
+    if template.printify_print_provider_id not in provider_ids:
+        valid = ", ".join(str(pid) for pid in sorted(pid for pid in provider_ids if pid > 0)) or "none"
+        raise TemplateValidationError(
+            f"Template {template.key} catalog validation failed: missing provider for blueprint blueprint_id={template.printify_blueprint_id} provider_id={template.printify_print_provider_id} valid_provider_ids=[{valid}]"
+        )
+
+    variants = printify.list_variants(template.printify_blueprint_id, template.printify_print_provider_id)
+    if not variants:
+        raise TemplateValidationError(
+            f"Template {template.key} catalog validation failed: no valid variants for blueprint_id={template.printify_blueprint_id} provider_id={template.printify_print_provider_id}"
+        )
+
+    wanted_placements = {placement.placement_name.strip().lower() for placement in template.placements if placement.placement_name}
+    available_placements = {
+        placement.strip().lower()
+        for placement in summarize_variant_options(variants).get("placements", [])
+        if isinstance(placement, str) and placement.strip()
+    }
+    if available_placements and wanted_placements and not wanted_placements.issubset(available_placements):
+        raise TemplateValidationError(
+            f"Template {template.key} catalog validation failed: placement mismatch expected={sorted(wanted_placements)} available={sorted(available_placements)} blueprint_id={template.printify_blueprint_id} provider_id={template.printify_print_provider_id}"
+        )
+
+    placement_note = "placement_data_unavailable" if not available_placements else ",".join(sorted(available_placements))
+    return variants, placement_note
+
+
+def resolve_tote_template_catalog_mapping(
+    *,
+    printify: PrintifyClient,
+    template: ProductTemplate,
+) -> Tuple[ProductTemplate, List[Dict[str, Any]]]:
+    logger.info(
+        "Tote catalog resolution start template=%s blueprint_id=%s provider_id=%s",
+        template.key,
+        template.printify_blueprint_id,
+        template.printify_print_provider_id,
+    )
+    try:
+        variants, placement_note = _validate_template_catalog_mapping(printify=printify, template=template)
+        logger.info(
+            "Tote validation result template=%s status=ok blueprint_id=%s provider_id=%s placements=%s",
+            template.key,
+            template.printify_blueprint_id,
+            template.printify_print_provider_id,
+            placement_note,
+        )
+        return template, variants
+    except TemplateValidationError as exc:
+        root_reason = str(exc)
+        logger.warning("Tote validation result template=%s status=failed reason=%s", template.key, exc)
+
+    blueprints = search_blueprints(printify.list_blueprints(), "tote bag")
+    if not blueprints:
+        blueprints = search_blueprints(printify.list_blueprints(), "tote")
+
+    best_template: Optional[ProductTemplate] = None
+    best_variants: List[Dict[str, Any]] = []
+    best_score = -1
+    for blueprint in blueprints[:40]:
+        blueprint_id = int(blueprint.get("id") or 0)
+        if blueprint_id <= 0:
+            continue
+        providers = printify.list_print_providers(blueprint_id)
+        for provider in providers:
+            provider_id = int(provider.get("id") or 0)
+            if provider_id <= 0:
+                continue
+            try:
+                variants = printify.list_variants(blueprint_id, provider_id)
+            except Exception:
+                continue
+            if not variants:
+                continue
+            candidate_template = replace(
+                template,
+                printify_blueprint_id=blueprint_id,
+                printify_print_provider_id=provider_id,
+            )
+            score = score_provider_for_template(provider, variants, candidate_template)
+            if score.get("matching_variant_count", 0) <= 0:
+                continue
+            if score["score"] > best_score:
+                best_score = score["score"]
+                best_template = candidate_template
+                best_variants = variants
+
+    if best_template is None:
+        raise TemplateValidationError(
+            f"{root_reason}; tote fallback discovery failed: no valid variants"
+        )
+
+    logger.info(
+        "Tote catalog resolution fallback selected template=%s old_blueprint_id=%s old_provider_id=%s new_blueprint_id=%s new_provider_id=%s score=%s",
+        template.key,
+        template.printify_blueprint_id,
+        template.printify_print_provider_id,
+        best_template.printify_blueprint_id,
+        best_template.printify_print_provider_id,
+        best_score,
+    )
+    return best_template, best_variants
 
 
 def build_printify_product_payload(artwork: Artwork, template: ProductTemplate, variant_rows: List[Dict[str, Any]], upload_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -3180,6 +3330,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
         aggressive_trim_used_report = False
         orientation_report = _orientation_bucket(artwork.image_width, artwork.image_height)
         try:
+            resolved_template = template
             if action == "skip":
                 result = {"printify": {"status": "skipped", "action": "skip", "printify_product_id": existing_product_id}}
                 if summary is not None:
@@ -3222,8 +3373,14 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=True, result=result, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
-            catalog_variants = printify.list_variants(template.printify_blueprint_id, template.printify_print_provider_id)
-            variant_rows = choose_variants_from_catalog(catalog_variants, template)
+            if template.key == "tote_basic":
+                resolved_template, catalog_variants = resolve_tote_template_catalog_mapping(
+                    printify=printify,
+                    template=template,
+                )
+            else:
+                catalog_variants = printify.list_variants(template.printify_blueprint_id, template.printify_print_provider_id)
+            variant_rows = choose_variants_from_catalog(catalog_variants, resolved_template)
             if not variant_rows:
                 all_templates_successful = False
                 if summary is not None:
@@ -3231,14 +3388,14 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 result = {"status": "no_matching_variants"}
                 record["products"].append({"template": template.key, "state_key": state_key, "title_source": title_info.title_source, "rendered_title": rendered_title, "result": result})
                 if run_rows is not None:
-                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", template.printify_blueprint_id, template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, "", "", "", "", "", "", "", "", False, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
-                log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
+                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, "", "", "", "", "", "", "", "", False, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
+                log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
             prepared_assets: List[PreparedArtwork] = []
             skipped_placements: List[str] = []
-            for placement in template.placements:
-                prepared = prepare_artwork_export(artwork, template, placement, export_dir, artwork_options)
+            for placement in resolved_template.placements:
+                prepared = prepare_artwork_export(artwork, resolved_template, placement, export_dir, artwork_options)
                 if prepared is None:
                     skipped_placements.append(placement.placement_name)
                     continue
@@ -3287,18 +3444,18 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     "result": result,
                 })
                 if run_rows is not None:
-                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", template.printify_blueprint_id, template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, source_size_report, trimmed_bounds_report, "", exported_canvas_report, placement_scale_report, effective_upscale_factor_report, requested_upscale_factor_report, applied_upscale_factor_report, upscale_capped_report, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
-                log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
+                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, source_size_report, trimmed_bounds_report, "", exported_canvas_report, placement_scale_report, effective_upscale_factor_report, requested_upscale_factor_report, applied_upscale_factor_report, upscale_capped_report, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
+                log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
-            upload_map = upload_assets_to_printify(printify, state, artwork, template, prepared_assets, state_path, upload_strategy, r2_config)
+            upload_map = upload_assets_to_printify(printify, state, artwork, resolved_template, prepared_assets, state_path, upload_strategy, r2_config)
 
             result: Dict[str, Any] = {}
             result["printify"] = upsert_in_printify(
                 printify=printify,
                 shop_id=shop_id,
                 artwork=artwork,
-                template=template,
+                template=resolved_template,
                 variant_rows=variant_rows,
                 upload_map=upload_map,
                 existing_product_id=existing_product_id,
@@ -3306,7 +3463,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 publish_mode=publish_mode,
                 verify_publish=verify_publish,
                 auto_rebuild_on_incompatible_update=auto_rebuild_on_incompatible_update,
-            ) if (template.push_via_printify and shop_id is not None) else {"status": "prepared_only", "action": action, "publish_attempted": False, "publish_verified": False}
+            ) if (resolved_template.push_via_printify and shop_id is not None) else {"status": "prepared_only", "action": action, "publish_attempted": False, "publish_verified": False}
             if template.publish_to_shopify and shopify is not None:
                 result["shopify"] = create_in_shopify_only(shopify, artwork, template, variant_rows)
 
@@ -3316,8 +3473,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
             row = {
                 "template": template.key,
                 "state_key": state_key,
-                "blueprint_id": template.printify_blueprint_id,
-                "print_provider_id": template.printify_print_provider_id,
+                "blueprint_id": resolved_template.printify_blueprint_id,
+                "print_provider_id": resolved_template.printify_print_provider_id,
                 "last_action": printify_result.get("action", action),
                 "publish_attempted": bool(printify_result.get("publish_attempted", False)),
                 "publish_verified": bool(printify_result.get("publish_verified", False)),
@@ -3347,8 +3504,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     template_key=template.key,
                     status="success",
                     action=str(printify_result.get("action", action)),
-                    blueprint_id=template.printify_blueprint_id,
-                    provider_id=template.printify_print_provider_id,
+                    blueprint_id=resolved_template.printify_blueprint_id,
+                    provider_id=resolved_template.printify_print_provider_id,
                     upload_strategy=summarize_upload_strategy(upload_map),
                     product_id=str(printify_result.get("printify_product_id") or ""),
                     publish_attempted=bool(row.get("publish_attempted")),
@@ -3393,7 +3550,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     summary.publish_verified += 1
                 if verification_warnings:
                     summary.verification_warnings += 1
-            log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=True, result=result, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action=(result.get("printify", {}) or {}).get("action", action), upload_map=upload_map)
+            log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=True, result=result, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action=(result.get("printify", {}) or {}).get("action", action), upload_map=upload_map)
         except Exception as exc:
             all_templates_successful = False
             if summary is not None:
@@ -3430,8 +3587,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     artwork_slug=artwork.slug,
                     template_key=template.key,
                     action_attempted=action,
-                    blueprint_id=template.printify_blueprint_id,
-                    provider_id=template.printify_print_provider_id,
+                    blueprint_id=resolved_template.printify_blueprint_id,
+                    provider_id=resolved_template.printify_print_provider_id,
                     upload_strategy=summarize_upload_strategy(upload_map),
                     error_type=type(exc).__name__,
                     error_message=str(exc),
@@ -3440,8 +3597,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     launch_plan_row_id=launch_plan_row_id,
                 ))
             if run_rows is not None:
-                run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "failure", action, template.printify_blueprint_id, template.printify_print_provider_id, summarize_upload_strategy(upload_map), "", False, False, rendered_title, source_size_report, trimmed_bounds_report, "", exported_canvas_report, placement_scale_report, effective_upscale_factor_report, requested_upscale_factor_report, applied_upscale_factor_report, upscale_capped_report, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
-            log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": error_result}, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action=action, upload_map=upload_map)
+                run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "failure", action, resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id, summarize_upload_strategy(upload_map), "", False, False, rendered_title, source_size_report, trimmed_bounds_report, "", exported_canvas_report, placement_scale_report, effective_upscale_factor_report, requested_upscale_factor_report, applied_upscale_factor_report, upscale_capped_report, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
+            log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": error_result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action=action, upload_map=upload_map)
         save_json_atomic(state_path, state)
         logger.info("State persisted after template processing state_path=%s", state_path)
         time.sleep(0.25)

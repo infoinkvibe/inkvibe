@@ -1,8 +1,8 @@
 [
   {
     "key": "tote_basic",
-    "printify_blueprint_id": 467,
-    "printify_print_provider_id": 30,
+    "printify_blueprint_id": 26,
+    "printify_print_provider_id": 1,
     "title_pattern": "{artwork_title}",
     "description_pattern": "<p>{artwork_title}</p>",
     "enabled_colors": [
