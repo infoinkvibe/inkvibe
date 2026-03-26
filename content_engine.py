@@ -105,3 +105,85 @@ def build_listing_context(template: Any, artwork: Any, *, overrides: Dict[str, s
     if overrides:
         context.update({k: v for k, v in overrides.items() if isinstance(v, str) and v.strip()})
     return context
+
+
+_FAMILY_CONFIG: Dict[str, Dict[str, Any]] = {
+    "hoodie": {
+        "suffix": "Hoodie",
+        "tags": ["hoodie", "gift idea", "graphic apparel", "wearable art"],
+        "description_closing": "Made to feel expressive, easy to wear, and full of personality.",
+    },
+    "sweatshirt": {
+        "suffix": "Sweatshirt",
+        "tags": ["sweatshirt", "gift idea", "graphic apparel", "wearable art"],
+        "description_closing": "Built for cozy style with a modern statement look.",
+    },
+    "long_sleeve": {
+        "suffix": "Long Sleeve T-Shirt",
+        "tags": ["long sleeve shirt", "gift idea", "graphic apparel", "wearable art"],
+        "description_closing": "A clean layer made for everyday style and standout detail.",
+    },
+    "tote": {
+        "suffix": "Tote Bag",
+        "tags": ["tote bag", "gift idea", "everyday carry"],
+        "description_closing": "Great for daily essentials with a bold, art-forward vibe.",
+    },
+    "poster": {
+        "suffix": "Poster",
+        "tags": ["poster", "gift idea", "wall art"],
+        "description_closing": "A simple way to add personality to your wall and space.",
+    },
+    "mug": {
+        "suffix": "Mug",
+        "tags": ["mug", "gift idea", "drinkware"],
+        "description_closing": "Designed to bring character to your coffee, tea, or desk setup.",
+    },
+    "default": {
+        "suffix": "Product",
+        "tags": ["gift idea", "statement art"],
+        "description_closing": "Made for expressive everyday style.",
+    },
+}
+
+
+def infer_product_family(template: Any) -> str:
+    hint = " ".join(
+        [
+            str(getattr(template, "key", "") or ""),
+            str(getattr(template, "product_type_label", "") or ""),
+            str(getattr(template, "shopify_product_type", "") or ""),
+        ]
+    ).lower()
+    if "longsleeve" in hint or "long sleeve" in hint:
+        return "long_sleeve"
+    if "hoodie" in hint:
+        return "hoodie"
+    if "sweatshirt" in hint or "crewneck" in hint:
+        return "sweatshirt"
+    if "tote" in hint:
+        return "tote"
+    if "poster" in hint:
+        return "poster"
+    if "mug" in hint or "drinkware" in hint:
+        return "mug"
+    return "default"
+
+
+def family_title_suffix(template: Any) -> str:
+    family = infer_product_family(template)
+    return str(_FAMILY_CONFIG.get(family, _FAMILY_CONFIG["default"])["suffix"])
+
+
+def family_tags(template: Any) -> List[str]:
+    family = infer_product_family(template)
+    return list(_FAMILY_CONFIG.get(family, _FAMILY_CONFIG["default"])["tags"])
+
+
+def build_branded_description(*, artwork_title: str, short_description: str, template: Any) -> str:
+    family = infer_product_family(template)
+    closing = str(_FAMILY_CONFIG.get(family, _FAMILY_CONFIG["default"])["description_closing"]).strip()
+    lead = short_description.strip() if short_description.strip() else f"{artwork_title} brings a fresh visual mood with signature InkVibe character."
+    return (
+        f"<p><strong>{artwork_title}</strong> by InkVibe. {lead}</p>"
+        f"<p>{closing}</p>"
+    )

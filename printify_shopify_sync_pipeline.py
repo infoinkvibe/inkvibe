@@ -43,6 +43,7 @@ IMAGE_DIR = pathlib.Path(os.getenv("IMAGE_DIR", "./images"))
 EXPORT_DIR = pathlib.Path(os.getenv("EXPORT_DIR", "./exports"))
 STATE_PATH = pathlib.Path(os.getenv("STATE_PATH", "./state.json"))
 TEMPLATES_CONFIG = pathlib.Path(os.getenv("TEMPLATES_CONFIG", "./product_templates.json"))
+ARTWORK_METADATA_MAP_PATH = pathlib.Path(os.getenv("ARTWORK_METADATA_MAP_PATH", "./artwork_metadata_map.json"))
 
 DEFAULT_TAGS = ["print-on-demand", "printify"]
 DEFAULT_VENDOR = "Printify"
@@ -500,6 +501,53 @@ def load_artwork_metadata(sidecar_path: pathlib.Path) -> Dict[str, Any]:
     return fields
 
 
+def load_artwork_metadata_map(mapping_path: pathlib.Path) -> Dict[str, Dict[str, Any]]:
+    if not mapping_path.exists() or not mapping_path.is_file():
+        return {}
+    try:
+        payload = json.loads(mapping_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Unable to parse artwork metadata map %s: %s", mapping_path, exc)
+        return {}
+    if not isinstance(payload, dict):
+        logger.warning("Ignoring non-object artwork metadata map %s", mapping_path)
+        return {}
+
+    resolved: Dict[str, Dict[str, Any]] = {}
+    for key, raw_entry in payload.items():
+        if not isinstance(raw_entry, dict):
+            continue
+        normalized_key = slugify(str(key))
+        title = str(raw_entry.get("title") or raw_entry.get("art_title") or "").strip()
+        description = str(raw_entry.get("description") or raw_entry.get("short_description") or "").strip()
+        tags = _split_keywords(raw_entry.get("tags"))
+        subject = str(raw_entry.get("subject") or "").strip()
+        mood = str(raw_entry.get("mood") or "").strip()
+        entry = {
+            "title": title,
+            "description": description,
+            "tags": tags,
+            "subject": subject,
+            "mood": mood,
+            "theme": str(raw_entry.get("theme") or mood or "").strip(),
+        }
+        resolved[normalized_key] = entry
+    return resolved
+
+
+def resolve_artwork_metadata_for_path(path: pathlib.Path, metadata_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    sidecar_path = path.with_suffix(".json")
+    if sidecar_path.exists() and sidecar_path.is_file():
+        return load_artwork_metadata(sidecar_path)
+
+    slug_key = slugify(path.stem)
+    for candidate in (slug_key, path.stem):
+        entry = metadata_map.get(slugify(candidate))
+        if entry:
+            return dict(entry)
+    return {}
+
+
 def filename_title_quality_reason(value: str) -> str:
     lowered = value.strip().lower()
     if not lowered:
@@ -866,7 +914,13 @@ def render_product_title(template: ProductTemplate, artwork: Artwork) -> str:
         context = dict(context)
         context["product_type_label"] = ""
     rendered = template.title_pattern.format(**context).strip()
-    return _dedupe_rendered_title(rendered)
+    deduped = _dedupe_rendered_title(rendered)
+    if deduped.lower() == context.get("artwork_title", "").strip().lower():
+        family = content_engine.infer_product_family(template)
+        suffix = content_engine.family_title_suffix(template) if family != "default" else ""
+        if suffix and not title_semantically_includes_product_label(deduped, suffix):
+            deduped = f"{deduped} {suffix}".strip()
+    return _dedupe_rendered_title(deduped)
 
 
 def _render_listing_tags(template: ProductTemplate, artwork: Artwork) -> List[str]:
@@ -877,6 +931,8 @@ def _render_listing_tags(template: ProductTemplate, artwork: Artwork) -> List[st
         *template.tags,
         *_split_keywords(metadata.get("tags")),
         *_split_keywords(metadata.get("seo_keywords")),
+        *content_engine.family_tags(template),
+        "inkvibe",
     ]
     tags: List[str] = []
     seen: set[str] = set()
@@ -898,19 +954,20 @@ def _render_listing_tags(template: ProductTemplate, artwork: Artwork) -> List[st
 
 def render_product_description(template: ProductTemplate, artwork: Artwork) -> str:
     context = build_seo_context(template, artwork)
-    generated = build_generic_description_html(context["artwork_title"])
+    generated = content_engine.build_branded_description(
+        artwork_title=context["artwork_title"],
+        short_description=str((artwork.metadata or {}).get("description", "")).strip(),
+        template=template,
+    )
     pattern = (template.description_pattern or "").strip()
     metadata = artwork.metadata or {}
     metadata_description = str(metadata.get("description", "")).strip()
-    if metadata_description:
-        generated = f"<p><strong>{context['artwork_title']}</strong></p><p>{metadata_description}</p>"
 
     if not pattern or pattern in {"{artwork_title}", "<p>{artwork_title}</p>"}:
+        if metadata_description:
+            return generated.strip()
         audience_line = f"<p>Designed for {context['audience']} who love {context['style_keywords']}.</p>" if context["audience"] and context["style_keywords"] else ""
-        theme_line = f"<p>Theme: {context['theme']}.</p>" if context["theme"] else ""
-        occasion_line = f"<p>Perfect for {context['occasion']}.</p>" if context["occasion"] else ""
-        collection_line = f"<p>Part of the {context['collection']} collection.</p>" if context["collection"] else ""
-        return f"{generated}{audience_line}{theme_line}{occasion_line}{collection_line}".strip()
+        return f"{generated}{audience_line}".strip()
 
     return template.description_pattern.format(
         **context,
@@ -1664,6 +1721,7 @@ def create_in_shopify_only(
 def discover_artworks(image_dir: pathlib.Path) -> List[Artwork]:
     supported = {".png", ".jpg", ".jpeg", ".webp"}
     artworks: List[Artwork] = []
+    metadata_map = load_artwork_metadata_map(ARTWORK_METADATA_MAP_PATH)
 
     for path in sorted(image_dir.glob("**/*")):
         if path.suffix.lower() not in supported or not path.is_file():
@@ -1672,7 +1730,7 @@ def discover_artworks(image_dir: pathlib.Path) -> List[Artwork]:
         with Image.open(path) as im:
             width, height = im.size
 
-        metadata = load_artwork_metadata(path.with_suffix(".json"))
+        metadata = resolve_artwork_metadata_for_path(path, metadata_map)
         title = str(metadata.get("title", "")).strip() or filename_slug_to_title(path.stem)
         artworks.append(
             Artwork(
