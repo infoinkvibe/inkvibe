@@ -74,6 +74,7 @@ from printify_shopify_sync_pipeline import (
     generate_mug_template_snippet,
     parse_launch_plan_csv,
     compute_placement_transform_for_artwork,
+    resolve_tote_template_catalog_mapping,
     export_launch_plan_from_images,
     resolve_launch_plan_rows,
     build_resolved_template,
@@ -2042,6 +2043,104 @@ def test_compute_placement_transform_for_shirt_uses_updated_orientation_caps():
     assert compute_placement_transform_for_artwork(placement, portrait, "tshirt_gildan").scale == 0.72
     assert compute_placement_transform_for_artwork(placement, square, "tshirt_gildan").scale == 0.80
     assert compute_placement_transform_for_artwork(placement, landscape, "tshirt_gildan").scale == 0.66
+
+
+def test_compute_placement_transform_for_poster_uses_tuned_scale():
+    placement = PlacementRequirement("front", 4500, 5400, placement_scale=1.0)
+    landscape = Artwork("l", Path("l.png"), "L", "", [], 2200, 1200)
+    portrait = Artwork("p", Path("p.png"), "P", "", [], 1200, 2200)
+    assert compute_placement_transform_for_artwork(placement, landscape, "poster_basic").scale == 0.97
+    assert compute_placement_transform_for_artwork(placement, portrait, "poster_basic").scale == 1.0
+
+
+def test_resolve_artwork_for_placement_applies_poster_cover_override(tmp_path: Path):
+    path = tmp_path / "poster-art.png"
+    image = Image.new("RGBA", (1800, 1200), (0, 0, 0, 0))
+    image.paste((255, 0, 0, 255), (600, 400, 1200, 800))
+    image.save(path)
+    artwork = Artwork("poster-art", path, "Poster Art", "", [], 1800, 1200)
+    placement = PlacementRequirement("front", 1000, 1000, artwork_fit_mode="contain")
+
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        template_key="poster_basic",
+        allow_upscale=False,
+        upscale_method="lanczos",
+        skip_undersized=False,
+    )
+    assert result.action == "covered_cropped"
+
+
+def test_resolve_tote_template_catalog_mapping_fails_for_missing_blueprint():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [{"id": 100, "title": "Other Product"}]
+
+        def list_print_providers(self, blueprint_id):
+            return []
+
+        def list_variants(self, blueprint_id, provider_id):
+            return []
+
+    template = ProductTemplate(
+        key="tote_basic",
+        printify_blueprint_id=467,
+        printify_print_provider_id=30,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[
+            PlacementRequirement("front", 4500, 5400),
+            PlacementRequirement("back", 4500, 5400),
+        ],
+    )
+    with pytest.raises(TemplateValidationError, match="missing blueprint"):
+        resolve_tote_template_catalog_mapping(printify=DummyPrintify(), template=template)
+
+
+def test_resolve_tote_template_catalog_mapping_fallback_selects_valid_pair():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [
+                {"id": 100, "title": "Old Tote"},
+                {"id": 200, "title": "Canvas Tote Bag"},
+            ]
+
+        def list_print_providers(self, blueprint_id):
+            if blueprint_id == 100:
+                return [{"id": 9, "title": "Deprecated Provider"}]
+            if blueprint_id == 200:
+                return [{"id": 5, "title": "Stable Provider"}]
+            return []
+
+        def list_variants(self, blueprint_id, provider_id):
+            if blueprint_id == 200 and provider_id == 5:
+                return [
+                    {
+                        "id": 1,
+                        "is_available": True,
+                        "options": {"size": "One size", "color": "Natural"},
+                        "placeholders": [{"position": "front"}, {"position": "back"}],
+                    }
+                ]
+            return []
+
+    template = ProductTemplate(
+        key="tote_basic",
+        printify_blueprint_id=467,
+        printify_print_provider_id=30,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_sizes=["One size"],
+        placements=[
+            PlacementRequirement("front", 4500, 5400),
+            PlacementRequirement("back", 4500, 5400),
+        ],
+    )
+    resolved_template, variants = resolve_tote_template_catalog_mapping(printify=DummyPrintify(), template=template)
+    assert resolved_template.printify_blueprint_id == 200
+    assert resolved_template.printify_print_provider_id == 5
+    assert len(variants) == 1
 
 
 def test_optional_trim_artwork_bounds_reduces_transparent_margin_when_enabled(tmp_path: Path):
