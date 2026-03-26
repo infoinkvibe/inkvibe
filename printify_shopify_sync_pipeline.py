@@ -270,6 +270,46 @@ class RunReportRow:
 
 
 @dataclass
+class StorefrontQaRow:
+    artwork_filename: str
+    artwork_slug: str
+    template_key: str
+    title: str
+    title_source: str
+    title_quality: str
+    title_warnings: str
+    description_preview: str
+    description_warnings: str
+    tags_preview: str
+    tag_count: int
+    tag_warnings: str
+    blueprint_id: int
+    provider_id: int
+    enabled_variant_count: int
+    option_names: str
+    sale_price_min: str
+    sale_price_max: str
+    compare_at_min: str
+    compare_at_max: str
+    pricing_warnings: str
+    compare_at_valid: bool
+    publish_images: bool
+    publish_mockups: str
+    mockup_warnings: str
+    placement_preview_context: str
+    qa_status: str
+    qa_warning_count: int
+    qa_error_count: int
+    recommended_action: str
+    launch_plan_row: str = ""
+    launch_plan_row_id: str = ""
+    collection_handle: str = ""
+    collection_title: str = ""
+    campaign: str = ""
+    merch_theme: str = ""
+
+
+@dataclass
 class LaunchPlanRow:
     row_number: int
     row_id: str
@@ -3019,6 +3059,400 @@ def preview_listing_copy(*, artworks: List[Artwork], templates: List[ProductTemp
             )
 
 
+def _normalize_whitespace(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _description_excerpt(description_html: str, *, max_len: int = 220) -> str:
+    plain = re.sub(r"<[^>]+>", " ", str(description_html or ""))
+    plain = _normalize_whitespace(plain)
+    if len(plain) <= max_len:
+        return plain
+    return plain[: max_len - 1].rstrip() + "…"
+
+
+def _collect_placeholder_tokens(text: str) -> List[str]:
+    return sorted(set(re.findall(r"\{[^{}]+\}", str(text or ""))))
+
+
+def _warnings_to_text(warnings: List[str]) -> str:
+    return " | ".join(warnings)
+
+
+def _money_str(minor: Optional[int]) -> str:
+    if minor is None:
+        return ""
+    return f"{Decimal(minor) / Decimal('100'):.2f}"
+
+
+def validate_storefront_title(*, title: str, title_source: str, title_quality: str, artwork: Artwork, template: ProductTemplate) -> Tuple[List[str], List[str]]:
+    warnings: List[str] = []
+    errors: List[str] = []
+    normalized_title = _normalize_whitespace(title)
+    if not normalized_title:
+        errors.append("title_empty")
+        return warnings, errors
+    if _collect_placeholder_tokens(normalized_title):
+        errors.append("title_unresolved_placeholder")
+    lowered = normalized_title.lower()
+    if len(normalized_title) > 140:
+        warnings.append("title_too_long")
+    if re.search(r"[a-f0-9]{12,}", lowered):
+        warnings.append("title_hash_like")
+    if re.fullmatch(r"[a-z0-9\-_,. ]{18,}", normalized_title):
+        warnings.append("title_slug_like")
+    if "untitled design" in lowered:
+        warnings.append("title_bad_fallback")
+    if "signature product" in lowered and str((artwork.metadata or {}).get("title") or "").strip():
+        warnings.append("title_generic_with_metadata_available")
+    for token in ("t-shirt t-shirt", "hoodie hoodie", "poster poster", "mug mug", "tote bag tote bag"):
+        if token in lowered:
+            warnings.append("title_duplicate_product_wording")
+            break
+    if title_source in {"filename_slug", "fallback"} and title_quality in {"hash_like", "slug_like", "too_short"}:
+        warnings.append("title_low_quality_source")
+    if not title_semantically_includes_product_label(normalized_title, template.product_type_label or template.shopify_product_type or ""):
+        family = content_engine.infer_product_family(template)
+        if family in {"shirt", "sweatshirt", "mug", "poster", "tote"} and "default" not in family:
+            warnings.append("title_missing_product_signal")
+    return warnings, errors
+
+
+def validate_storefront_description(*, description_html: str, template: ProductTemplate, artwork: Artwork) -> Tuple[List[str], List[str]]:
+    warnings: List[str] = []
+    errors: List[str] = []
+    normalized = _normalize_whitespace(description_html)
+    if not normalized:
+        errors.append("description_empty")
+        return warnings, errors
+    if _collect_placeholder_tokens(normalized):
+        errors.append("description_unresolved_placeholder")
+    excerpt = _description_excerpt(description_html, max_len=500)
+    if len(excerpt) < 40:
+        warnings.append("description_suspiciously_short")
+    if normalized.count("<") != normalized.count(">"):
+        warnings.append("description_html_unbalanced")
+    metadata_description = str((artwork.metadata or {}).get("description") or "").strip()
+    default_pattern = (template.description_pattern or "").strip() in {"", "{artwork_title}", "<p>{artwork_title}</p>"}
+    if metadata_description and default_pattern and metadata_description.lower() not in normalized.lower():
+        warnings.append("description_metadata_not_apparent")
+    if metadata_description and "adds an easy style upgrade" in normalized.lower():
+        warnings.append("description_generic_fallback_with_metadata")
+    return warnings, errors
+
+
+def validate_storefront_tags(*, tags: List[str], template: ProductTemplate, artwork: Artwork) -> Tuple[List[str], List[str]]:
+    warnings: List[str] = []
+    errors: List[str] = []
+    if not tags:
+        errors.append("tags_empty")
+        return warnings, errors
+    deduped = {_normalize_whitespace(tag).lower() for tag in tags if _normalize_whitespace(tag)}
+    if len(deduped) != len(tags):
+        warnings.append("tags_contain_duplicates")
+    if any(len(tag) > 32 for tag in tags):
+        warnings.append("tag_too_long")
+    if len(tags) >= 20:
+        warnings.append("tag_count_high")
+    elif len(tags) >= 16:
+        warnings.append("tag_count_near_limit")
+    generic = {"print-on-demand", "printify", "gift", "style", "inkvibe", "apparel", "shirt", "clothing"}
+    non_generic = [tag for tag in deduped if tag not in generic]
+    if not non_generic:
+        warnings.append("tags_generic_only")
+    family_tags = set(content_engine.family_tags(template))
+    if family_tags and not family_tags.intersection(deduped):
+        warnings.append("tags_missing_family_signal")
+    artwork_terms = {token for token in re.findall(r"[a-z0-9]+", artwork.slug.lower()) if len(token) >= 4}
+    if artwork_terms and not any(any(term in tag for term in artwork_terms) for tag in deduped):
+        warnings.append("tags_missing_artwork_theme_signal")
+    return warnings, errors
+
+
+def validate_storefront_pricing(*, template: ProductTemplate, variant_rows: List[Dict[str, Any]]) -> Tuple[List[str], List[str], Dict[str, Optional[int]]]:
+    warnings: List[str] = []
+    errors: List[str] = []
+    sale_prices: List[int] = []
+    compare_prices: List[int] = []
+    markups: List[Decimal] = []
+    for variant in variant_rows:
+        try:
+            sale = compute_sale_price_minor(template, variant)
+        except Exception:
+            errors.append("pricing_invalid_sale_value")
+            continue
+        if sale <= 0:
+            errors.append("pricing_sale_non_positive")
+        sale_prices.append(sale)
+        try:
+            compare = compute_compare_at_price_minor(template, sale)
+        except Exception:
+            errors.append("pricing_invalid_compare_at_value")
+            compare = None
+        if compare is not None:
+            compare_prices.append(compare)
+            if compare <= sale:
+                errors.append("pricing_compare_at_not_greater")
+        base_source = template.base_price if template.base_price is not None else variant.get("price")
+        if base_source is not None:
+            try:
+                base_minor = normalize_printify_price(base_source)
+                if base_minor > 0:
+                    markups.append((Decimal(sale) / Decimal(base_minor)) - Decimal("1"))
+            except Exception:
+                pass
+    if not sale_prices:
+        errors.append("pricing_no_variant_prices")
+    if sale_prices and (max(sale_prices) - min(sale_prices)) > 5000:
+        warnings.append("pricing_variant_spread_high")
+    if markups and max(markups) > Decimal("4.0"):
+        warnings.append("pricing_extreme_markup_outlier")
+    if template.rounding_mode == "x_99" and any((price % 100) != 99 for price in sale_prices):
+        warnings.append("pricing_rounding_inconsistent")
+    if template.rounding_mode == "whole_dollar" and any((price % 100) != 0 for price in sale_prices):
+        warnings.append("pricing_rounding_inconsistent")
+    summary = {
+        "sale_min": min(sale_prices) if sale_prices else None,
+        "sale_max": max(sale_prices) if sale_prices else None,
+        "compare_min": min(compare_prices) if compare_prices else None,
+        "compare_max": max(compare_prices) if compare_prices else None,
+    }
+    return warnings, errors, summary
+
+
+def validate_storefront_options(*, template: ProductTemplate, variant_rows: List[Dict[str, Any]], product_options: List[Dict[str, Any]], variant_payloads: List[Dict[str, Any]]) -> Tuple[List[str], List[str], List[str]]:
+    warnings: List[str] = []
+    errors: List[str] = []
+    option_names = [str(opt.get("name") or "") for opt in product_options if isinstance(opt, dict)]
+    if not variant_rows:
+        errors.append("options_zero_enabled_variants")
+    colors_present = any(_variant_option_value(v, "color") for v in variant_rows)
+    sizes_present = any(_variant_option_value(v, "size") for v in variant_rows)
+    if colors_present and "Color" not in option_names:
+        errors.append("options_missing_color_name")
+    if sizes_present and "Size" not in option_names:
+        errors.append("options_missing_size_name")
+    if (colors_present or sizes_present) and "Title" in option_names:
+        warnings.append("options_default_title_with_real_dimensions")
+    seen_combos: set[Tuple[str, ...]] = set()
+    for payload in variant_payloads:
+        option_values = payload.get("optionValues") or []
+        combo = tuple(sorted(f"{item.get('optionName')}={item.get('name')}" for item in option_values if isinstance(item, dict)))
+        if not combo:
+            errors.append("options_missing_option_values")
+            continue
+        if combo in seen_combos:
+            errors.append("options_duplicate_combination")
+        seen_combos.add(combo)
+    return warnings, errors, option_names
+
+
+def validate_storefront_mockups(*, template: ProductTemplate, publish_payload: Dict[str, Any], placement_context: str) -> Tuple[List[str], List[str]]:
+    warnings: List[str] = []
+    errors: List[str] = []
+    if publish_payload.get("images") is False:
+        warnings.append("mockups_publish_images_disabled")
+    if template.publish_mockups is not None:
+        warnings.append("mockups_publish_mockups_override_set")
+    if not placement_context:
+        warnings.append("mockups_no_placement_context")
+    if not template.placements:
+        errors.append("mockups_template_has_no_placements")
+    warnings.append("mockups_channel_provider_dependent_selection")
+    return warnings, errors
+
+
+def build_storefront_qa_row(
+    *,
+    artwork: Artwork,
+    template: ProductTemplate,
+    variant_rows: List[Dict[str, Any]],
+    launch_plan_row: str = "",
+    launch_plan_row_id: str = "",
+    collection_handle: str = "",
+    collection_title: str = "",
+    campaign: str = "",
+    merch_theme: str = "",
+) -> StorefrontQaRow:
+    context = build_seo_context(template, artwork)
+    title = render_product_title(template, artwork)
+    description_html = render_product_description(template, artwork)
+    tags = _render_listing_tags(template, artwork)
+    product_options, variant_payloads = build_shopify_product_options(template, variant_rows)
+    publish_payload = build_printify_publish_payload(template)
+    placement_bits: List[str] = []
+    for placement in template.placements:
+        transform = compute_placement_transform_for_artwork(placement, artwork, template.key)
+        placement_bits.append(
+            f"{placement.placement_name}:mode={placement.artwork_fit_mode}:scale={transform.scale:.3f}:xy=({transform.x:.3f},{transform.y:.3f})"
+        )
+    placement_context = "; ".join(placement_bits)
+
+    title_warnings, title_errors = validate_storefront_title(
+        title=title,
+        title_source=str(context.get("title_source") or ""),
+        title_quality=str(context.get("title_quality") or ""),
+        artwork=artwork,
+        template=template,
+    )
+    description_warnings, description_errors = validate_storefront_description(
+        description_html=description_html,
+        template=template,
+        artwork=artwork,
+    )
+    tag_warnings, tag_errors = validate_storefront_tags(tags=tags, template=template, artwork=artwork)
+    pricing_warnings, pricing_errors, pricing_summary = validate_storefront_pricing(template=template, variant_rows=variant_rows)
+    option_warnings, option_errors, option_names = validate_storefront_options(
+        template=template,
+        variant_rows=variant_rows,
+        product_options=product_options,
+        variant_payloads=variant_payloads,
+    )
+    mockup_warnings, mockup_errors = validate_storefront_mockups(
+        template=template,
+        publish_payload=publish_payload,
+        placement_context=placement_context,
+    )
+
+    warning_messages = [*title_warnings, *description_warnings, *tag_warnings, *pricing_warnings, *option_warnings, *mockup_warnings]
+    error_messages = [*title_errors, *description_errors, *tag_errors, *pricing_errors, *option_errors, *mockup_errors]
+    qa_status = "fail" if error_messages else ("warn" if warning_messages else "pass")
+    compare_at_valid = (pricing_summary["compare_min"] is None) or (
+        (pricing_summary["sale_min"] is not None) and (pricing_summary["compare_min"] > pricing_summary["sale_min"])
+    )
+    recommended_action = "review" if error_messages else ("consider_tuning" if warning_messages else "none")
+
+    return StorefrontQaRow(
+        artwork_filename=artwork.src_path.name,
+        artwork_slug=artwork.slug,
+        template_key=template.key,
+        title=title,
+        title_source=str(context.get("title_source") or ""),
+        title_quality=str(context.get("title_quality") or ""),
+        title_warnings=_warnings_to_text(title_warnings),
+        description_preview=_description_excerpt(description_html),
+        description_warnings=_warnings_to_text(description_warnings),
+        tags_preview=", ".join(tags[:20]),
+        tag_count=len(tags),
+        tag_warnings=_warnings_to_text([*tag_warnings, *option_warnings]),
+        blueprint_id=template.printify_blueprint_id,
+        provider_id=template.printify_print_provider_id,
+        enabled_variant_count=len(variant_rows),
+        option_names=", ".join(option_names),
+        sale_price_min=_money_str(pricing_summary["sale_min"]),
+        sale_price_max=_money_str(pricing_summary["sale_max"]),
+        compare_at_min=_money_str(pricing_summary["compare_min"]),
+        compare_at_max=_money_str(pricing_summary["compare_max"]),
+        pricing_warnings=_warnings_to_text(pricing_warnings),
+        compare_at_valid=compare_at_valid,
+        publish_images=bool(publish_payload.get("images")),
+        publish_mockups="" if template.publish_mockups is None else str(bool(template.publish_mockups)).lower(),
+        mockup_warnings=_warnings_to_text(mockup_warnings),
+        placement_preview_context=placement_context,
+        qa_status=qa_status,
+        qa_warning_count=len(warning_messages),
+        qa_error_count=len(error_messages),
+        recommended_action=recommended_action,
+        launch_plan_row=launch_plan_row,
+        launch_plan_row_id=launch_plan_row_id,
+        collection_handle=collection_handle,
+        collection_title=collection_title,
+        campaign=campaign,
+        merch_theme=merch_theme,
+    )
+
+
+def _log_storefront_qa_summary(rows: List[StorefrontQaRow]) -> None:
+    status_counts = {
+        "pass": sum(1 for row in rows if row.qa_status == "pass"),
+        "warn": sum(1 for row in rows if row.qa_status == "warn"),
+        "fail": sum(1 for row in rows if row.qa_status == "fail"),
+    }
+    warning_counter: Dict[str, int] = {}
+    for row in rows:
+        combined = " | ".join(filter(None, [row.title_warnings, row.description_warnings, row.tag_warnings, row.pricing_warnings, row.mockup_warnings]))
+        for token in [part.strip() for part in combined.split("|") if part.strip()]:
+            warning_counter[token] = warning_counter.get(token, 0) + 1
+    top = sorted(warning_counter.items(), key=lambda item: item[1], reverse=True)[:5]
+    top_text = ", ".join(f"{name}:{count}" for name, count in top) if top else "none"
+    logger.info(
+        "Storefront QA summary rows_checked=%s passed=%s warnings=%s failed=%s top_warning_categories=%s",
+        len(rows),
+        status_counts["pass"],
+        status_counts["warn"],
+        status_counts["fail"],
+        top_text,
+    )
+
+
+def run_storefront_qa(
+    *,
+    printify: PrintifyClient,
+    artworks: List[Artwork],
+    templates: List[ProductTemplate],
+    launch_plan_rows: Optional[List[LaunchPlanRow]] = None,
+    launch_plan_image_dir: Optional[pathlib.Path] = None,
+    export_csv_path: str = "",
+    export_json_path: str = "",
+) -> List[StorefrontQaRow]:
+    qa_rows: List[StorefrontQaRow] = []
+    if launch_plan_rows:
+        if launch_plan_image_dir is None:
+            raise RuntimeError("launch_plan_image_dir is required when launch_plan_rows are provided")
+        template_by_key = {template.key: template for template in templates}
+        metadata_map = load_artwork_metadata_map(ARTWORK_METADATA_MAP_PATH)
+        for launch_row in launch_plan_rows:
+            artwork_path = _resolve_artwork_path_for_launch_plan(launch_row.artwork_file, launch_plan_image_dir)
+            with Image.open(artwork_path) as im:
+                width, height = im.size
+            metadata, _ = resolve_artwork_metadata_with_source(artwork_path, metadata_map, artwork_slug=slugify(artwork_path.stem))
+            artwork = Artwork(
+                slug=slugify(artwork_path.stem),
+                src_path=artwork_path,
+                title=filename_slug_to_title(artwork_path.stem),
+                description_html=f"<p>{filename_slug_to_title(artwork_path.stem)}</p>",
+                tags=DEFAULT_TAGS.copy(),
+                image_width=width,
+                image_height=height,
+                metadata=metadata,
+            )
+            template = build_resolved_template(template_by_key[launch_row.template_key], launch_row.overrides)
+            variant_rows = choose_variants_from_catalog(
+                printify.list_variants(template.printify_blueprint_id, template.printify_print_provider_id),
+                template,
+            )
+            qa_rows.append(
+                build_storefront_qa_row(
+                    artwork=artwork,
+                    template=template,
+                    variant_rows=variant_rows,
+                    launch_plan_row=str(launch_row.row_number),
+                    launch_plan_row_id=launch_row.row_id,
+                    collection_handle=launch_row.collection_handle,
+                    collection_title=launch_row.collection_title,
+                    campaign=launch_row.campaign,
+                    merch_theme=launch_row.merch_theme,
+                )
+            )
+    else:
+        for artwork in artworks:
+            for template in templates:
+                variant_rows = choose_variants_from_catalog(
+                    printify.list_variants(template.printify_blueprint_id, template.printify_print_provider_id),
+                    template,
+                )
+                qa_rows.append(build_storefront_qa_row(artwork=artwork, template=template, variant_rows=variant_rows))
+
+    _log_storefront_qa_summary(qa_rows)
+    if export_csv_path:
+        write_csv_report(pathlib.Path(export_csv_path), [row.__dict__ for row in qa_rows])
+        logger.info("Storefront QA CSV exported path=%s rows=%s", export_csv_path, len(qa_rows))
+    if export_json_path:
+        save_json_atomic(pathlib.Path(export_json_path), [row.__dict__ for row in qa_rows])
+        logger.info("Storefront QA JSON exported path=%s rows=%s", export_json_path, len(qa_rows))
+    return qa_rows
+
+
 def build_printify_publish_payload(template: ProductTemplate) -> Dict[str, Any]:
     # Printify publish image controls can govern storefront mockups/images for supported channels.
     # TODO: Add provider/channel-specific mockup selection support if Printify API exposes stable controls.
@@ -3816,6 +4250,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-disabled-template-rows", action="store_true", help="Also include disabled rows when exporting launch-plan CSV from images")
     parser.add_argument("--launch-plan-default-enabled", choices=["true", "false"], default="true", help="Default enabled value used by --export-launch-plan-from-images")
     parser.add_argument("--placement-preview", action="store_true", help="Render local placement QA previews to exports/previews")
+    parser.add_argument("--storefront-qa", action="store_true", help="Run read-only storefront QA and skip create/update/publish mutations")
+    parser.add_argument("--strict-storefront-qa", action="store_true", help="Return exit code 1 when storefront QA finds errors")
+    parser.add_argument("--export-storefront-qa-report", default="", help="Optional CSV export path for storefront QA rows")
+    parser.add_argument("--export-storefront-qa-json", default="", help="Optional JSON export path for storefront QA rows")
     parser.epilog = (
         "Examples:\n"
         "  python printify_shopify_sync_pipeline.py --dry-run --template-key tshirt_gildan --template-key mug_11oz\n"
@@ -4016,7 +4454,7 @@ def run_catalog_cli(
     return False
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False) -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "") -> None:
     if publish_mode not in {"default", "publish", "skip"}:
         raise RuntimeError(f"Unsupported publish mode: {publish_mode}")
 
@@ -4123,6 +4561,29 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
 
     if not skip_audit:
         audit_printify_integration(printify, templates, shop_id)
+
+    if storefront_qa:
+        launch_rows: Optional[List[LaunchPlanRow]] = None
+        if launch_plan_path:
+            launch_rows, validation_failures = resolve_launch_plan_rows(
+                launch_plan_path=pathlib.Path(launch_plan_path),
+                templates=templates,
+                image_dir=image_dir,
+            )
+            if validation_failures:
+                logger.warning("Storefront QA launch-plan validation had %s failure row(s); skipping invalid rows", len(validation_failures))
+        qa_rows = run_storefront_qa(
+            printify=printify,
+            artworks=artworks,
+            templates=templates,
+            launch_plan_rows=launch_rows,
+            launch_plan_image_dir=image_dir,
+            export_csv_path=export_storefront_qa_report,
+            export_json_path=export_storefront_qa_json,
+        )
+        if strict_storefront_qa and any(row.qa_error_count > 0 for row in qa_rows):
+            raise RuntimeError("Strict storefront QA failed due to one or more QA errors")
+        return
 
     logger.info("Loaded %s template(s) and %s artwork file(s)", len(templates), len(artworks))
     summary = RunSummary(artworks_scanned=len(artworks))
@@ -4356,6 +4817,10 @@ if __name__ == "__main__":
             include_disabled_template_rows=args.include_disabled_template_rows,
             launch_plan_default_enabled=(args.launch_plan_default_enabled == "true"),
             placement_preview=args.placement_preview,
+            storefront_qa=args.storefront_qa,
+            strict_storefront_qa=args.strict_storefront_qa,
+            export_storefront_qa_report=args.export_storefront_qa_report,
+            export_storefront_qa_json=args.export_storefront_qa_json,
         )
     except CatalogCliUsageError as exc:
         print(f"Catalog CLI error: {exc}")

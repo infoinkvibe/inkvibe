@@ -83,6 +83,14 @@ from printify_shopify_sync_pipeline import (
     resolve_artwork_for_placement,
     _resolve_trim_bounds_settings,
     build_shopify_product_options,
+    validate_storefront_title,
+    validate_storefront_description,
+    validate_storefront_tags,
+    validate_storefront_pricing,
+    validate_storefront_options,
+    validate_storefront_mockups,
+    build_storefront_qa_row,
+    run_storefront_qa,
 )
 
 
@@ -2931,3 +2939,201 @@ def test_process_artwork_success_run_row_includes_launch_plan_metadata(tmp_path:
     assert run_rows[0].launch_plan_row_id == "row-2"
     assert run_rows[0].collection_handle == "animals"
     assert run_rows[0].campaign == "spring"
+
+
+def _qa_template() -> ProductTemplate:
+    return ProductTemplate(
+        key="tshirt_gildan",
+        printify_blueprint_id=6,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title} T-Shirt",
+        description_pattern="<p>{generated_description}</p>",
+        enabled_colors=["Black"],
+        enabled_sizes=["M"],
+        placements=[PlacementRequirement("front", 1000, 1000)],
+    )
+
+
+def _qa_artwork(tmp_path: Path, *, title: str = "Aurora Bloom", metadata: dict = None) -> Artwork:
+    image_path = tmp_path / "aurora-bloom.png"
+    Image.new("RGBA", (1400, 1400), (10, 10, 10, 255)).save(image_path)
+    return Artwork(
+        slug="aurora-bloom",
+        src_path=image_path,
+        title=title,
+        description_html="<p>Aurora Bloom</p>",
+        tags=["aurora", "bloom"],
+        image_width=1400,
+        image_height=1400,
+        metadata=metadata or {"title": title, "description": "A rich floral scene", "tags": "aurora,bloom,floral"},
+    )
+
+
+def test_storefront_title_qa_flags_placeholders_and_bad_fallback(tmp_path: Path):
+    template = _qa_template()
+    artwork = _qa_artwork(tmp_path)
+    warnings, errors = validate_storefront_title(
+        title="{artwork_title}",
+        title_source="filename_slug",
+        title_quality="hash_like",
+        artwork=artwork,
+        template=template,
+    )
+    assert "title_unresolved_placeholder" in errors
+    assert "title_low_quality_source" in warnings
+
+    ok_warnings, ok_errors = validate_storefront_title(
+        title="Aurora Bloom T-Shirt",
+        title_source="metadata",
+        title_quality="metadata_title",
+        artwork=artwork,
+        template=template,
+    )
+    assert not ok_errors
+    assert "title_unresolved_placeholder" not in ok_warnings
+
+
+def test_storefront_description_qa_flags_empty_and_short(tmp_path: Path):
+    template = _qa_template()
+    artwork = _qa_artwork(tmp_path)
+
+    warnings, errors = validate_storefront_description(description_html="", template=template, artwork=artwork)
+    assert "description_empty" in errors
+
+    warnings2, errors2 = validate_storefront_description(description_html="<p>Hi</p>", template=template, artwork=artwork)
+    assert "description_suspiciously_short" in warnings2
+    assert not errors2
+
+
+def test_storefront_tag_qa_detects_duplicates_and_generic_only(tmp_path: Path):
+    template = _qa_template()
+    artwork = _qa_artwork(tmp_path)
+    warnings, errors = validate_storefront_tags(
+        tags=["printify", "printify", "inkvibe", "print-on-demand"],
+        template=template,
+        artwork=artwork,
+    )
+    assert not errors
+    assert "tags_contain_duplicates" in warnings
+    assert "tags_generic_only" in warnings
+
+
+def test_storefront_pricing_qa_compare_at_and_summary():
+    template = _qa_template()
+    template.compare_at_price = "bad-price"
+    variants = [{"id": 1, "is_available": True, "options": {"color": "Black", "size": "M"}, "price": 1200}]
+    warnings, errors, summary = validate_storefront_pricing(template=template, variant_rows=variants)
+    assert "pricing_invalid_compare_at_value" in errors
+    assert summary["sale_min"] == summary["sale_max"]
+    assert not warnings
+
+
+def test_storefront_options_qa_color_size_and_default_title():
+    template = _qa_template()
+    variant_rows = [{"id": 1, "is_available": True, "options": {"color": "Black", "size": "M"}, "price": 1200}]
+    product_options, variant_payloads = build_shopify_product_options(template, variant_rows)
+    warnings, errors, names = validate_storefront_options(
+        template=template,
+        variant_rows=variant_rows,
+        product_options=product_options,
+        variant_payloads=variant_payloads,
+    )
+    assert not errors
+    assert "Color" in names and "Size" in names
+    assert "options_default_title_with_real_dimensions" not in warnings
+
+
+def test_storefront_mockup_qa_captures_publish_flags():
+    template = _qa_template()
+    template.publish_images = False
+    template.publish_mockups = True
+    warnings, errors = validate_storefront_mockups(
+        template=template,
+        publish_payload={"images": template.publish_mockups},
+        placement_context="front:mode=contain",
+    )
+    assert not errors
+    assert "mockups_publish_mockups_override_set" in warnings
+    assert "mockups_channel_provider_dependent_selection" in warnings
+
+
+def test_run_storefront_qa_non_mutating_and_exports(tmp_path: Path):
+    class DummyPrintify:
+        dry_run = False
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [{"id": 1, "is_available": True, "options": {"color": "Black", "size": "M"}, "price": 1200}]
+
+    artwork = _qa_artwork(tmp_path)
+    template = _qa_template()
+    csv_path = tmp_path / "storefront_qa.csv"
+    json_path = tmp_path / "storefront_qa.json"
+    rows = run_storefront_qa(
+        printify=DummyPrintify(),
+        artworks=[artwork],
+        templates=[template],
+        export_csv_path=str(csv_path),
+        export_json_path=str(json_path),
+    )
+    assert len(rows) == 1
+    assert csv_path.exists()
+    assert json_path.exists()
+    exported = csv_path.read_text(encoding="utf-8")
+    assert "artwork_filename" in exported
+    assert "qa_status" in exported
+
+
+def test_run_storefront_qa_cli_path_does_not_mutate(monkeypatch, tmp_path: Path):
+    import printify_shopify_sync_pipeline as pipeline
+
+    img = tmp_path / "images"
+    img.mkdir()
+    Image.new("RGBA", (1200, 1200), (0, 0, 0, 255)).save(img / "a.png")
+    cfg = tmp_path / "templates.json"
+    cfg.write_text(
+        json.dumps(
+            [
+                {
+                    "key": "tshirt_gildan",
+                    "printify_blueprint_id": 6,
+                    "printify_print_provider_id": 99,
+                    "title_pattern": "{artwork_title}",
+                    "description_pattern": "{generated_description}",
+                    "placements": [{"placement_name": "front", "width_px": 1000, "height_px": 1000}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    state_path = tmp_path / "state.json"
+    before = json.dumps(ensure_state_shape({}), sort_keys=True)
+    state_path.write_text(before, encoding="utf-8")
+
+    class DummyPrintify:
+        dry_run = True
+
+        def __init__(self, token, dry_run=False):
+            self.dry_run = dry_run
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [{"id": 1, "is_available": True, "options": {}, "price": 1200}]
+
+    monkeypatch.setenv("PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "PrintifyClient", DummyPrintify)
+    monkeypatch.setattr(pipeline, "resolve_shop_id", lambda *a, **k: 1)
+    monkeypatch.setattr(pipeline, "run_catalog_cli", lambda **kwargs: False)
+    monkeypatch.setattr(pipeline, "audit_printify_integration", lambda *a, **k: None)
+    called = {"process": 0}
+    monkeypatch.setattr(pipeline, "process_artwork", lambda **kwargs: called.__setitem__("process", called["process"] + 1))
+
+    pipeline.run(
+        cfg,
+        dry_run=True,
+        image_dir=img,
+        state_path=state_path,
+        storefront_qa=True,
+        export_storefront_qa_report=str(tmp_path / "qa.csv"),
+    )
+    assert called["process"] == 0
+    assert state_path.read_text(encoding="utf-8") == before

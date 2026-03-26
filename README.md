@@ -577,3 +577,27 @@ Use `--skip-audit` when iterating quickly in local dry-run/testing loops where P
 ## Placement QA preview mode
 
 Use `--placement-preview` to emit local preview composites to `exports/previews/` before upload. This mode is read-only and optional.
+
+## Storefront QA mode (read-only)
+
+Use `--storefront-qa` to run a non-mutating listing-quality audit across rendered titles, descriptions, tags, pricing/compare-at summaries, variant option structure, and publish image/mockup intent. This mode does **not** create, update, rebuild, publish, or delete products.
+
+Examples:
+
+```bash
+# Spreadsheet-ready CSV report
+python printify_shopify_sync_pipeline.py \
+  --storefront-qa \
+  --export-storefront-qa-report ./exports/storefront_qa.csv
+
+# Optional JSON export + strict exit behavior
+python printify_shopify_sync_pipeline.py \
+  --storefront-qa \
+  --strict-storefront-qa \
+  --export-storefront-qa-report ./exports/storefront_qa.csv \
+  --export-storefront-qa-json ./exports/storefront_qa.json
+```
+
+Notes:
+- QA rows include launch-plan metadata when run with `--launch-plan`.
+- Mockup/image selection is still partially provider/channel-dependent in Printify, so this report flags publish intent and placement context, but cannot guarantee exact storefront mockup ordering.
