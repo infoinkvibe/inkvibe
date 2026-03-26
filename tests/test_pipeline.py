@@ -2119,6 +2119,70 @@ def test_resolve_artwork_for_placement_falls_back_to_contain_for_undersized_post
     assert result.upscaled is False
 
 
+def test_resolve_artwork_for_placement_applies_safe_enhancement_for_undersized_poster(tmp_path: Path):
+    path = tmp_path / "poster-safe-enhance.png"
+    Image.new("RGBA", (780, 900), (255, 0, 0, 255)).save(path)
+    artwork = Artwork("poster-safe-enhance", path, "Poster Safe Enhance", "", [], 780, 900)
+    placement = PlacementRequirement("front", 1000, 1000, artwork_fit_mode="contain")
+
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        template_key="poster_basic",
+        allow_upscale=False,
+        upscale_method="lanczos",
+        skip_undersized=False,
+    )
+
+    assert result.action == "contained_padded_upscale"
+    assert result.upscaled is True
+    assert result.requested_upscale_factor == pytest.approx(1.111, rel=1e-3)
+    assert result.applied_upscale_factor == pytest.approx(1.111, rel=1e-3)
+    assert result.upscale_capped is False
+
+
+def test_resolve_artwork_for_placement_skips_safe_enhancement_when_over_cap(tmp_path: Path):
+    path = tmp_path / "poster-over-cap.png"
+    Image.new("RGBA", (500, 700), (255, 0, 0, 255)).save(path)
+    artwork = Artwork("poster-over-cap", path, "Poster Over Cap", "", [], 500, 700)
+    placement = PlacementRequirement("front", 1000, 1000, artwork_fit_mode="contain")
+
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        template_key="poster_basic",
+        allow_upscale=True,
+        upscale_method="lanczos",
+        skip_undersized=False,
+    )
+
+    assert result.action == "contained_padded"
+    assert result.upscaled is False
+    assert result.requested_upscale_factor == 1.0
+    assert result.applied_upscale_factor == 1.0
+
+
+def test_resolve_artwork_for_placement_non_poster_behavior_unchanged_for_contain(tmp_path: Path):
+    path = tmp_path / "mug-small.png"
+    Image.new("RGBA", (500, 700), (255, 0, 0, 255)).save(path)
+    artwork = Artwork("mug-small", path, "Mug Small", "", [], 500, 700)
+    placement = PlacementRequirement("front", 1000, 1000, artwork_fit_mode="contain")
+
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        template_key="mug_basic",
+        allow_upscale=False,
+        upscale_method="lanczos",
+        skip_undersized=False,
+    )
+
+    assert result.action == "contained_padded"
+    assert result.upscaled is False
+    assert result.requested_upscale_factor == 1.0
+    assert result.applied_upscale_factor == 1.0
+
+
 def test_resolve_tote_template_catalog_mapping_fails_for_missing_blueprint():
     class DummyPrintify:
         def list_blueprints(self):
