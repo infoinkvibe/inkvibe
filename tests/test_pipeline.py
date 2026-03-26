@@ -54,6 +54,8 @@ from printify_shopify_sync_pipeline import (
     list_state_keys,
     inspect_state_key,
     load_artwork_metadata,
+    load_artwork_metadata_map,
+    resolve_artwork_metadata_for_path,
     filename_title_quality_reason,
     resolve_artwork_title,
     _render_listing_tags,
@@ -519,6 +521,42 @@ def test_sidecar_metadata_loading(tmp_path: Path):
     assert metadata["seo_keywords"] == ["gift", "botanical"]
 
 
+def test_artwork_metadata_map_loading_and_resolution(tmp_path: Path):
+    mapping = tmp_path / "artwork_metadata_map.json"
+    mapping.write_text(
+        json.dumps(
+            {
+                "ai-generated-8321310": {
+                    "art_title": "Golden Trail Wolf",
+                    "short_description": "A lone wolf moving through warm mountain light.",
+                    "tags": ["wolf", "wildlife"],
+                    "subject": "wolf",
+                    "mood": "golden-hour",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    image = tmp_path / "ai-generated-8321310.png"
+    Image.new("RGBA", (900, 900), (0, 0, 0, 255)).save(image)
+    metadata_map = load_artwork_metadata_map(mapping)
+    resolved = resolve_artwork_metadata_for_path(image, metadata_map)
+    assert resolved["title"] == "Golden Trail Wolf"
+    assert resolved["description"].startswith("A lone wolf")
+    assert "wolf" in resolved["tags"]
+
+
+def test_sidecar_metadata_preferred_over_repo_map(tmp_path: Path):
+    image = tmp_path / "ai-generated-8383720.png"
+    sidecar = tmp_path / "ai-generated-8383720.json"
+    Image.new("RGBA", (900, 900), (0, 0, 0, 255)).save(image)
+    sidecar.write_text(json.dumps({"title": "Sidecar Title", "description": "From sidecar.", "tags": ["sidecar"]}), encoding="utf-8")
+    metadata_map = {"ai-generated-8383720": {"title": "Map Title", "description": "From map.", "tags": ["map"]}}
+    resolved = resolve_artwork_metadata_for_path(image, metadata_map)
+    assert resolved["title"] == "Sidecar Title"
+    assert resolved["tags"] == ["sidecar"]
+
+
 def test_uuid_noisy_filename_detection():
     assert filename_title_quality_reason("8f6f45d4-c95f-4f68-9cf9-f022f5197a18") == "uuid_like"
     assert filename_title_quality_reason("2fd4e1c67a2d28fced849ee1bb76e7391b93eb12") == "hex_like"
@@ -591,8 +629,59 @@ def test_render_description_generic_fallback(tmp_path: Path):
     template = _template_for_variant_tests()
     template.description_pattern = "<p>{artwork_title}</p>"
     description = render_product_description(template, art)
-    assert "<ul>" in description
-    assert "style upgrade" in description
+    assert "InkVibe" in description
+    assert "expressive everyday style" in description
+
+
+def test_curated_artwork_title_and_family_suffix(tmp_path: Path):
+    src = tmp_path / "ai-generated-8321310.png"
+    Image.new("RGBA", (1000, 1000), (255, 0, 0, 255)).save(src)
+    art = Artwork(
+        slug="ai-generated-8321310",
+        src_path=src,
+        title="Ai Generated 8321310",
+        description_html="",
+        tags=[],
+        image_width=1000,
+        image_height=1000,
+        metadata={"title": "Golden Trail Wolf", "description": "A lone wolf moving through warm mountain light."},
+    )
+    template = _template_for_variant_tests()
+    template.key = "hoodie_gildan"
+    template.product_type_label = "Hoodie"
+    template.title_pattern = "{artwork_title}"
+    assert render_product_title(template, art) == "Golden Trail Wolf Hoodie"
+
+
+def test_unknown_artwork_slug_still_human_readable_fallback(tmp_path: Path):
+    src = tmp_path / "mystery-shape-20260215.png"
+    Image.new("RGBA", (1000, 1000), (255, 0, 0, 255)).save(src)
+    art = Artwork(
+        slug="mystery-shape-20260215",
+        src_path=src,
+        title="mystery-shape-20260215",
+        description_html="",
+        tags=[],
+        image_width=1000,
+        image_height=1000,
+        metadata={},
+    )
+    template = _template_for_variant_tests()
+    template.key = "poster_basic"
+    template.title_pattern = "{artwork_title}"
+    assert render_product_title(template, art) == "Mystery Shape Poster"
+
+
+def test_listing_tags_include_family_brand_and_dedupe(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    art.metadata = {"tags": ["inkvibe", "wolf", "wolf"]}
+    template = _template_for_variant_tests()
+    template.key = "poster_basic"
+    template.tags = ["wall art", "inkvibe"]
+    tags = _render_listing_tags(template, art)
+    assert "inkvibe" in tags
+    assert "poster" in tags
+    assert tags.count("inkvibe") == 1
 
 
 def test_upload_strategy_summary_helper():
