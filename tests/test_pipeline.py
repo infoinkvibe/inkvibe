@@ -56,6 +56,7 @@ from printify_shopify_sync_pipeline import (
     load_artwork_metadata,
     load_artwork_metadata_map,
     resolve_artwork_metadata_for_path,
+    resolve_artwork_metadata_with_source,
     filename_title_quality_reason,
     resolve_artwork_title,
     _render_listing_tags,
@@ -557,6 +558,40 @@ def test_sidecar_metadata_preferred_over_repo_map(tmp_path: Path):
     assert resolved["tags"] == ["sidecar"]
 
 
+def test_artwork_metadata_alias_match_for_uuid_filename(tmp_path: Path):
+    image = tmp_path / "7a90f8b0-5687-4cbf-81a5-3eba04940253.png"
+    Image.new("RGBA", (900, 900), (0, 0, 0, 255)).save(image)
+    metadata_map = {
+        "ai-generated-8321310": {
+            "title": "Golden Trail Wolf",
+            "description": "A lone wolf moving through warm mountain light.",
+            "tags": ["wolf"],
+            "aliases": ["7a90f8b0-5687-4cbf-81a5-3eba04940253"],
+        }
+    }
+    resolved, match = resolve_artwork_metadata_with_source(image, metadata_map, artwork_slug="7a90f8b0-5687-4cbf-81a5-3eba04940253")
+    assert resolved["title"] == "Golden Trail Wolf"
+    assert match["source"] == "alias"
+    assert match["key"] == "ai-generated-8321310"
+
+
+def test_sidecar_still_wins_over_alias_match(tmp_path: Path):
+    image = tmp_path / "7a90f8b0-5687-4cbf-81a5-3eba04940253.png"
+    sidecar = tmp_path / "7a90f8b0-5687-4cbf-81a5-3eba04940253.json"
+    Image.new("RGBA", (900, 900), (0, 0, 0, 255)).save(image)
+    sidecar.write_text(json.dumps({"title": "Sidecar Wolf", "tags": ["sidecar"]}), encoding="utf-8")
+    metadata_map = {
+        "ai-generated-8321310": {
+            "title": "Golden Trail Wolf",
+            "tags": ["map"],
+            "aliases": ["7a90f8b0-5687-4cbf-81a5-3eba04940253"],
+        }
+    }
+    resolved, match = resolve_artwork_metadata_with_source(image, metadata_map, artwork_slug="7a90f8b0-5687-4cbf-81a5-3eba04940253")
+    assert resolved["title"] == "Sidecar Wolf"
+    assert match["source"] == "sidecar"
+
+
 def test_uuid_noisy_filename_detection():
     assert filename_title_quality_reason("8f6f45d4-c95f-4f68-9cf9-f022f5197a18") == "uuid_like"
     assert filename_title_quality_reason("2fd4e1c67a2d28fced849ee1bb76e7391b93eb12") == "hex_like"
@@ -599,6 +634,26 @@ def test_fallback_title_generation_for_noisy_filename(tmp_path: Path):
     resolved = resolve_artwork_title(template, art)
     assert resolved.title_source == "fallback"
     assert resolved.cleaned_display_title == "Retro Sunset Graphic Tee"
+
+
+def test_noisy_filename_fallback_uses_slug_when_available(tmp_path: Path):
+    src = tmp_path / "8f6f45d4-c95f-4f68-9cf9-f022f5197a18.png"
+    Image.new("RGBA", (1000, 1000), (0, 0, 0, 255)).save(src)
+    art = Artwork(
+        slug="golden-trail-wolf",
+        src_path=src,
+        title="",
+        description_html="",
+        tags=[],
+        image_width=1000,
+        image_height=1000,
+        metadata={},
+    )
+    template = _template_for_variant_tests()
+    template.product_type_label = "Hoodie"
+    resolved = resolve_artwork_title(template, art)
+    assert resolved.title_source == "fallback"
+    assert resolved.cleaned_display_title == "Golden Trail Wolf Hoodie"
 
 
 def test_tag_merging_and_deduplication(tmp_path: Path):

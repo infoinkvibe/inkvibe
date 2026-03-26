@@ -518,11 +518,19 @@ def load_artwork_metadata_map(mapping_path: pathlib.Path) -> Dict[str, Dict[str,
         if not isinstance(raw_entry, dict):
             continue
         normalized_key = slugify(str(key))
+        if not normalized_key:
+            continue
         title = str(raw_entry.get("title") or raw_entry.get("art_title") or "").strip()
         description = str(raw_entry.get("description") or raw_entry.get("short_description") or "").strip()
         tags = _split_keywords(raw_entry.get("tags"))
         subject = str(raw_entry.get("subject") or "").strip()
         mood = str(raw_entry.get("mood") or "").strip()
+        aliases = [slugify(alias) for alias in _split_keywords(raw_entry.get("aliases")) if slugify(alias)]
+        original_slug = str(raw_entry.get("original_slug") or "").strip()
+        if original_slug:
+            normalized_original_slug = slugify(original_slug)
+            if normalized_original_slug:
+                aliases.append(normalized_original_slug)
         entry = {
             "title": title,
             "description": description,
@@ -530,22 +538,86 @@ def load_artwork_metadata_map(mapping_path: pathlib.Path) -> Dict[str, Dict[str,
             "subject": subject,
             "mood": mood,
             "theme": str(raw_entry.get("theme") or mood or "").strip(),
+            "aliases": list(dict.fromkeys(aliases)),
+            "original_slug": original_slug,
         }
         resolved[normalized_key] = entry
     return resolved
 
 
-def resolve_artwork_metadata_for_path(path: pathlib.Path, metadata_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+def _metadata_alias_candidates(entry: Dict[str, Any]) -> set[str]:
+    candidates: set[str] = set()
+    for alias in _split_keywords(entry.get("aliases")):
+        normalized = slugify(alias)
+        if normalized:
+            candidates.add(normalized)
+    original_slug = str(entry.get("original_slug") or "").strip()
+    if original_slug:
+        normalized = slugify(original_slug)
+        if normalized:
+            candidates.add(normalized)
+    return candidates
+
+
+def resolve_artwork_metadata_with_source(
+    path: pathlib.Path,
+    metadata_map: Dict[str, Dict[str, Any]],
+    *,
+    artwork_slug: str = "",
+    persisted_aliases: Optional[List[str]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, str]]:
     sidecar_path = path.with_suffix(".json")
     if sidecar_path.exists() and sidecar_path.is_file():
-        return load_artwork_metadata(sidecar_path)
+        return load_artwork_metadata(sidecar_path), {"source": "sidecar", "key": sidecar_path.name}
 
-    slug_key = slugify(path.stem)
-    for candidate in (slug_key, path.stem):
-        entry = metadata_map.get(slugify(candidate))
+    def _lookup(candidate: str) -> Optional[Tuple[Dict[str, Any], str]]:
+        normalized = slugify(candidate)
+        if not normalized:
+            return None
+        entry = metadata_map.get(candidate) or metadata_map.get(normalized)
         if entry:
-            return dict(entry)
-    return {}
+            canonical_key = normalized if metadata_map.get(normalized) else candidate
+            return dict(entry), canonical_key
+        return None
+
+    canonical_slug = slugify(artwork_slug) if artwork_slug else ""
+    if canonical_slug:
+        matched = _lookup(canonical_slug)
+        if matched:
+            metadata, key = matched
+            return metadata, {"source": "slug", "key": key}
+
+    filename_stem = path.stem
+    exact_stem_match = metadata_map.get(filename_stem)
+    if isinstance(exact_stem_match, dict):
+        return dict(exact_stem_match), {"source": "stem", "key": filename_stem}
+
+    normalized_stem = slugify(filename_stem)
+    if normalized_stem:
+        matched = _lookup(normalized_stem)
+        if matched:
+            metadata, key = matched
+            return metadata, {"source": "normalized_stem", "key": key}
+
+    alias_values = [filename_stem, canonical_slug]
+    if persisted_aliases:
+        alias_values.extend([slugify(alias) for alias in persisted_aliases if slugify(alias)])
+    normalized_aliases = {slugify(value) for value in alias_values if slugify(value)}
+    if normalized_aliases:
+        for key, entry in metadata_map.items():
+            if not isinstance(entry, dict):
+                continue
+            entry_aliases = _metadata_alias_candidates(entry)
+            if entry_aliases.intersection(normalized_aliases):
+                return dict(entry), {"source": "alias", "key": key}
+
+    fallback_key = normalized_stem or canonical_slug or slugify(path.name) or "unknown"
+    return {}, {"source": "fallback", "key": fallback_key}
+
+
+def resolve_artwork_metadata_for_path(path: pathlib.Path, metadata_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    metadata, _ = resolve_artwork_metadata_with_source(path, metadata_map)
+    return metadata
 
 
 def filename_title_quality_reason(value: str) -> str:
@@ -589,7 +661,18 @@ def resolve_artwork_title(template: ProductTemplate, artwork: Artwork) -> TitleR
 
     product_label = (template.product_type_label or template.shopify_product_type or "Product").strip()
     phrase = _best_metadata_phrase(artwork, template)
-    fallback = f"{phrase} {product_label}".strip() if phrase else f"Signature {product_label}".strip()
+    cleaned_slug_title = filename_slug_to_title(artwork.slug)
+    if phrase:
+        base_title = phrase
+    elif cleaned_slug_title and cleaned_slug_title != "Untitled Design":
+        base_title = cleaned_slug_title
+    elif quality_reason not in {"uuid_like", "hex_like", "long_numeric", "hashy_slug"} and cleaned and cleaned != "Untitled Design":
+        base_title = cleaned
+    else:
+        base_title = "Signature"
+    fallback = base_title.strip()
+    if product_label and not title_semantically_includes_product_label(fallback, product_label):
+        fallback = f"{fallback} {product_label}".strip()
     return TitleResolution(filename_stem, fallback, "fallback", quality_reason)
 
 
@@ -1730,11 +1813,18 @@ def discover_artworks(image_dir: pathlib.Path) -> List[Artwork]:
         with Image.open(path) as im:
             width, height = im.size
 
-        metadata = resolve_artwork_metadata_for_path(path, metadata_map)
+        slug = slugify(path.stem)
+        metadata, match_info = resolve_artwork_metadata_with_source(path, metadata_map, artwork_slug=slug)
+        logger.info(
+            "Content metadata match artwork=%s source=%s key=%s",
+            path.name,
+            match_info.get("source", "unknown"),
+            match_info.get("key", ""),
+        )
         title = str(metadata.get("title", "")).strip() or filename_slug_to_title(path.stem)
         artworks.append(
             Artwork(
-                slug=slugify(path.stem),
+                slug=slug,
                 src_path=path,
                 title=title,
                 description_html=f"<p>{title}</p>",
@@ -3774,6 +3864,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
 
     if launch_plan_path:
         template_by_key = {template.key: template for template in templates}
+        metadata_map = load_artwork_metadata_map(ARTWORK_METADATA_MAP_PATH)
         artwork_by_path: Dict[str, Artwork] = {}
         for artwork in artworks:
             artwork_by_path[str(artwork.src_path.resolve())] = artwork
@@ -3799,6 +3890,17 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             if artwork is None:
                 with Image.open(artwork_path) as im:
                     width, height = im.size
+                metadata, match_info = resolve_artwork_metadata_with_source(
+                    artwork_path,
+                    metadata_map,
+                    artwork_slug=slugify(artwork_path.stem),
+                )
+                logger.info(
+                    "Content metadata match artwork=%s source=%s key=%s",
+                    artwork_path.name,
+                    match_info.get("source", "unknown"),
+                    match_info.get("key", ""),
+                )
                 title = filename_slug_to_title(artwork_path.stem)
                 artwork = Artwork(
                     slug=slugify(artwork_path.stem),
@@ -3808,7 +3910,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                     tags=DEFAULT_TAGS.copy(),
                     image_width=width,
                     image_height=height,
-                    metadata=load_artwork_metadata(artwork_path),
+                    metadata=metadata,
                 )
             template = build_resolved_template(template_by_key[launch_row.template_key], launch_row.overrides)
             if resume and is_state_key_successful(state, f"{artwork.slug}:{template.key}"):
