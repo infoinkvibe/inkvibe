@@ -78,6 +78,7 @@ from printify_shopify_sync_pipeline import (
     normalize_printify_transform,
     resolve_artwork_for_placement,
     _resolve_trim_bounds_settings,
+    build_shopify_product_options,
 )
 
 
@@ -641,6 +642,24 @@ def test_compare_at_price_only_when_higher():
     )
     assert compute_compare_at_price_minor(template, 2999) == 3999
     assert compute_compare_at_price_minor(template, 3999) is None
+
+
+def test_shopify_variant_pricing_matches_template_pricing_logic():
+    template = ProductTemplate(
+        key="pricing",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        base_price="12.00",
+        markup_type="percent",
+        markup_value="35",
+        rounding_mode="whole_dollar",
+        compare_at_price="19.99",
+    )
+    _, variants = build_shopify_product_options(template, [{"id": 1, "price": 1099, "options": {"size": "11oz"}}])
+    assert variants[0]["price"] == "16.00"
+    assert variants[0]["compareAtPrice"] == "19.99"
 
 
 def test_template_filtering_by_key_and_limit():
@@ -1596,7 +1615,7 @@ def test_generate_mug_template_snippet_prefers_mug_defaults():
 
 def test_mug_sample_template_points_to_real_pair_and_safe_cap():
     templates = load_templates(Path("product_templates.json"))
-    mug = next(t for t in templates if t.key == "mug_11oz")
+    mug = next(t for t in templates if t.key == "mug_new")
     assert mug.printify_blueprint_id == 68
     assert mug.printify_print_provider_id == 1
     assert mug.max_enabled_variants is not None and mug.max_enabled_variants <= 24
@@ -1606,8 +1625,8 @@ def test_mug_sample_template_points_to_real_pair_and_safe_cap():
 
 def test_shirt_template_enables_allow_upscale_while_mug_stays_conservative():
     templates = load_templates(Path("product_templates.json"))
-    shirt = next(t for t in templates if t.key == "tshirt_gildan")
-    mug = next(t for t in templates if t.key == "mug_11oz")
+    shirt = next(t for t in templates if t.key == "hoodie_gildan")
+    mug = next(t for t in templates if t.key == "mug_new")
 
     assert shirt.placements[0].artwork_fit_mode == "contain"
     assert shirt.placements[0].allow_upscale is True
@@ -1625,8 +1644,8 @@ def test_shirt_contain_export_upscales_but_mug_contain_export_does_not(tmp_path:
     options = ArtworkProcessingOptions()
 
     templates = load_templates(Path("product_templates.json"))
-    shirt = next(t for t in templates if t.key == "tshirt_gildan")
-    mug = next(t for t in templates if t.key == "mug_11oz")
+    shirt = next(t for t in templates if t.key == "hoodie_gildan")
+    mug = next(t for t in templates if t.key == "mug_new")
 
     prepared_shirt = prepare_artwork_export(artwork, shirt, shirt.placements[0], tmp_path / "exports", options)
     prepared_mug = prepare_artwork_export(artwork, mug, mug.placements[0], tmp_path / "exports", options)

@@ -1576,7 +1576,11 @@ def _variant_option_value(variant: Dict[str, Any], key: str) -> str:
     return str(variant.get(key, "")).strip()
 
 
-def build_shopify_product_options(variant_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def _shopify_money_string_from_minor(minor_units: int) -> str:
+    return f"{Decimal(minor_units) / Decimal('100'):.2f}"
+
+
+def build_shopify_product_options(template: ProductTemplate, variant_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     colors = sorted({c for c in (_variant_option_value(v, "color") for v in variant_rows) if c})
     sizes = sorted({s for s in (_variant_option_value(v, "size") for v in variant_rows) if s})
 
@@ -1600,23 +1604,19 @@ def build_shopify_product_options(variant_rows: List[Dict[str, Any]]) -> Tuple[L
         if not option_values:
             option_values.append({"optionName": "Title", "name": "Default Title"})
 
-        price_cents = variant.get("price") or variant.get("cost") or variant.get("price_cents")
-        if isinstance(price_cents, str) and price_cents.isdigit():
-            price_value = f"{int(price_cents) / 100:.2f}"
-        elif isinstance(price_cents, int):
-            price_value = f"{price_cents / 100:.2f}"
-        elif price_cents is not None:
-            price_value = str(price_cents)
-        else:
-            price_value = DEFAULT_PRICE_FALLBACK
+        sale_price_minor = compute_sale_price_minor(template, variant)
+        compare_at_minor = compute_compare_at_price_minor(template, sale_price_minor)
 
-        variants.append({
+        variant_payload = {
             "optionValues": option_values,
-            "price": price_value,
+            "price": _shopify_money_string_from_minor(sale_price_minor),
             "inventoryPolicy": "CONTINUE",
             "taxable": True,
             "inventoryItem": {"tracked": False},
-        })
+        }
+        if compare_at_minor is not None:
+            variant_payload["compareAtPrice"] = _shopify_money_string_from_minor(compare_at_minor)
+        variants.append(variant_payload)
 
     return product_options, variants
 
@@ -1630,7 +1630,7 @@ def create_in_shopify_only(
     title = render_product_title(template, artwork)
     description_html = render_product_description(template, artwork)
     tags = _render_listing_tags(template, artwork)
-    product_options, variants = build_shopify_product_options(variant_rows)
+    product_options, variants = build_shopify_product_options(template, variant_rows)
     handle = slugify(f"{artwork.slug}-{template.key}")
 
     payload = {
