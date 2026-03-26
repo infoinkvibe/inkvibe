@@ -257,6 +257,7 @@ Template-level optional preprocessing:
 Recommendation:
 - Shirts and mugs should usually use `artwork_fit_mode: contain` unless you intentionally want a full-bleed/cropped look.
 - Current defaults are intentionally split: `hoodie_gildan` front placement enables `allow_upscale: true` with a conservative `max_upscale_factor` cap, while `mug_new` keeps `allow_upscale: false` (conservative/no interpolation by default).
+- `poster_basic` now uses an adaptive poster-safe fallback: it still prefers `cover` when source resolution is eligible, and for undersized sources it keeps `contain` as the base while allowing only a bounded poster-only enhancement (`<= 1.35x` with minimum source-size ratio checks). If limits are exceeded, it stays on plain `contain` without upscale.
 
 Example commands:
 

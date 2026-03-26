@@ -367,6 +367,9 @@ TRIM_PRESETS: Dict[str, Dict[str, float]] = {
     },
 }
 
+POSTER_SAFE_ENHANCEMENT_MAX_UPSCALE_FACTOR = 1.35
+POSTER_SAFE_ENHANCEMENT_MIN_SOURCE_RATIO = 0.45
+
 
 LAUNCH_PLAN_OVERRIDE_COLUMNS = [
     "title_override",
@@ -2129,6 +2132,13 @@ def resolve_artwork_for_placement(
         fit_mode = "contain"
     poster_strategy_path = ""
     poster_cover_eligible = False
+    poster_enhancement_considered = False
+    poster_enhancement_applied = False
+    poster_requested_upscale_factor = 1.0
+    poster_applied_upscale_factor = 1.0
+    poster_trim_fill_optimization_applied = False
+    effective_allow_upscale = allow_upscale
+    effective_max_upscale_factor = max_upscale_factor
     if template_key == "poster_basic":
         poster_cover_eligible = image.width >= placement.width_px and image.height >= placement.height_px
         logger.info(
@@ -2152,6 +2162,7 @@ def resolve_artwork_for_placement(
         else:
             fit_mode = "contain"
             poster_strategy_path = "contain_fallback"
+            poster_enhancement_considered = True
             logger.warning(
                 "Poster strategy fallback=contain reason=insufficient_resolution placement=%s source=%sx%s required=%sx%s",
                 placement.placement_name,
@@ -2160,15 +2171,44 @@ def resolve_artwork_for_placement(
                 placement.width_px,
                 placement.height_px,
             )
-            if allow_upscale:
+            poster_requested_scale = min(placement.width_px / image.width, placement.height_px / image.height)
+            poster_requested_upscale_factor = poster_requested_scale if poster_requested_scale > 1.0 else 1.0
+            min_source_ratio = min(image.width / placement.width_px, image.height / placement.height_px)
+            enhancement_within_limits = (
+                poster_requested_upscale_factor > 1.0
+                and poster_requested_upscale_factor <= POSTER_SAFE_ENHANCEMENT_MAX_UPSCALE_FACTOR
+                and min_source_ratio >= POSTER_SAFE_ENHANCEMENT_MIN_SOURCE_RATIO
+            )
+            if enhancement_within_limits:
+                effective_allow_upscale = True
+                effective_max_upscale_factor = (
+                    min(max_upscale_factor, POSTER_SAFE_ENHANCEMENT_MAX_UPSCALE_FACTOR)
+                    if max_upscale_factor is not None and max_upscale_factor > 0
+                    else POSTER_SAFE_ENHANCEMENT_MAX_UPSCALE_FACTOR
+                )
+                poster_enhancement_applied = True
+                poster_applied_upscale_factor = min(
+                    poster_requested_upscale_factor,
+                    effective_max_upscale_factor if effective_max_upscale_factor else poster_requested_upscale_factor,
+                )
                 logger.info(
-                    "Poster upscale status=allowed placement=%s note=contain_path_uses_safe_upscale_rules",
+                    "Poster enhancement applied placement=%s strategy=bounded_contain_upscale requested_upscale_factor=%.3f applied_upscale_factor=%.3f max_allowed=%.3f trim_fill_optimization_applied=%s",
                     placement.placement_name,
+                    poster_requested_upscale_factor,
+                    poster_applied_upscale_factor,
+                    effective_max_upscale_factor if effective_max_upscale_factor is not None else 0.0,
+                    poster_trim_fill_optimization_applied,
                 )
             else:
+                effective_allow_upscale = False
                 logger.info(
-                    "Poster upscale status=not_allowed placement=%s reason=template_or_runtime_setting",
+                    "Poster enhancement skipped placement=%s reason=outside_safe_limits requested_upscale_factor=%.3f max_safe_upscale_factor=%.3f min_source_ratio=%.3f min_required_source_ratio=%.3f trim_fill_optimization_applied=%s",
                     placement.placement_name,
+                    poster_requested_upscale_factor,
+                    POSTER_SAFE_ENHANCEMENT_MAX_UPSCALE_FACTOR,
+                    min_source_ratio,
+                    POSTER_SAFE_ENHANCEMENT_MIN_SOURCE_RATIO,
+                    poster_trim_fill_optimization_applied,
                 )
 
     too_small = fit_mode == "cover" and (image.width < placement.width_px or image.height < placement.height_px)
@@ -2212,7 +2252,7 @@ def resolve_artwork_for_placement(
             trim_skip_reason,
         )
 
-    if too_small and not allow_upscale:
+    if too_small and not effective_allow_upscale:
         if skip_undersized:
             logger.warning(
                 "Skipping undersized artwork %s for placement %s: %sx%s < %sx%s (action=skip fit_mode=%s)",
@@ -2256,13 +2296,18 @@ def resolve_artwork_for_placement(
         requested_scale = max(placement.width_px / image.width, placement.height_px / image.height)
     else:
         requested_scale = min(placement.width_px / image.width, placement.height_px / image.height)
-        if not allow_upscale:
+        if not effective_allow_upscale:
             requested_scale = min(requested_scale, 1.0)
     requested_upscale_factor = requested_scale if requested_scale > 1.0 else 1.0
     scale = requested_scale
     upscale_capped = False
-    if scale > 1.0 and max_upscale_factor is not None and max_upscale_factor > 0 and scale > max_upscale_factor:
-        scale = max_upscale_factor
+    if (
+        scale > 1.0
+        and effective_max_upscale_factor is not None
+        and effective_max_upscale_factor > 0
+        and scale > effective_max_upscale_factor
+    ):
+        scale = effective_max_upscale_factor
         upscale_capped = True
         logger.warning(
             "Upscale cap applied artwork=%s placement=%s fit_mode=%s requested_upscale_factor=%.3f applied_upscale_factor=%.3f max_upscale_factor=%.3f",
@@ -2271,7 +2316,7 @@ def resolve_artwork_for_placement(
             fit_mode,
             requested_upscale_factor,
             scale,
-            max_upscale_factor,
+            effective_max_upscale_factor,
         )
     applied_upscale_factor = scale if scale > 1.0 else 1.0
     upscaled = scale > 1
@@ -2318,12 +2363,17 @@ def resolve_artwork_for_placement(
             placement.placement_name,
         )
         logger.info(
-            "Poster final resolution path chosen strategy=%s fit_mode=%s action=%s upscaled=%s upscale_capped=%s",
+            "Poster final resolution path chosen strategy=%s fit_mode=%s action=%s upscaled=%s upscale_capped=%s enhancement_considered=%s enhancement_applied=%s requested_upscale_factor=%.3f applied_upscale_factor=%.3f trim_fill_optimization_applied=%s",
             poster_strategy_path or fit_mode,
             fit_mode,
             action,
             upscaled,
             upscale_capped,
+            poster_enhancement_considered,
+            poster_enhancement_applied,
+            poster_requested_upscale_factor,
+            applied_upscale_factor,
+            poster_trim_fill_optimization_applied,
         )
         if upscaled:
             logger.info(
