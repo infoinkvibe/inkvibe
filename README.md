@@ -564,6 +564,24 @@ python printify_ui_automation.py \
 
 Run report rows now include launch-plan row context (`launch_plan_row`, `launch_plan_row_id`) for successful rows and can also carry optional collection metadata columns (`collection_handle`, `collection_title`, `collection_description`, `launch_name`, `campaign`, `merch_theme`) when provided in launch-plan CSV mode.
 
+Collection sync is optional and explicit:
+
+- `--sync-collections`: enable Shopify custom/manual collection resolve/create/update + product membership attach for launch-plan rows that include collection metadata.
+- `--skip-collections`: explicitly disable collection sync even if `--sync-collections` is present.
+- `--verify-collections`: read-only membership verification after collection sync.
+
+Collection behavior is idempotent by design: handle-first resolution (title fallback), reuse existing collections on reruns, and no-op membership checks before creating a collect row.
+
+Example:
+
+```bash
+python printify_shopify_sync_pipeline.py \
+  --launch-plan ./launch_plan.csv \
+  --sync-collections \
+  --verify-collections \
+  --export-run-report ./exports/run.csv
+```
+
 ## Compact state behavior and migration
 
 State handling is centralized in `state_store.py`. Legacy `state.json` rows still load through migration helpers, and status semantics for resume are preserved (`dry-run-only` remains resumable, `real-completed` remains non-resumable).

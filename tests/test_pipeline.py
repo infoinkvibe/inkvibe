@@ -91,6 +91,8 @@ from printify_shopify_sync_pipeline import (
     validate_storefront_mockups,
     build_storefront_qa_row,
     run_storefront_qa,
+    sync_shopify_collection,
+    _extract_numeric_shopify_id,
 )
 
 
@@ -2939,6 +2941,185 @@ def test_process_artwork_success_run_row_includes_launch_plan_metadata(tmp_path:
     assert run_rows[0].launch_plan_row_id == "row-2"
     assert run_rows[0].collection_handle == "animals"
     assert run_rows[0].campaign == "spring"
+
+
+def test_extract_numeric_shopify_id_supports_gid_and_plain_id():
+    assert _extract_numeric_shopify_id("gid://shopify/Product/12345") == 12345
+    assert _extract_numeric_shopify_id("12345") == 12345
+    assert _extract_numeric_shopify_id("bad") is None
+
+
+def test_sync_shopify_collection_creates_then_reuses_collection_and_membership():
+    class DummyShopify:
+        def __init__(self):
+            self.collections = {}
+            self.collects = set()
+            self.next_id = 100
+
+        def find_custom_collection(self, *, handle="", title=""):
+            for row in self.collections.values():
+                if handle and row["handle"] == handle:
+                    return dict(row)
+                if title and row["title"] == title:
+                    return dict(row)
+            return None
+
+        def create_custom_collection(self, *, handle, title, description=""):
+            row = {"id": self.next_id, "handle": handle, "title": title, "body_html": description}
+            self.collections[row["id"]] = row
+            self.next_id += 1
+            return dict(row)
+
+        def update_custom_collection(self, *, collection_id, title, description=""):
+            row = self.collections[collection_id]
+            row["title"] = title
+            row["body_html"] = description
+            return dict(row)
+
+        def is_product_in_collection(self, *, collection_id, product_id):
+            return (collection_id, product_id) in self.collects
+
+        def add_product_to_collection(self, *, collection_id, product_id):
+            self.collects.add((collection_id, product_id))
+            return {"id": 1}
+
+    shopify = DummyShopify()
+    first = sync_shopify_collection(
+        shopify=shopify,
+        shopify_product_id="gid://shopify/Product/200",
+        collection_handle="animals",
+        collection_title="Animals",
+        collection_description="Animal art",
+        verify_membership=True,
+    )
+    second = sync_shopify_collection(
+        shopify=shopify,
+        shopify_product_id="gid://shopify/Product/200",
+        collection_handle="animals",
+        collection_title="Animals",
+        collection_description="Animal art",
+        verify_membership=True,
+    )
+
+    assert first["collection_sync_status"] == "created"
+    assert second["collection_sync_status"] == "synced"
+    assert len(shopify.collections) == 1
+    assert len(shopify.collects) == 1
+    assert second["collection_membership_verified"] is True
+
+
+def test_sync_shopify_collection_skips_without_shopify_product_id():
+    result = sync_shopify_collection(
+        shopify=None,
+        shopify_product_id="",
+        collection_handle="animals",
+        collection_title="Animals",
+        collection_description="",
+        verify_membership=False,
+    )
+    assert result["collection_sync_status"] == "skipped_no_shopify_client"
+
+
+def test_sync_shopify_collection_dry_run_returns_non_mutating_status():
+    class DryRunShopify:
+        def find_custom_collection(self, *, handle="", title=""):
+            return None
+
+        def create_custom_collection(self, *, handle, title, description=""):
+            raise DryRunMutationSkipped("dry-run skipped")
+
+    result = sync_shopify_collection(
+        shopify=DryRunShopify(),
+        shopify_product_id="gid://shopify/Product/200",
+        collection_handle="animals",
+        collection_title="Animals",
+        collection_description="",
+        verify_membership=False,
+    )
+    assert result["collection_sync_status"] == "dry-run"
+
+
+def test_process_artwork_collection_sync_fields_in_run_report(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    class DummyPrintify:
+        dry_run = False
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [{"id": 1, "is_available": True, "options": {}, "price": 1200}]
+
+    monkeypatch.setattr(pipeline, "choose_variants_from_catalog", lambda variants, template: variants)
+    monkeypatch.setattr(
+        pipeline,
+        "prepare_artwork_export",
+        lambda artwork, template, placement, export_dir, options: PreparedArtwork(
+            artwork=artwork,
+            template=template,
+            placement=placement,
+            export_path=tmp_path / "x.png",
+            width_px=placement.width_px,
+            height_px=placement.height_px,
+        ),
+    )
+    monkeypatch.setattr(pipeline, "upload_assets_to_printify", lambda *a, **k: {"front": {"id": "up-1"}})
+    monkeypatch.setattr(
+        pipeline,
+        "upsert_in_printify",
+        lambda **kwargs: {"status": "ok", "action": "create", "printify_product_id": "p1"},
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "create_in_shopify_only",
+        lambda shopify, artwork, template, variant_rows: {"shopify_product_id": "gid://shopify/Product/200"},
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "sync_shopify_collection",
+        lambda **kwargs: {
+            "collection_sync_attempted": True,
+            "collection_sync_status": "synced",
+            "collection_id": "300",
+            "collection_handle": "animals",
+            "collection_title": "Animals",
+            "collection_membership_verified": True,
+            "collection_warning": "",
+            "collection_error": "",
+        },
+    )
+
+    art = _create_artwork(tmp_path, 1200, 1200)
+    tpl = ProductTemplate(
+        key="tshirt_gildan",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[PlacementRequirement("front", 1000, 1000)],
+        publish_to_shopify=True,
+    )
+    state = ensure_state_shape({})
+    run_rows = []
+    pipeline.process_artwork(
+        printify=DummyPrintify(),
+        shopify=object(),
+        shop_id=1,
+        artwork=art,
+        templates=[tpl],
+        state=state,
+        force=False,
+        export_dir=tmp_path / "exports",
+        state_path=tmp_path / "state.json",
+        artwork_options=ArtworkProcessingOptions(),
+        upload_strategy="auto",
+        r2_config=None,
+        run_rows=run_rows,
+        sync_collections=True,
+        collection_handle="animals",
+        collection_title="Animals",
+    )
+    assert run_rows[0].collection_sync_attempted is True
+    assert run_rows[0].collection_sync_status == "synced"
+    assert run_rows[0].shopify_collection_id == "300"
 
 
 def _qa_template() -> ProductTemplate:

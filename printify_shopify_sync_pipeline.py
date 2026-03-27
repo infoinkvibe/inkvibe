@@ -267,6 +267,12 @@ class RunReportRow:
     subject_bounds_after_aggressive_trim: str = ""
     subject_fill_target: str = ""
     aggressive_trim_used: bool = False
+    collection_sync_attempted: bool = False
+    collection_sync_status: str = ""
+    shopify_collection_id: str = ""
+    collection_membership_verified: bool = False
+    collection_warning: str = ""
+    collection_error: str = ""
 
 
 @dataclass
@@ -1764,6 +1770,188 @@ class ShopifyClient(BaseApiClient):
         if data.get("userErrors"):
             raise RuntimeError(f"Shopify productSet errors: {data['userErrors']}")
         return data["product"]
+
+    def list_custom_collections(self, **params: Any) -> List[Dict[str, Any]]:
+        response = self.get(f"/admin/api/{SHOPIFY_API_VERSION}/custom_collections.json", **params)
+        return response.get("custom_collections", []) if isinstance(response, dict) else []
+
+    def find_custom_collection(self, *, handle: str = "", title: str = "") -> Optional[Dict[str, Any]]:
+        normalized_handle = handle.strip()
+        normalized_title = title.strip()
+        if normalized_handle:
+            by_handle = self.list_custom_collections(handle=normalized_handle, limit=1)
+            if by_handle:
+                return by_handle[0]
+        if normalized_title:
+            by_title = self.list_custom_collections(title=normalized_title, limit=25)
+            for row in by_title:
+                if str(row.get("title") or "").strip().casefold() == normalized_title.casefold():
+                    return row
+            if by_title:
+                return by_title[0]
+        return None
+
+    def create_custom_collection(self, *, handle: str, title: str, description: str = "") -> Dict[str, Any]:
+        payload = {
+            "custom_collection": {
+                "handle": handle,
+                "title": title,
+                "body_html": description,
+            }
+        }
+        response = self.post(f"/admin/api/{SHOPIFY_API_VERSION}/custom_collections.json", payload)
+        return response.get("custom_collection", {}) if isinstance(response, dict) else {}
+
+    def update_custom_collection(self, *, collection_id: int, title: str, description: str = "") -> Dict[str, Any]:
+        payload = {"custom_collection": {"id": collection_id, "title": title, "body_html": description}}
+        response = self.put(f"/admin/api/{SHOPIFY_API_VERSION}/custom_collections/{collection_id}.json", payload)
+        return response.get("custom_collection", {}) if isinstance(response, dict) else {}
+
+    def list_collects(self, **params: Any) -> List[Dict[str, Any]]:
+        response = self.get(f"/admin/api/{SHOPIFY_API_VERSION}/collects.json", **params)
+        return response.get("collects", []) if isinstance(response, dict) else []
+
+    def add_product_to_collection(self, *, collection_id: int, product_id: int) -> Dict[str, Any]:
+        payload = {"collect": {"collection_id": collection_id, "product_id": product_id}}
+        response = self.post(f"/admin/api/{SHOPIFY_API_VERSION}/collects.json", payload)
+        return response.get("collect", {}) if isinstance(response, dict) else {}
+
+    def is_product_in_collection(self, *, collection_id: int, product_id: int) -> bool:
+        return bool(self.list_collects(collection_id=collection_id, product_id=product_id, limit=1))
+
+
+def _extract_numeric_shopify_id(value: Any) -> Optional[int]:
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    if candidate.isdigit():
+        return int(candidate)
+    match = re.search(r"/(\d+)$", candidate)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def sync_shopify_collection(
+    *,
+    shopify: Optional[ShopifyClient],
+    shopify_product_id: str,
+    collection_handle: str,
+    collection_title: str,
+    collection_description: str,
+    verify_membership: bool,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "collection_sync_attempted": False,
+        "collection_sync_status": "skipped",
+        "collection_id": "",
+        "collection_handle": collection_handle.strip(),
+        "collection_title": collection_title.strip(),
+        "collection_membership_verified": False,
+        "collection_warning": "",
+        "collection_error": "",
+    }
+    normalized_handle = collection_handle.strip()
+    normalized_title = collection_title.strip()
+    normalized_description = collection_description.strip()
+
+    if not normalized_handle and not normalized_title:
+        result["collection_sync_status"] = "skipped_no_collection_metadata"
+        result["collection_warning"] = "No collection_handle or collection_title provided"
+        logger.info("Collection sync skipped: no collection metadata provided")
+        return result
+
+    if shopify is None:
+        result["collection_sync_status"] = "skipped_no_shopify_client"
+        result["collection_warning"] = "SHOPIFY_ADMIN_TOKEN missing; collection sync not available"
+        logger.warning("Collection sync skipped: Shopify client unavailable")
+        return result
+
+    numeric_product_id = _extract_numeric_shopify_id(shopify_product_id)
+    if numeric_product_id is None:
+        result["collection_sync_status"] = "skipped_no_shopify_product_id"
+        result["collection_warning"] = f"Unable to resolve Shopify product id from {shopify_product_id!r}"
+        logger.warning("Collection sync skipped: Shopify product id unavailable product_id=%s", shopify_product_id or "-")
+        return result
+
+    result["collection_sync_attempted"] = True
+    resolved_handle = normalized_handle or slugify(normalized_title)
+    resolved_title = normalized_title or normalized_handle.replace("-", " ").title()
+
+    try:
+        collection = shopify.find_custom_collection(handle=resolved_handle, title=resolved_title)
+        created = False
+        if collection:
+            logger.info("Collection resolved handle=%s title=%s id=%s", resolved_handle, resolved_title, collection.get("id"))
+        if not collection:
+            try:
+                collection = shopify.create_custom_collection(handle=resolved_handle, title=resolved_title, description=normalized_description)
+                created = True
+                logger.info("Collection created handle=%s title=%s id=%s", resolved_handle, resolved_title, collection.get("id"))
+            except DryRunMutationSkipped:
+                result["collection_sync_status"] = "dry-run"
+                logger.info("Collection sync dry-run: create skipped handle=%s", resolved_handle)
+                return result
+
+        collection_id = _extract_numeric_shopify_id(collection.get("id")) if isinstance(collection, dict) else None
+        if collection_id is None:
+            raise RuntimeError(f"Resolved collection is missing id: {collection}")
+
+        existing_title = str(collection.get("title") or "").strip()
+        existing_description = str(collection.get("body_html") or "").strip()
+        needs_update = bool(
+            (resolved_title and existing_title != resolved_title) or
+            (normalized_description and existing_description != normalized_description)
+        )
+        if needs_update:
+            try:
+                collection = shopify.update_custom_collection(
+                    collection_id=collection_id,
+                    title=resolved_title,
+                    description=normalized_description,
+                )
+                logger.info("Collection updated id=%s title=%s", collection_id, resolved_title)
+            except DryRunMutationSkipped:
+                result["collection_sync_status"] = "dry-run"
+                logger.info("Collection sync dry-run: update skipped id=%s", collection_id)
+                return result
+
+        if not shopify.is_product_in_collection(collection_id=collection_id, product_id=numeric_product_id):
+            try:
+                shopify.add_product_to_collection(collection_id=collection_id, product_id=numeric_product_id)
+                logger.info("Product attached to collection product_id=%s collection_id=%s", numeric_product_id, collection_id)
+            except DryRunMutationSkipped:
+                result["collection_sync_status"] = "dry-run"
+                logger.info("Collection sync dry-run: collect create skipped collection_id=%s", collection_id)
+                return result
+        else:
+            logger.info("Collection membership already exists product_id=%s collection_id=%s", numeric_product_id, collection_id)
+
+        result["collection_sync_status"] = "created" if created else "synced"
+        result["collection_id"] = str(collection_id)
+        result["collection_handle"] = str(collection.get("handle") or resolved_handle)
+        result["collection_title"] = str(collection.get("title") or resolved_title)
+
+        if verify_membership:
+            result["collection_membership_verified"] = shopify.is_product_in_collection(
+                collection_id=collection_id,
+                product_id=numeric_product_id,
+            )
+            logger.info(
+                "Collection verification result product_id=%s collection_id=%s verified=%s",
+                numeric_product_id,
+                collection_id,
+                result["collection_membership_verified"],
+            )
+    except Exception as exc:
+        result["collection_sync_status"] = "error"
+        result["collection_error"] = str(exc)
+        logger.warning("Collection sync failed product_id=%s handle=%s error=%s", numeric_product_id, resolved_handle, exc)
+    return result
 
 
 def _variant_option_value(variant: Dict[str, Any], key: str) -> str:
@@ -3822,7 +4010,7 @@ def upsert_in_printify(
     return result
 
 
-def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, summary: Optional[RunSummary] = None, failure_rows: Optional[List[FailureReportRow]] = None, run_rows: Optional[List[RunReportRow]] = None, launch_plan_row: str = "", launch_plan_row_id: str = "", collection_handle: str = "", collection_title: str = "", collection_description: str = "", launch_name: str = "", campaign: str = "", merch_theme: str = "") -> None:
+def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, verify_collections: bool = False, summary: Optional[RunSummary] = None, failure_rows: Optional[List[FailureReportRow]] = None, run_rows: Optional[List[RunReportRow]] = None, launch_plan_row: str = "", launch_plan_row_id: str = "", collection_handle: str = "", collection_title: str = "", collection_description: str = "", launch_name: str = "", campaign: str = "", merch_theme: str = "") -> None:
     processed = state.setdefault("processed", {})
     existing = processed.get(artwork.slug, {})
     existing_products = existing.get("products", []) if isinstance(existing.get("products", []), list) else []
@@ -4015,6 +4203,40 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 result["shopify"] = create_in_shopify_only(shopify, artwork, template, variant_rows)
 
             printify_result = result.get("printify", {}) if isinstance(result.get("printify"), dict) else {}
+            collection_result = {
+                "collection_sync_attempted": False,
+                "collection_sync_status": "skipped_disabled",
+                "collection_id": "",
+                "collection_handle": collection_handle,
+                "collection_title": collection_title,
+                "collection_membership_verified": False,
+                "collection_warning": "",
+                "collection_error": "",
+            }
+            if sync_collections:
+                shopify_product_id = str(
+                    (
+                        (result.get("shopify", {}) if isinstance(result.get("shopify"), dict) else {}).get("shopify_product_id")
+                        or ""
+                    )
+                ).strip()
+                collection_result = sync_shopify_collection(
+                    shopify=shopify,
+                    shopify_product_id=shopify_product_id,
+                    collection_handle=collection_handle,
+                    collection_title=collection_title,
+                    collection_description=collection_description,
+                    verify_membership=verify_collections,
+                )
+            elif collection_handle.strip() or collection_title.strip():
+                collection_result["collection_warning"] = "Collection sync disabled (use --sync-collections)"
+                logger.info(
+                    "Collection sync skipped by CLI setting artwork=%s template=%s row_id=%s",
+                    artwork.slug,
+                    template.key,
+                    launch_plan_row_id or "-",
+                )
+            result["collection"] = collection_result
             verification = printify_result.get("verification", {}) if isinstance(printify_result.get("verification"), dict) else {}
             verification_warnings = verification.get("warnings", []) if isinstance(verification.get("warnings", []), list) else []
             row = {
@@ -4038,6 +4260,12 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 "launch_name": launch_name,
                 "campaign": campaign,
                 "merch_theme": merch_theme,
+                "collection_sync_attempted": bool(collection_result.get("collection_sync_attempted", False)),
+                "collection_sync_status": str(collection_result.get("collection_sync_status") or ""),
+                "shopify_collection_id": str(collection_result.get("collection_id") or ""),
+                "collection_membership_verified": bool(collection_result.get("collection_membership_verified", False)),
+                "collection_warning": str(collection_result.get("collection_warning") or ""),
+                "collection_error": str(collection_result.get("collection_error") or ""),
                 "result": result,
                 "dry_run": bool(printify.dry_run),
                 "completion_status": "dry-run-only" if printify.dry_run else "real-completed",
@@ -4080,6 +4308,12 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     subject_bounds_after_aggressive_trim=subject_bounds_after_aggressive_trim_report,
                     subject_fill_target=subject_fill_target_report,
                     aggressive_trim_used=aggressive_trim_used_report,
+                    collection_sync_attempted=bool(collection_result.get("collection_sync_attempted", False)),
+                    collection_sync_status=str(collection_result.get("collection_sync_status") or ""),
+                    shopify_collection_id=str(collection_result.get("collection_id") or ""),
+                    collection_membership_verified=bool(collection_result.get("collection_membership_verified", False)),
+                    collection_warning=str(collection_result.get("collection_warning") or ""),
+                    collection_error=str(collection_result.get("collection_error") or ""),
                 ))
             if summary is not None:
                 printify_action = (result.get("printify", {}) or {}).get("action", action)
@@ -4254,6 +4488,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strict-storefront-qa", action="store_true", help="Return exit code 1 when storefront QA finds errors")
     parser.add_argument("--export-storefront-qa-report", default="", help="Optional CSV export path for storefront QA rows")
     parser.add_argument("--export-storefront-qa-json", default="", help="Optional JSON export path for storefront QA rows")
+    parser.add_argument("--sync-collections", action="store_true", help="Sync Shopify custom collections from launch-plan collection metadata")
+    parser.add_argument("--skip-collections", action="store_true", help="Explicitly disable Shopify collection sync")
+    parser.add_argument("--verify-collections", action="store_true", help="Read-only verify Shopify collection membership after sync")
     parser.epilog = (
         "Examples:\n"
         "  python printify_shopify_sync_pipeline.py --dry-run --template-key tshirt_gildan --template-key mug_11oz\n"
@@ -4454,7 +4691,7 @@ def run_catalog_cli(
     return False
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "") -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "") -> None:
     if publish_mode not in {"default", "publish", "skip"}:
         raise RuntimeError(f"Unsupported publish mode: {publish_mode}")
 
@@ -4557,6 +4794,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
 
     shop_id = resolve_shop_id(printify, PRINTIFY_SHOP_ID)
     shopify = ShopifyClient(SHOPIFY_ADMIN_TOKEN, dry_run=dry_run) if SHOPIFY_ADMIN_TOKEN else None
+    collection_sync_enabled = bool(sync_collections and not skip_collections)
     r2_config = load_r2_config_from_env()
 
     if not skip_audit:
@@ -4667,6 +4905,8 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                 publish_mode=publish_mode,
                 verify_publish=verify_publish,
                 auto_rebuild_on_incompatible_update=auto_rebuild_on_incompatible_update,
+                sync_collections=collection_sync_enabled,
+                verify_collections=verify_collections,
                 summary=summary,
                 failure_rows=failure_rows,
                 run_rows=run_rows,
@@ -4718,6 +4958,8 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                     publish_mode=publish_mode,
                     verify_publish=verify_publish,
                     auto_rebuild_on_incompatible_update=auto_rebuild_on_incompatible_update,
+                    sync_collections=collection_sync_enabled,
+                    verify_collections=verify_collections,
                     summary=summary,
                     failure_rows=failure_rows,
                     run_rows=run_rows,
@@ -4804,6 +5046,9 @@ if __name__ == "__main__":
             publish_mode=publish_mode,
             verify_publish=args.verify_publish,
             auto_rebuild_on_incompatible_update=args.auto_rebuild_on_incompatible_update,
+            sync_collections=args.sync_collections,
+            skip_collections=args.skip_collections,
+            verify_collections=args.verify_collections,
             inspect_state_key_value=args.inspect_state_key,
             list_state_keys_only=args.list_state_keys,
             list_failures_only=args.list_failures,
