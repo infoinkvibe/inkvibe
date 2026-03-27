@@ -86,21 +86,70 @@ def choose_artwork_display_title(artwork: Any) -> str:
     return filename_slug_to_title(artwork.src_path.stem or artwork.slug)
 
 
+def _as_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _as_keywords(value: Any) -> List[str]:
+    if isinstance(value, list):
+        rows = value
+    elif isinstance(value, str):
+        rows = re.split(r"[,;]", value)
+    else:
+        return []
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        cleaned = _as_text(row)
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(cleaned)
+    return deduped
+
+
 def build_listing_context(template: Any, artwork: Any, *, overrides: Dict[str, str] | None = None) -> Dict[str, Any]:
     title_info = resolve_artwork_title(template, artwork)
     metadata = artwork.metadata or {}
+    style_keywords = _as_keywords(metadata.get("style_keywords"))
+    seo_keywords = [*getattr(template, "seo_keywords", []), *_as_keywords(metadata.get("seo_keywords"))]
+    deduped_seo: List[str] = []
+    seo_seen: set[str] = set()
+    for keyword in seo_keywords:
+        cleaned = _as_text(keyword)
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seo_seen:
+            continue
+        seo_seen.add(key)
+        deduped_seo.append(cleaned)
     context = {
         "artwork_title": title_info.cleaned_display_title,
         "clean_artwork_title": title_info.cleaned_display_title,
-        "audience": str(metadata.get("audience") or template.audience or "").strip(),
-        "subtitle": str(metadata.get("subtitle", "")).strip(),
-        "theme": str(metadata.get("theme", "")).strip(),
-        "collection": str(metadata.get("collection", "")).strip(),
-        "occasion": str(metadata.get("occasion", "")).strip(),
+        "audience": _as_text(metadata.get("audience") or getattr(template, "audience", "") or ""),
+        "subtitle": _as_text(metadata.get("subtitle")),
+        "theme": _as_text(metadata.get("theme")),
+        "collection": _as_text(metadata.get("collection")),
+        "occasion": _as_text(metadata.get("occasion")),
+        "color_story": _as_text(metadata.get("color_story")),
+        "artist_note": _as_text(metadata.get("artist_note")),
+        "style_keywords": ", ".join(style_keywords[:6]),
+        "seo_keywords": ", ".join(deduped_seo[:8]),
+        "style_keywords_list": style_keywords,
+        "seo_keywords_list": deduped_seo,
+        "family": infer_product_family(template),
+        "family_label": family_title_suffix(template),
         "title_source": title_info.title_source,
         "title_quality": title_info.quality_reason,
         "raw_title_source": title_info.raw_title_source,
-        "seo_keywords": ", ".join(template.seo_keywords or []),
     }
     if overrides:
         context.update({k: v for k, v in overrides.items() if isinstance(v, str) and v.strip()})

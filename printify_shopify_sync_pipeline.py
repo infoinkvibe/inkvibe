@@ -687,19 +687,55 @@ def filename_title_quality_reason(value: str) -> str:
     return "ok"
 
 
-def _best_metadata_phrase(artwork: Artwork, template: ProductTemplate) -> str:
-    for key in ("theme", "style_keywords", "collection", "subtitle"):
-        value = artwork.metadata.get(key)
-        if isinstance(value, list) and value:
-            return str(value[0]).strip().title()
+def _is_weak_title_phrase(value: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+    if not normalized:
+        return True
+    weak_phrases = {
+        "signature",
+        "signature product",
+        "untitled",
+        "untitled design",
+        "product",
+        "design",
+        "artwork",
+    }
+    if normalized in weak_phrases:
+        return True
+    tokens = [token for token in normalized.split() if token]
+    return len(tokens) <= 1 and tokens[0] in {"signature", "product", "design"} if tokens else True
+
+
+def _select_fallback_title_phrase(*, artwork: Artwork, quality_reason: str) -> str:
+    metadata = artwork.metadata or {}
+    candidates: List[str] = []
+    for key in ("title", "subtitle", "theme", "collection", "occasion", "color_story"):
+        value = metadata.get(key)
         if isinstance(value, str) and value.strip():
-            return value.strip().title()
-    return ""
+            candidates.append(value.strip())
+    style_keywords = _split_keywords(metadata.get("style_keywords"))
+    seo_keywords = _split_keywords(metadata.get("seo_keywords"))
+    if style_keywords:
+        candidates.append(style_keywords[0])
+    if seo_keywords:
+        candidates.append(seo_keywords[0])
+    cleaned_slug_title = filename_slug_to_title(artwork.slug)
+    if cleaned_slug_title and cleaned_slug_title != "Untitled Design":
+        candidates.append(cleaned_slug_title)
+    for candidate in candidates:
+        cleaned = re.sub(r"\s+", " ", candidate).strip().title()
+        if cleaned and not _is_weak_title_phrase(cleaned):
+            return cleaned
+    if quality_reason not in {"uuid_like", "hex_like", "long_numeric", "hashy_slug"}:
+        filename_clean = filename_slug_to_title(artwork.src_path.stem or artwork.slug)
+        if filename_clean != "Untitled Design":
+            return filename_clean
+    return "Signature"
 
 
 def resolve_artwork_title(template: ProductTemplate, artwork: Artwork) -> TitleResolution:
     metadata_title = str(artwork.metadata.get("title", "")).strip()
-    if metadata_title:
+    if metadata_title and not _is_weak_title_phrase(metadata_title):
         return TitleResolution(metadata_title, metadata_title, "metadata", "metadata_title")
 
     filename_stem = artwork.src_path.stem or artwork.slug
@@ -708,17 +744,8 @@ def resolve_artwork_title(template: ProductTemplate, artwork: Artwork) -> TitleR
     if quality_reason == "ok":
         return TitleResolution(filename_stem, cleaned, "filename", "filename_clean")
 
-    product_label = (template.product_type_label or template.shopify_product_type or "Product").strip()
-    phrase = _best_metadata_phrase(artwork, template)
-    cleaned_slug_title = filename_slug_to_title(artwork.slug)
-    if phrase:
-        base_title = phrase
-    elif cleaned_slug_title and cleaned_slug_title != "Untitled Design":
-        base_title = cleaned_slug_title
-    elif quality_reason not in {"uuid_like", "hex_like", "long_numeric", "hashy_slug"} and cleaned and cleaned != "Untitled Design":
-        base_title = cleaned
-    else:
-        base_title = "Signature"
+    product_label = (template.product_type_label or template.shopify_product_type or content_engine.family_title_suffix(template) or "Product").strip()
+    base_title = _select_fallback_title_phrase(artwork=artwork, quality_reason=quality_reason)
     fallback = base_title.strip()
     if product_label and not title_semantically_includes_product_label(fallback, product_label):
         fallback = f"{fallback} {product_label}".strip()
@@ -1005,38 +1032,17 @@ def build_generic_description_html(artwork_title: str) -> str:
 
 
 def build_seo_context(template: ProductTemplate, artwork: Artwork) -> Dict[str, str]:
-    title_info = resolve_artwork_title(template, artwork)
-    display_title = title_info.cleaned_display_title
-    metadata = artwork.metadata or {}
-    merged_seo = [*template.seo_keywords, *_split_keywords(metadata.get("seo_keywords"))]
-    merged_style = [*template.style_keywords, *_split_keywords(metadata.get("style_keywords"))]
-    seo_keywords = ", ".join(list(dict.fromkeys(merged_seo))[:8])
-    style_keywords = ", ".join(list(dict.fromkeys(merged_style))[:6])
-    audience = str(metadata.get("audience") or template.audience or "").strip()
-    product_type = (template.product_type_label or template.shopify_product_type or "Product").strip()
-    subtitle = str(metadata.get("subtitle", "")).strip()
-    theme = str(metadata.get("theme", "")).strip()
-    collection = str(metadata.get("collection", "")).strip()
-    color_story = str(metadata.get("color_story", "")).strip()
-    occasion = str(metadata.get("occasion", "")).strip()
-    artist_note = str(metadata.get("artist_note", "")).strip()
-    return {
-        "artwork_title": display_title,
-        "clean_artwork_title": display_title,
-        "seo_keywords": seo_keywords,
-        "audience": audience,
-        "product_type_label": product_type,
-        "style_keywords": style_keywords,
-        "subtitle": subtitle,
-        "theme": theme,
-        "collection": collection,
-        "color_story": color_story,
-        "occasion": occasion,
-        "artist_note": artist_note,
-        "title_source": title_info.title_source,
-        "title_quality": title_info.quality_reason,
-        "raw_title_source": title_info.raw_title_source,
-    }
+    context = content_engine.build_listing_context(template, artwork)
+    merged_style = [*template.style_keywords, *_split_keywords((artwork.metadata or {}).get("style_keywords"))]
+    product_type = (template.product_type_label or template.shopify_product_type or context.get("family_label") or "Product").strip()
+    context.update(
+        {
+            "product_type_label": product_type,
+            "style_keywords": ", ".join(list(dict.fromkeys(merged_style))[:6]),
+            "family_label": content_engine.family_title_suffix(template),
+        }
+    )
+    return context
 
 
 def render_product_title(template: ProductTemplate, artwork: Artwork) -> str:
@@ -1057,30 +1063,59 @@ def render_product_title(template: ProductTemplate, artwork: Artwork) -> str:
 
 def _render_listing_tags(template: ProductTemplate, artwork: Artwork) -> List[str]:
     metadata = artwork.metadata or {}
-    merged = [
-        *DEFAULT_TAGS,
-        *artwork.tags,
+    context = build_seo_context(template, artwork)
+    family = content_engine.infer_product_family(template)
+    family_label = str(context.get("family_label", "")).strip().lower()
+    family_bucket = [*content_engine.family_tags(template), family_label, template.product_type_label, template.shopify_product_type]
+    theme_bucket = [
+        metadata.get("theme"),
+        metadata.get("subtitle"),
+        metadata.get("collection"),
+        metadata.get("color_story"),
+        context.get("artwork_title"),
         *template.tags,
+        *artwork.tags,
         *_split_keywords(metadata.get("tags")),
         *_split_keywords(metadata.get("seo_keywords")),
-        *content_engine.family_tags(template),
-        "inkvibe",
     ]
+    audience_style_bucket = [
+        metadata.get("audience"),
+        *template.style_keywords,
+        *_split_keywords(metadata.get("style_keywords")),
+    ]
+    gifting_bucket = [metadata.get("occasion"), "gift idea", "inkvibe", *DEFAULT_TAGS]
+    bucket_order = [family_bucket, theme_bucket, audience_style_bucket, gifting_bucket]
     tags: List[str] = []
     seen: set[str] = set()
-    for row in merged:
-        cleaned = str(row).strip().lower()
-        if not cleaned:
-            continue
-        cleaned = re.sub(r"\s+", " ", cleaned)
-        if len(cleaned) > 32:
-            continue
-        if cleaned in seen:
-            continue
-        seen.add(cleaned)
-        tags.append(cleaned)
+    generic_tokens = {"print-on-demand", "printify", "style", "design", "artwork", "product"}
+    for bucket in bucket_order:
+        for row in bucket:
+            cleaned = str(row).strip().lower()
+            if not cleaned:
+                continue
+            cleaned = re.sub(r"\s+", " ", cleaned)
+            cleaned = re.sub(r"[^a-z0-9&' +/\-]", "", cleaned).strip()
+            if not cleaned or len(cleaned) > 32:
+                continue
+            if cleaned in seen:
+                continue
+            if cleaned in generic_tokens and len(tags) >= 8:
+                continue
+            seen.add(cleaned)
+            tags.append(cleaned)
+            if len(tags) >= 20:
+                break
         if len(tags) >= 20:
             break
+    if family in {"hoodie", "sweatshirt", "long_sleeve", "poster", "mug", "tote"}:
+        required = set(content_engine.family_tags(template))
+        if required and not required.intersection(set(tags)):
+            for tag in content_engine.family_tags(template):
+                lowered = tag.lower()
+                if lowered not in seen and len(lowered) <= 32:
+                    tags.append(lowered)
+                    seen.add(lowered)
+                    break
     return tags
 
 
@@ -1098,8 +1133,34 @@ def render_product_description(template: ProductTemplate, artwork: Artwork) -> s
     if not pattern or pattern in {"{artwork_title}", "<p>{artwork_title}</p>"}:
         if metadata_description:
             return generated.strip()
-        audience_line = f"<p>Designed for {context['audience']} who love {context['style_keywords']}.</p>" if context["audience"] and context["style_keywords"] else ""
-        return f"{generated}{audience_line}".strip()
+        details: List[str] = []
+        family_label = str(context.get("family_label") or context.get("product_type_label") or "product").strip()
+        theme = str(context.get("theme") or "").strip()
+        subtitle = str(context.get("subtitle") or "").strip()
+        collection = str(context.get("collection") or "").strip()
+        occasion = str(context.get("occasion") or "").strip()
+        color_story = str(context.get("color_story") or "").strip()
+        audience = str(context.get("audience") or "").strip()
+        style_keywords = str(context.get("style_keywords") or "").strip()
+        artist_note = str(context.get("artist_note") or "").strip()
+        if subtitle:
+            details.append(f"<p>{subtitle}</p>")
+        details.append(f"<p>This {family_label.lower()} features the <strong>{context['artwork_title']}</strong> design for an easy, everyday statement.</p>")
+        metadata_signals = [signal for signal in (theme, collection, color_story) if signal]
+        if metadata_signals:
+            details.append(f"<p>Inspired by {', '.join(metadata_signals[:3])}.</p>")
+        bullet_rows: List[str] = []
+        if occasion:
+            bullet_rows.append(f"Great for {occasion}")
+        if audience:
+            bullet_rows.append(f"Made for {audience}")
+        if style_keywords:
+            bullet_rows.append(f"Style mood: {style_keywords}")
+        if bullet_rows:
+            details.append("<ul>" + "".join(f"<li>{row}</li>" for row in bullet_rows[:3]) + "</ul>")
+        if artist_note:
+            details.append(f"<p>Artist note: {artist_note}</p>")
+        return f"{generated}{''.join(details)}".strip()
 
     return template.description_pattern.format(
         **context,
