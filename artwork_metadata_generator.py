@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import pathlib
 import re
+from collections import Counter
 from enum import Enum
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
@@ -51,6 +52,7 @@ class GeneratedArtworkMetadataCandidate:
     generator: str
     rationale: str = ""
     source_signals: List[str] | None = None
+    debug_signals: Dict[str, Any] | None = None
 
 
 class MetadataGeneratorMode(str, Enum):
@@ -75,6 +77,8 @@ class VisionAnalyzer(Protocol):
 
 @dataclass
 class VisionAnalysis:
+    primary_subject: str = ""
+    secondary_subjects: List[str] | None = None
     subject: str = ""
     supporting_subjects: List[str] | None = None
     style_keywords: List[str] | None = None
@@ -84,6 +88,12 @@ class VisionAnalysis:
     buyer_appeal: List[str] | None = None
     confidence: float = 0.0
     rationale: str = ""
+
+    def resolved_subject(self) -> str:
+        return (self.primary_subject or self.subject).strip()
+
+    def resolved_supporting_subjects(self) -> List[str]:
+        return _dedupe((self.secondary_subjects or []) + (self.supporting_subjects or []))
 
 
 COLOR_NAMES: Sequence[Tuple[str, Tuple[int, int, int]]] = (
@@ -153,6 +163,134 @@ class NullVisionAnalyzer:
         return None
 
 
+class LocalVisionAnalyzer:
+    """
+    Lightweight local analyzer that infers likely subjects from filename and
+    visible design text. This keeps the analyzer fully local and dependency-free
+    while still providing structured, mockable vision signals.
+    """
+
+    name = "local_keyword_vision"
+
+    SUBJECT_SYNONYMS: Dict[str, Sequence[str]] = {
+        "lion": ("lion", "leo", "big-cat"),
+        "wolf": ("wolf", "wolves", "lupine"),
+        "tiger": ("tiger", "tigress"),
+        "bear": ("bear", "grizzly", "polar-bear"),
+        "eagle": ("eagle", "hawk", "falcon"),
+        "owl": ("owl",),
+        "fox": ("fox",),
+        "deer": ("deer", "stag"),
+        "horse": ("horse", "stallion"),
+        "dog": ("dog", "puppy", "canine"),
+        "cat": ("cat", "kitten", "feline"),
+        "mountain": ("mountain", "alpine"),
+        "forest": ("forest", "woods", "woodland"),
+        "ocean": ("ocean", "sea", "wave"),
+        "sunset": ("sunset",),
+        "skull": ("skull",),
+        "motorcycle": ("motorcycle", "bike", "biker"),
+        "car": ("car", "mustang", "muscle-car"),
+        "astronaut": ("astronaut", "space", "cosmonaut"),
+    }
+    STYLE_TOKENS = {
+        "retro": "retro",
+        "vintage": "vintage",
+        "grunge": "grunge",
+        "minimal": "minimal",
+        "minimalist": "minimal",
+        "boho": "boho",
+        "abstract": "abstract",
+        "line-art": "line art",
+        "cyberpunk": "cyberpunk",
+    }
+    MOOD_TOKENS = {
+        "happy": "bright",
+        "bright": "bright",
+        "sunny": "bright",
+        "neon": "dramatic",
+        "dramatic": "dramatic",
+        "dark": "moody",
+        "moody": "moody",
+        "calm": "balanced",
+        "serene": "balanced",
+    }
+    _TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
+
+    def analyze_image(self, image_path: pathlib.Path) -> Optional[VisionAnalysis]:
+        info = _analyze_image(image_path)
+        tokens = self._extract_tokens(image_path=image_path)
+        subject_hits = self._subject_hits(tokens)
+        if not subject_hits:
+            return None
+        ranked_subjects = [subject for subject, _ in subject_hits.most_common(3)]
+        primary_subject = ranked_subjects[0]
+        secondary_subjects = ranked_subjects[1:]
+        style_keywords = self._style_keywords(tokens)
+        mood = self._mood(tokens=tokens, fallback=info["mood"])
+        visible_text = self._extract_visible_text(tokens)
+        confidence = min(0.98, 0.55 + (0.16 * subject_hits[primary_subject]) + (0.04 * len(secondary_subjects)))
+        rationale = (
+            f"subject={primary_subject}; source=filename_or_text; matches={subject_hits[primary_subject]}; "
+            f"analyzer={self.name}; confidence={confidence:.2f}"
+        )
+        return VisionAnalysis(
+            primary_subject=primary_subject,
+            secondary_subjects=secondary_subjects,
+            style_keywords=_dedupe(style_keywords + ["subject-aware"]),
+            mood=mood,
+            palette=info["palette"],
+            visible_text=visible_text,
+            buyer_appeal=self._buyer_appeal(primary_subject),
+            confidence=confidence,
+            rationale=rationale,
+        )
+
+    def _extract_tokens(self, *, image_path: pathlib.Path) -> List[str]:
+        stem_tokens = self._TOKEN_PATTERN.findall(image_path.stem.lower())
+        sidecar = image_path.with_suffix(".json")
+        if not sidecar.exists():
+            return stem_tokens
+        try:
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        except Exception:
+            return stem_tokens
+        text_chunks = [payload.get("title", ""), payload.get("description", ""), " ".join(payload.get("tags", []))]
+        text_tokens = self._TOKEN_PATTERN.findall(" ".join(str(chunk) for chunk in text_chunks).lower())
+        return stem_tokens + text_tokens
+
+    def _subject_hits(self, tokens: Sequence[str]) -> Counter[str]:
+        hits: Counter[str] = Counter()
+        token_set = set(tokens)
+        for subject, synonyms in self.SUBJECT_SYNONYMS.items():
+            for token in synonyms:
+                if token in token_set:
+                    hits[subject] += 1
+        return hits
+
+    def _style_keywords(self, tokens: Sequence[str]) -> List[str]:
+        return _dedupe([label for token, label in self.STYLE_TOKENS.items() if token in set(tokens)])
+
+    def _mood(self, *, tokens: Sequence[str], fallback: str) -> str:
+        for token in tokens:
+            if token in self.MOOD_TOKENS:
+                return self.MOOD_TOKENS[token]
+        return fallback
+
+    def _extract_visible_text(self, tokens: Sequence[str]) -> List[str]:
+        meaningful = [token for token in tokens if len(token) >= 4 and token not in self.MOOD_TOKENS]
+        return _dedupe(meaningful[:2])
+
+    def _buyer_appeal(self, subject: str) -> List[str]:
+        mapping = {
+            "lion": ["wildlife", "majestic"],
+            "wolf": ["wild", "adventure"],
+            "motorcycle": ["adventure", "retro"],
+            "astronaut": ["sci-fi", "space"],
+        }
+        return mapping.get(subject, [subject])
+
+
 class VisionArtworkMetadataGenerator:
     """Subject-aware generator driven by an injectable vision analyzer."""
 
@@ -163,15 +301,15 @@ class VisionArtworkMetadataGenerator:
 
     def generate_metadata_for_artwork(self, image_path: pathlib.Path) -> GeneratedArtworkMetadataCandidate:
         analysis = self.analyzer.analyze_image(image_path)
-        if not analysis or not analysis.subject.strip():
+        if not analysis or not analysis.resolved_subject():
             raise RuntimeError("vision analyzer unavailable or did not return a subject")
 
-        subject = analysis.subject.strip()
+        subject = analysis.resolved_subject()
         style_keywords = _dedupe((analysis.style_keywords or []) + ["subject-aware"])
         mood = analysis.mood.strip().lower() or "balanced"
         palette = _dedupe(analysis.palette or [])
         visible_text = _dedupe(analysis.visible_text or [])
-        supporting_subjects = _dedupe(analysis.supporting_subjects or [])
+        supporting_subjects = analysis.resolved_supporting_subjects()
         buyer_appeal = _dedupe(analysis.buyer_appeal or [])
 
         title = _build_vision_title(subject=subject, mood=mood, style_keywords=style_keywords, visible_text=visible_text)
@@ -222,6 +360,11 @@ class VisionArtworkMetadataGenerator:
             rationale=analysis.rationale.strip()
             or f"subject={subject}; mood={mood}; analyzer={self.analyzer.name}; confidence={analysis.confidence:.2f}",
             source_signals=source_signals,
+            debug_signals={
+                "detected_subject": subject,
+                "visible_text": visible_text,
+                "confidence": round(float(analysis.confidence or 0.0), 3),
+            },
         )
 
 
@@ -287,6 +430,12 @@ def preview_generated_metadata(candidates: Sequence[GeneratedArtworkMetadataCand
         lines.append(f"    rationale: {candidate.rationale}")
         if candidate.source_signals:
             lines.append(f"    sources: {', '.join(candidate.source_signals)}")
+        if candidate.debug_signals:
+            if candidate.debug_signals.get("detected_subject"):
+                lines.append(f"    detected_subject: {candidate.debug_signals['detected_subject']}")
+            if candidate.debug_signals.get("visible_text"):
+                lines.append(f"    visible_text: {', '.join(candidate.debug_signals['visible_text'])}")
+            lines.append(f"    confidence: {candidate.debug_signals.get('confidence', 0):.3f}")
         lines.append(f"    title: {payload['title']}")
         if payload["subtitle"]:
             lines.append(f"    subtitle: {payload['subtitle']}")
@@ -308,7 +457,7 @@ def select_artwork_metadata_generator(
 ) -> ArtworkMetadataGenerator:
     normalized = (mode or MetadataGeneratorMode.HEURISTIC.value).strip().lower()
     heuristic = HeuristicArtworkMetadataGenerator()
-    vision = VisionArtworkMetadataGenerator(analyzer=vision_analyzer)
+    vision = VisionArtworkMetadataGenerator(analyzer=vision_analyzer or LocalVisionAnalyzer())
     if normalized == MetadataGeneratorMode.HEURISTIC.value:
         return heuristic
     if normalized == MetadataGeneratorMode.VISION.value:

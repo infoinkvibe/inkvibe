@@ -98,6 +98,7 @@ from printify_shopify_sync_pipeline import (
 from artwork_metadata_generator import (
     CompositeArtworkMetadataGenerator,
     HeuristicArtworkMetadataGenerator,
+    LocalVisionAnalyzer,
     MetadataGeneratorMode,
     VisionAnalysis,
     VisionArtworkMetadataGenerator,
@@ -685,8 +686,30 @@ def test_auto_metadata_generator_falls_back_to_heuristic(tmp_path: Path):
     assert candidate.metadata.title
 
 
+def test_vision_mode_uses_local_subject_detection_from_filename(tmp_path: Path):
+    image = tmp_path / "majestic-lion-retro.png"
+    Image.new("RGB", (600, 600), (140, 90, 55)).save(image)
+    generator = select_artwork_metadata_generator(mode=MetadataGeneratorMode.VISION.value)
+    candidate = generator.generate_metadata_for_artwork(image)
+    title = candidate.metadata.title.lower()
+    assert "lion" in title
+    assert candidate.generator.startswith("vision:")
+    assert "fallback" not in (candidate.source_signals or [])
+    assert "vision_subject" in (candidate.source_signals or [])
+
+
+def test_auto_mode_prefers_subject_aware_over_heuristic_when_detected(tmp_path: Path):
+    image = tmp_path / "wild-wolf-adventure-poster.png"
+    Image.new("RGB", (640, 480), (80, 80, 90)).save(image)
+    generator = select_artwork_metadata_generator(mode=MetadataGeneratorMode.AUTO.value)
+    candidate = generator.generate_metadata_for_artwork(image)
+    assert candidate.generator.startswith("auto:vision_subject")
+    assert "wolf" in candidate.metadata.title.lower()
+    assert "heuristic_palette" not in (candidate.source_signals or [])
+
+
 def test_metadata_preview_surfaces_generator_sources(tmp_path: Path, capsys):
-    image = tmp_path / "wolf.png"
+    image = tmp_path / "preview-fallback.png"
     Image.new("RGB", (640, 480), (70, 80, 95)).save(image)
     run_artwork_metadata_generation(
         image_dir=tmp_path,
@@ -701,6 +724,18 @@ def test_metadata_preview_surfaces_generator_sources(tmp_path: Path, capsys):
     out = capsys.readouterr().out
     assert "sources:" in out
     assert "heuristic_palette" in out
+
+
+def test_metadata_preview_surfaces_vision_debug_signals(tmp_path: Path, capsys):
+    image = tmp_path / "forest-lion-minimal.png"
+    Image.new("RGB", (640, 480), (130, 110, 90)).save(image)
+    generator = VisionArtworkMetadataGenerator(analyzer=LocalVisionAnalyzer())
+    candidate = generator.generate_metadata_for_artwork(image)
+    preview = preview_generated_metadata([candidate])
+    print(preview)
+    out = capsys.readouterr().out
+    assert "detected_subject: lion" in out
+    assert "confidence:" in out
 
 
 def test_vision_subject_titles_are_not_generic_palette_labels(tmp_path: Path):
