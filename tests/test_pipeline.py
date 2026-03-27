@@ -647,6 +647,26 @@ def test_fallback_title_generation_for_noisy_filename(tmp_path: Path):
     assert resolved.cleaned_display_title == "Retro Sunset Graphic Tee"
 
 
+def test_metadata_title_weak_phrase_uses_contextual_fallback(tmp_path: Path):
+    src = tmp_path / "8f6f45d4-c95f-4f68-9cf9-f022f5197a18.png"
+    Image.new("RGBA", (1000, 1000), (0, 0, 0, 255)).save(src)
+    art = Artwork(
+        slug="8f6f45d4-c95f-4f68-9cf9-f022f5197a18",
+        src_path=src,
+        title="",
+        description_html="",
+        tags=[],
+        image_width=1000,
+        image_height=1000,
+        metadata={"title": "Signature Product", "theme": "sunset palms"},
+    )
+    template = _template_for_variant_tests()
+    template.product_type_label = "Poster"
+    resolved = resolve_artwork_title(template, art)
+    assert resolved.title_source == "fallback"
+    assert resolved.cleaned_display_title == "Sunset Palms Poster"
+
+
 def test_noisy_filename_fallback_uses_slug_when_available(tmp_path: Path):
     src = tmp_path / "8f6f45d4-c95f-4f68-9cf9-f022f5197a18.png"
     Image.new("RGBA", (1000, 1000), (0, 0, 0, 255)).save(src)
@@ -679,6 +699,26 @@ def test_tag_merging_and_deduplication(tmp_path: Path):
     assert "boho" in tags
 
 
+def test_tag_generation_prioritizes_family_and_theme_over_generic(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    art.slug = "misty-forest-wolf"
+    art.metadata = {
+        "theme": "forest wolf",
+        "collection": "woodland stories",
+        "occasion": "birthday gifting",
+        "tags": ["forest wolf", "gift"],
+        "style_keywords": ["rustic"],
+    }
+    template = _template_for_variant_tests()
+    template.key = "poster_basic"
+    template.product_type_label = "Poster"
+    tags = _render_listing_tags(template, art)
+    assert "poster" in tags
+    assert any("forest" in tag or "wolf" in tag for tag in tags)
+    assert tags.count("printify") <= 1
+    assert len(tags) <= 20
+
+
 def test_preview_listing_copy_behavior(tmp_path: Path, capsys):
     art = _create_artwork(tmp_path, 1000, 1000)
     art.metadata = {"title": "Ocean Drift", "tags": ["coastal"]}
@@ -697,6 +737,52 @@ def test_render_description_generic_fallback(tmp_path: Path):
     description = render_product_description(template, art)
     assert "InkVibe" in description
     assert "expressive everyday style" in description
+
+
+def test_render_description_uses_rich_metadata_context(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    art.metadata = {
+        "title": "Neon Coyote",
+        "subtitle": "Night pulse wildlife scene.",
+        "theme": "neon desert",
+        "collection": "after dark",
+        "occasion": "holiday gifting",
+        "color_story": "electric cyan and magenta",
+        "artist_note": "Built from hand-sketched ink lines.",
+        "audience": "nightlife art fans",
+        "style_keywords": ["retro", "street"],
+    }
+    template = _template_for_variant_tests()
+    template.key = "hoodie_gildan"
+    template.description_pattern = "<p>{artwork_title}</p>"
+    description = render_product_description(template, art)
+    assert "Night pulse wildlife scene." in description
+    assert "Inspired by neon desert, after dark, electric cyan and magenta." in description
+    assert "Artist note: Built from hand-sketched ink lines." in description
+    assert "<ul>" in description
+
+
+def test_launch_plan_overrides_still_win_for_listing_copy(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    art.metadata = {
+        "title": "Sunrise Bloom",
+        "description": "Metadata description",
+        "tags": ["flower", "botanical"],
+    }
+    base = _template_for_variant_tests()
+    resolved = build_resolved_template(
+        base,
+        {
+            "title_override": "Launch Title",
+            "description_override": "<p>Launch Description</p>",
+            "tags_override": "launch,exclusive",
+        },
+    )
+    assert render_product_title(resolved, art) == "Launch Title"
+    assert render_product_description(resolved, art) == "<p>Launch Description</p>"
+    tags = _render_listing_tags(resolved, art)
+    assert "launch" in tags
+    assert "exclusive" in tags
 
 
 def test_curated_artwork_title_and_family_suffix(tmp_path: Path):
@@ -748,6 +834,35 @@ def test_listing_tags_include_family_brand_and_dedupe(tmp_path: Path):
     assert "inkvibe" in tags
     assert "poster" in tags
     assert tags.count("inkvibe") == 1
+
+
+def test_storefront_qa_strong_metadata_avoids_generic_copy_warnings(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    art.metadata = {
+        "title": "Golden Field Fox",
+        "description": "A fox in golden hour light.",
+        "theme": "golden field fox",
+        "collection": "wild trails",
+        "tags": ["fox", "golden field"],
+    }
+    template = _template_for_variant_tests()
+    template.key = "poster_basic"
+    title = render_product_title(template, art)
+    description = render_product_description(template, art)
+    tags = _render_listing_tags(template, art)
+    context = build_seo_context(template, art)
+    title_warnings, _ = validate_storefront_title(
+        title=title,
+        template=template,
+        artwork=art,
+        title_source=context.get("title_source", ""),
+        title_quality=context.get("title_quality", ""),
+    )
+    description_warnings, _ = validate_storefront_description(description_html=description, template=template, artwork=art)
+    tag_warnings, _ = validate_storefront_tags(tags=tags, template=template, artwork=art)
+    assert "title_bad_fallback" not in title_warnings
+    assert "description_generic_fallback_with_metadata" not in description_warnings
+    assert "tags_generic_only" not in tag_warnings
 
 
 def test_upload_strategy_summary_helper():
