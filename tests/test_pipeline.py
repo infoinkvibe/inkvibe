@@ -96,10 +96,15 @@ from printify_shopify_sync_pipeline import (
     _extract_numeric_shopify_id,
 )
 from artwork_metadata_generator import (
+    CompositeArtworkMetadataGenerator,
     HeuristicArtworkMetadataGenerator,
+    MetadataGeneratorMode,
+    VisionAnalysis,
+    VisionArtworkMetadataGenerator,
     should_write_sidecar,
     write_artwork_sidecar,
     preview_generated_metadata,
+    select_artwork_metadata_generator,
 )
 
 
@@ -111,6 +116,16 @@ class DummyPrintify:
 
     def upload_image(self, file_path):
         return {"id": "upload-1"}
+
+
+class StubVisionAnalyzer:
+    name = "stub_vision"
+
+    def __init__(self, analysis: VisionAnalysis | None):
+        self.analysis = analysis
+
+    def analyze_image(self, image_path: Path) -> VisionAnalysis | None:
+        return self.analysis
 
 
 def test_template_validation_rejects_missing_fields(tmp_path: Path):
@@ -615,6 +630,98 @@ def test_generated_artwork_metadata_overwrite_sidecars(tmp_path: Path):
         "occasion",
         "artist_note",
     }
+
+
+def test_metadata_generator_strategy_selection_modes():
+    heuristic = select_artwork_metadata_generator(mode=MetadataGeneratorMode.HEURISTIC.value)
+    assert isinstance(heuristic, HeuristicArtworkMetadataGenerator)
+
+    vision = select_artwork_metadata_generator(
+        mode=MetadataGeneratorMode.VISION.value,
+        vision_analyzer=StubVisionAnalyzer(
+            VisionAnalysis(subject="lion", mood="dramatic", style_keywords=["wildlife"], confidence=0.95),
+        ),
+    )
+    assert isinstance(vision, CompositeArtworkMetadataGenerator)
+
+    auto = select_artwork_metadata_generator(mode=MetadataGeneratorMode.AUTO.value)
+    assert isinstance(auto, CompositeArtworkMetadataGenerator)
+
+
+def test_vision_generator_supports_injected_analyzer(tmp_path: Path):
+    image = tmp_path / "lion.png"
+    Image.new("RGB", (512, 512), (120, 90, 60)).save(image)
+    generator = VisionArtworkMetadataGenerator(
+        analyzer=StubVisionAnalyzer(
+            VisionAnalysis(
+                subject="lion",
+                supporting_subjects=["savanna"],
+                style_keywords=["wildlife", "painterly"],
+                mood="dramatic",
+                palette=["gold", "umber"],
+                visible_text=[],
+                confidence=0.93,
+                rationale="subject detected: lion",
+            )
+        )
+    )
+    candidate = generator.generate_metadata_for_artwork(image)
+    payload = candidate.metadata.as_sidecar_dict()
+    assert "lion" in payload["title"].lower()
+    assert "lion" in " ".join(payload["tags"]).lower()
+    assert "vision_subject" in (candidate.source_signals or [])
+
+
+def test_auto_metadata_generator_falls_back_to_heuristic(tmp_path: Path):
+    image = tmp_path / "fallback.png"
+    Image.new("RGB", (500, 500), (25, 30, 70)).save(image)
+    generator = select_artwork_metadata_generator(
+        mode=MetadataGeneratorMode.AUTO.value,
+        vision_analyzer=StubVisionAnalyzer(None),
+    )
+    candidate = generator.generate_metadata_for_artwork(image)
+    assert candidate.generator.startswith("auto:")
+    assert "fallback" in (candidate.source_signals or [])
+    assert candidate.metadata.title
+
+
+def test_metadata_preview_surfaces_generator_sources(tmp_path: Path, capsys):
+    image = tmp_path / "wolf.png"
+    Image.new("RGB", (640, 480), (70, 80, 95)).save(image)
+    run_artwork_metadata_generation(
+        image_dir=tmp_path,
+        metadata_preview=True,
+        write_sidecars=False,
+        overwrite_sidecars=False,
+        metadata_only_missing=True,
+        metadata_max_artworks=0,
+        metadata_output_dir="",
+        metadata_generator=MetadataGeneratorMode.AUTO.value,
+    )
+    out = capsys.readouterr().out
+    assert "sources:" in out
+    assert "heuristic_palette" in out
+
+
+def test_vision_subject_titles_are_not_generic_palette_labels(tmp_path: Path):
+    image = tmp_path / "subject.png"
+    Image.new("RGB", (512, 512), (200, 120, 80)).save(image)
+    generator = VisionArtworkMetadataGenerator(
+        analyzer=StubVisionAnalyzer(
+            VisionAnalysis(
+                subject="retro motorcycle",
+                style_keywords=["retro", "coastal"],
+                mood="bright",
+                visible_text=["good vibes"],
+                confidence=0.88,
+            )
+        )
+    )
+    candidate = generator.generate_metadata_for_artwork(image)
+    title = candidate.metadata.title.lower()
+    assert "midnight atmosphere" not in title
+    assert "slate contrast" not in title
+    assert any(token in title for token in ["retro", "motorcycle", "good vibes"])
 
 
 def test_artwork_metadata_generator_helper_functions(tmp_path: Path):

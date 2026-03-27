@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import pathlib
 import re
+from enum import Enum
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
@@ -49,6 +50,13 @@ class GeneratedArtworkMetadataCandidate:
     metadata: GeneratedArtworkMetadata
     generator: str
     rationale: str = ""
+    source_signals: List[str] | None = None
+
+
+class MetadataGeneratorMode(str, Enum):
+    HEURISTIC = "heuristic"
+    VISION = "vision"
+    AUTO = "auto"
 
 
 class ArtworkMetadataGenerator(Protocol):
@@ -56,6 +64,26 @@ class ArtworkMetadataGenerator(Protocol):
 
     def generate_metadata_for_artwork(self, image_path: pathlib.Path) -> GeneratedArtworkMetadataCandidate:
         ...
+
+
+class VisionAnalyzer(Protocol):
+    name: str
+
+    def analyze_image(self, image_path: pathlib.Path) -> Optional["VisionAnalysis"]:
+        ...
+
+
+@dataclass
+class VisionAnalysis:
+    subject: str = ""
+    supporting_subjects: List[str] | None = None
+    style_keywords: List[str] | None = None
+    mood: str = ""
+    palette: List[str] | None = None
+    visible_text: List[str] | None = None
+    buyer_appeal: List[str] | None = None
+    confidence: float = 0.0
+    rationale: str = ""
 
 
 COLOR_NAMES: Sequence[Tuple[str, Tuple[int, int, int]]] = (
@@ -112,7 +140,111 @@ class HeuristicArtworkMetadataGenerator:
                 f"Palette={info['palette_name']} mood={info['mood']} contrast={info['contrast_bucket']} "
                 f"orientation={info['orientation']}"
             ),
+            source_signals=["heuristic_palette"],
         )
+
+
+class NullVisionAnalyzer:
+    """Default analyzer: signals that no vision backend is configured."""
+
+    name = "unconfigured_vision"
+
+    def analyze_image(self, image_path: pathlib.Path) -> Optional[VisionAnalysis]:
+        return None
+
+
+class VisionArtworkMetadataGenerator:
+    """Subject-aware generator driven by an injectable vision analyzer."""
+
+    name = "vision_subject"
+
+    def __init__(self, analyzer: Optional[VisionAnalyzer] = None):
+        self.analyzer = analyzer or NullVisionAnalyzer()
+
+    def generate_metadata_for_artwork(self, image_path: pathlib.Path) -> GeneratedArtworkMetadataCandidate:
+        analysis = self.analyzer.analyze_image(image_path)
+        if not analysis or not analysis.subject.strip():
+            raise RuntimeError("vision analyzer unavailable or did not return a subject")
+
+        subject = analysis.subject.strip()
+        style_keywords = _dedupe((analysis.style_keywords or []) + ["subject-aware"])
+        mood = analysis.mood.strip().lower() or "balanced"
+        palette = _dedupe(analysis.palette or [])
+        visible_text = _dedupe(analysis.visible_text or [])
+        supporting_subjects = _dedupe(analysis.supporting_subjects or [])
+        buyer_appeal = _dedupe(analysis.buyer_appeal or [])
+
+        title = _build_vision_title(subject=subject, mood=mood, style_keywords=style_keywords, visible_text=visible_text)
+        description = _build_vision_description(
+            title=title,
+            subject=subject,
+            supporting_subjects=supporting_subjects,
+            mood=mood,
+            style_keywords=style_keywords,
+            palette=palette,
+            buyer_appeal=buyer_appeal,
+            visible_text=visible_text,
+        )
+        tags = _build_vision_tags(
+            subject=subject,
+            supporting_subjects=supporting_subjects,
+            style_keywords=style_keywords,
+            mood=mood,
+            buyer_appeal=buyer_appeal,
+            visible_text=visible_text,
+        )
+        seo_keywords = _build_vision_seo_keywords(title=title, subject=subject, style_keywords=style_keywords, mood=mood)
+        theme = _build_vision_theme(subject=subject, mood=mood, style_keywords=style_keywords)
+
+        metadata = GeneratedArtworkMetadata(
+            title=title,
+            subtitle=_build_vision_subtitle(subject=subject, mood=mood),
+            description=description,
+            tags=tags,
+            seo_keywords=seo_keywords,
+            audience=_build_vision_audience(subject=subject, buyer_appeal=buyer_appeal),
+            style_keywords=style_keywords,
+            theme=theme,
+            collection=theme,
+            occasion="",
+            artist_note="Generated from subject-aware vision analysis and conservative style inference.",
+        )
+        source_signals = ["vision_subject"]
+        if visible_text:
+            source_signals.append("vision_text")
+        if analysis.rationale:
+            source_signals.append("vision_rationale")
+        return GeneratedArtworkMetadataCandidate(
+            image_path=image_path,
+            sidecar_path=image_path.with_suffix(".json"),
+            metadata=metadata,
+            generator=self.name,
+            rationale=analysis.rationale.strip()
+            or f"subject={subject}; mood={mood}; analyzer={self.analyzer.name}; confidence={analysis.confidence:.2f}",
+            source_signals=source_signals,
+        )
+
+
+class CompositeArtworkMetadataGenerator:
+    """Try primary generator first and fall back to heuristic metadata."""
+
+    def __init__(self, primary: ArtworkMetadataGenerator, fallback: ArtworkMetadataGenerator, *, name: str = "auto"):
+        self.name = name
+        self.primary = primary
+        self.fallback = fallback
+
+    def generate_metadata_for_artwork(self, image_path: pathlib.Path) -> GeneratedArtworkMetadataCandidate:
+        try:
+            candidate = self.primary.generate_metadata_for_artwork(image_path)
+            candidate.generator = f"{self.name}:{candidate.generator}"
+            return candidate
+        except Exception as exc:
+            fallback_candidate = self.fallback.generate_metadata_for_artwork(image_path)
+            fallback_candidate.generator = f"{self.name}:{fallback_candidate.generator}"
+            rationale = fallback_candidate.rationale
+            fallback_candidate.rationale = f"{rationale} | fallback_reason={type(exc).__name__}: {exc}"
+            fallback_candidate.source_signals = _dedupe((fallback_candidate.source_signals or []) + ["fallback"])
+            return fallback_candidate
 
 
 def discover_artwork_images(image_dir: pathlib.Path) -> List[pathlib.Path]:
@@ -153,6 +285,8 @@ def preview_generated_metadata(candidates: Sequence[GeneratedArtworkMetadataCand
         payload = candidate.metadata.as_sidecar_dict()
         lines.append(f"[{idx}] {candidate.image_path.name} -> {candidate.sidecar_path.name} ({candidate.generator})")
         lines.append(f"    rationale: {candidate.rationale}")
+        if candidate.source_signals:
+            lines.append(f"    sources: {', '.join(candidate.source_signals)}")
         lines.append(f"    title: {payload['title']}")
         if payload["subtitle"]:
             lines.append(f"    subtitle: {payload['subtitle']}")
@@ -165,6 +299,23 @@ def preview_generated_metadata(candidates: Sequence[GeneratedArtworkMetadataCand
         if payload["occasion"]:
             lines.append(f"    occasion: {payload['occasion']}")
     return "\n".join(lines)
+
+
+def select_artwork_metadata_generator(
+    *,
+    mode: str = MetadataGeneratorMode.HEURISTIC.value,
+    vision_analyzer: Optional[VisionAnalyzer] = None,
+) -> ArtworkMetadataGenerator:
+    normalized = (mode or MetadataGeneratorMode.HEURISTIC.value).strip().lower()
+    heuristic = HeuristicArtworkMetadataGenerator()
+    vision = VisionArtworkMetadataGenerator(analyzer=vision_analyzer)
+    if normalized == MetadataGeneratorMode.HEURISTIC.value:
+        return heuristic
+    if normalized == MetadataGeneratorMode.VISION.value:
+        return CompositeArtworkMetadataGenerator(primary=vision, fallback=heuristic, name=MetadataGeneratorMode.VISION.value)
+    if normalized == MetadataGeneratorMode.AUTO.value:
+        return CompositeArtworkMetadataGenerator(primary=vision, fallback=heuristic, name=MetadataGeneratorMode.AUTO.value)
+    raise ValueError(f"unsupported metadata generator mode: {mode}")
 
 
 def _resolve_sidecar_path(image_path: pathlib.Path, output_dir: Optional[pathlib.Path]) -> pathlib.Path:
@@ -317,6 +468,109 @@ def _build_artist_note(info: Dict[str, Any]) -> str:
         f"Generated from visual analysis of color balance, contrast, and composition. "
         f"Primary palette signal: {info['palette_name']}."
     )
+
+
+def _build_vision_title(
+    *,
+    subject: str,
+    mood: str,
+    style_keywords: Sequence[str],
+    visible_text: Sequence[str],
+) -> str:
+    canonical_subject = _title_case_phrase(subject)
+    if visible_text:
+        txt = visible_text[0][:36]
+        return _title_case_phrase(f"{canonical_subject} · {txt}")
+    if "retro" in {token.lower() for token in style_keywords}:
+        return f"Retro {canonical_subject}"
+    if mood == "moody":
+        return f"{canonical_subject} After Dark"
+    if mood == "bright":
+        return f"{canonical_subject} in Color"
+    return canonical_subject
+
+
+def _build_vision_subtitle(*, subject: str, mood: str) -> str:
+    if mood == "bright":
+        return f"Subject-led art with vibrant energy around {subject.lower()}."
+    if mood == "moody":
+        return f"Atmospheric composition centered on {subject.lower()}."
+    return f"Subject-forward artwork featuring {subject.lower()}."
+
+
+def _build_vision_description(
+    *,
+    title: str,
+    subject: str,
+    supporting_subjects: Sequence[str],
+    mood: str,
+    style_keywords: Sequence[str],
+    palette: Sequence[str],
+    buyer_appeal: Sequence[str],
+    visible_text: Sequence[str],
+) -> str:
+    style = ", ".join(style_keywords[:2]) if style_keywords else "illustrative"
+    palette_text = ", ".join(palette[:3]).lower() if palette else "balanced tones"
+    support = ""
+    if supporting_subjects:
+        support = f" Supporting elements include {', '.join(supporting_subjects[:2]).lower()}."
+    text_note = ""
+    if visible_text:
+        text_note = f" Visible design text is used selectively: \"{visible_text[0][:30]}\"."
+    appeal = ""
+    if buyer_appeal:
+        appeal = f" Great for shoppers looking for {', '.join(buyer_appeal[:2]).lower()} themes."
+    return (
+        f"{title} focuses on {subject.lower()} with a {mood or 'balanced'} mood and {style} styling. "
+        f"The color story leans on {palette_text}.{support}{text_note}{appeal}"
+    ).strip()
+
+
+def _build_vision_tags(
+    *,
+    subject: str,
+    supporting_subjects: Sequence[str],
+    style_keywords: Sequence[str],
+    mood: str,
+    buyer_appeal: Sequence[str],
+    visible_text: Sequence[str],
+) -> List[str]:
+    tags = ["wall art", "digital artwork", subject.lower(), f"{subject.lower()} art", mood, "subject-aware"]
+    tags.extend(item.lower() for item in supporting_subjects[:3])
+    tags.extend(item.lower() for item in style_keywords[:3])
+    tags.extend(item.lower() for item in buyer_appeal[:3])
+    if visible_text:
+        tags.append(visible_text[0][:24].lower())
+    return _dedupe(tags)
+
+
+def _build_vision_seo_keywords(*, title: str, subject: str, style_keywords: Sequence[str], mood: str) -> List[str]:
+    style = style_keywords[0].lower() if style_keywords else "modern"
+    return _dedupe(
+        [
+            f"{subject.lower()} wall art",
+            f"{style} {subject.lower()} print",
+            f"{mood} {subject.lower()} decor",
+            title.lower(),
+            "subject aware artwork",
+        ]
+    )
+
+
+def _build_vision_theme(*, subject: str, mood: str, style_keywords: Sequence[str]) -> str:
+    style = _title_case_phrase(style_keywords[0]) if style_keywords else "Contemporary"
+    mood_prefix = _title_case_phrase(mood or "balanced")
+    return f"{mood_prefix} {style} { _title_case_phrase(subject)}".strip()
+
+
+def _build_vision_audience(*, subject: str, buyer_appeal: Sequence[str]) -> str:
+    if buyer_appeal:
+        return f"Fans of {', '.join(buyer_appeal[:2]).lower()} aesthetics"
+    return f"{subject.lower()} and nature-inspired art shoppers"
+
+
+def _title_case_phrase(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip()).title()
 
 
 def _dedupe(values: Sequence[str]) -> List[str]:
