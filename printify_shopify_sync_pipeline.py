@@ -25,6 +25,13 @@ from PIL import Image, ImageOps
 from r2_uploader import R2Config, build_r2_public_url, load_r2_config_from_env, upload_file_to_r2
 import content_engine
 import state_store
+from artwork_metadata_generator import (
+    HeuristicArtworkMetadataGenerator,
+    discover_artwork_images,
+    preview_generated_metadata,
+    should_write_sidecar,
+    write_artwork_sidecar,
+)
 
 load_dotenv()
 
@@ -2142,6 +2149,56 @@ def discover_artworks(image_dir: pathlib.Path) -> List[Artwork]:
         )
 
     return artworks
+
+
+def run_artwork_metadata_generation(
+    *,
+    image_dir: pathlib.Path,
+    metadata_preview: bool,
+    write_sidecars: bool,
+    overwrite_sidecars: bool,
+    metadata_only_missing: bool,
+    metadata_max_artworks: int,
+    metadata_output_dir: str,
+) -> None:
+    generator = HeuristicArtworkMetadataGenerator()
+    artwork_paths = discover_artwork_images(image_dir)
+    if metadata_max_artworks > 0:
+        artwork_paths = artwork_paths[:metadata_max_artworks]
+    output_dir = pathlib.Path(metadata_output_dir) if metadata_output_dir else None
+
+    candidates = [generator.generate_metadata_for_artwork(path) for path in artwork_paths]
+    if metadata_preview or not write_sidecars:
+        preview_text = preview_generated_metadata(candidates)
+        if preview_text:
+            print(preview_text)
+        logger.info("Artwork metadata preview generated artworks=%s", len(candidates))
+
+    if not write_sidecars:
+        return
+
+    write_count = 0
+    skipped_count = 0
+    for candidate in candidates:
+        target_sidecar = candidate.sidecar_path if not output_dir else (output_dir / f"{candidate.image_path.stem}.json")
+        if not should_write_sidecar(
+            target_sidecar,
+            overwrite_sidecars=overwrite_sidecars,
+            only_missing=metadata_only_missing and not overwrite_sidecars,
+        ):
+            skipped_count += 1
+            continue
+        write_artwork_sidecar(candidate=candidate, output_dir=output_dir)
+        write_count += 1
+
+    logger.info(
+        "Artwork metadata generation complete generated=%s written=%s skipped=%s overwrite=%s only_missing=%s",
+        len(candidates),
+        write_count,
+        skipped_count,
+        overwrite_sidecars,
+        metadata_only_missing and not overwrite_sidecars,
+    )
 
 
 def validate_artwork_for_placement(artwork: Artwork, placement: PlacementRequirement) -> Tuple[bool, str]:
@@ -4539,6 +4596,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--export-failure-report", default="", help="Optional CSV export path for failed combinations")
     parser.add_argument("--export-run-report", default="", help="Optional CSV export path for all processed combinations")
     parser.add_argument("--preview-listing-copy", action="store_true", help="Render listing title/description/tags previews without creating/updating products")
+    parser.add_argument("--generate-artwork-metadata", action="store_true", help="Generate reviewable artwork sidecar metadata from local image analysis")
+    parser.add_argument("--metadata-preview", action="store_true", help="Preview generated artwork metadata in stdout")
+    parser.add_argument("--write-sidecars", action="store_true", help="Write generated artwork sidecar JSON files")
+    parser.add_argument("--overwrite-sidecars", action="store_true", help="Allow generated metadata to overwrite existing sidecars")
+    parser.add_argument("--metadata-max-artworks", type=int, default=0, help="Limit number of artworks processed for metadata generation (0 = no limit)")
+    parser.add_argument("--metadata-output-dir", default="", help="Optional output directory for generated sidecars; defaults beside images")
+    parser.add_argument("--metadata-only-missing", action="store_true", default=True, help="Write only missing sidecars (default safe behavior)")
     parser.add_argument("--launch-plan", default="", help="Optional CSV launch plan path; when set, process enabled rows instead of folder-scan combinations")
     parser.add_argument("--export-launch-plan-template", default="", help="Write a starter launch-plan CSV template to this path and exit")
     parser.add_argument("--export-launch-plan-from-images", default="", help="Write a launch-plan CSV generated from files in --image-dir and exit")
@@ -4752,13 +4816,25 @@ def run_catalog_cli(
     return False
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "") -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "") -> None:
     if publish_mode not in {"default", "publish", "skip"}:
         raise RuntimeError(f"Unsupported publish mode: {publish_mode}")
 
     if export_launch_plan_template:
         write_launch_plan_template(pathlib.Path(export_launch_plan_template))
         logger.info("Launch-plan CSV template exported path=%s", export_launch_plan_template)
+        return
+
+    if generate_artwork_metadata:
+        run_artwork_metadata_generation(
+            image_dir=image_dir,
+            metadata_preview=metadata_preview,
+            write_sidecars=write_sidecars,
+            overwrite_sidecars=overwrite_sidecars,
+            metadata_only_missing=metadata_only_missing,
+            metadata_max_artworks=metadata_max_artworks,
+            metadata_output_dir=metadata_output_dir,
+        )
         return
 
     state = ensure_state_shape(load_json(state_path, {}))
@@ -5117,6 +5193,13 @@ if __name__ == "__main__":
             export_failure_report=args.export_failure_report,
             export_run_report=args.export_run_report,
             preview_listing_copy_only=args.preview_listing_copy,
+            generate_artwork_metadata=args.generate_artwork_metadata,
+            metadata_preview=args.metadata_preview,
+            write_sidecars=args.write_sidecars,
+            overwrite_sidecars=args.overwrite_sidecars,
+            metadata_max_artworks=args.metadata_max_artworks,
+            metadata_output_dir=args.metadata_output_dir,
+            metadata_only_missing=args.metadata_only_missing,
             launch_plan_path=args.launch_plan,
             export_launch_plan_template=args.export_launch_plan_template,
             export_launch_plan_from_images_path=args.export_launch_plan_from_images,

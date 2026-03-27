@@ -491,10 +491,49 @@ Behavior:
 - If sidecar metadata exists, listing copy prefers metadata values.
 - If metadata is missing, filename-based behavior remains in place.
 - Low-quality filename stems (UUID/hash/noisy strings) now trigger safer fallback titles.
+- Launch-plan row overrides still take precedence over sidecar metadata during listing rendering.
 
 Example sidecar files:
 - `examples/tee-artwork.sidecar.example.json`
 - `examples/mug-artwork.sidecar.example.json`
+
+### Reviewable artwork metadata generation workflow
+
+Use the metadata generator to create candidate sidecars from local image analysis (color palette, contrast, composition cues) without changing create/update/publish flows.
+
+Safe defaults:
+- `--generate-artwork-metadata` with `--metadata-preview` previews only (no writes).
+- `--write-sidecars` writes generated sidecars.
+- Existing sidecars are preserved by default (`--metadata-only-missing` safe mode).
+- `--overwrite-sidecars` is required to replace existing sidecars.
+
+Common commands:
+
+```bash
+# Preview candidate metadata only (no file writes)
+python printify_shopify_sync_pipeline.py \
+  --generate-artwork-metadata \
+  --metadata-preview \
+  --image-dir ./images
+
+# Write sidecars for images missing .json files
+python printify_shopify_sync_pipeline.py \
+  --generate-artwork-metadata \
+  --write-sidecars \
+  --metadata-max-artworks 20 \
+  --image-dir ./images
+
+# Explicitly overwrite existing sidecars (opt-in only)
+python printify_shopify_sync_pipeline.py \
+  --generate-artwork-metadata \
+  --write-sidecars \
+  --overwrite-sidecars \
+  --image-dir ./images
+```
+
+Optional controls:
+- `--metadata-max-artworks <n>` limit batch size.
+- `--metadata-output-dir <path>` write generated sidecars to a review folder instead of beside source images.
 
 Preview listing copy without creating/updating products:
 

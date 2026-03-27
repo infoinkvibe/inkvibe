@@ -91,8 +91,15 @@ from printify_shopify_sync_pipeline import (
     validate_storefront_mockups,
     build_storefront_qa_row,
     run_storefront_qa,
+    run_artwork_metadata_generation,
     sync_shopify_collection,
     _extract_numeric_shopify_id,
+)
+from artwork_metadata_generator import (
+    HeuristicArtworkMetadataGenerator,
+    should_write_sidecar,
+    write_artwork_sidecar,
+    preview_generated_metadata,
 )
 
 
@@ -531,6 +538,100 @@ def test_sidecar_metadata_loading(tmp_path: Path):
     assert metadata["title"] == "Aurora Bloom"
     assert metadata["tags"] == ["Floral", "Spring"]
     assert metadata["seo_keywords"] == ["gift", "botanical"]
+
+
+def test_generated_artwork_metadata_preview_does_not_write(tmp_path: Path, capsys):
+    image = tmp_path / "sample.png"
+    Image.new("RGB", (640, 480), (230, 160, 90)).save(image)
+
+    run_artwork_metadata_generation(
+        image_dir=tmp_path,
+        metadata_preview=True,
+        write_sidecars=False,
+        overwrite_sidecars=False,
+        metadata_only_missing=True,
+        metadata_max_artworks=0,
+        metadata_output_dir="",
+    )
+
+    out = capsys.readouterr().out
+    assert "sample.png" in out
+    assert not image.with_suffix(".json").exists()
+
+
+def test_generated_artwork_metadata_write_only_missing(tmp_path: Path):
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    Image.new("RGB", (600, 600), (220, 180, 140)).save(first)
+    Image.new("RGB", (600, 600), (40, 60, 100)).save(second)
+    preserved = {"title": "Manual Title", "description": "Keep me", "tags": ["manual"]}
+    second.with_suffix(".json").write_text(json.dumps(preserved), encoding="utf-8")
+
+    run_artwork_metadata_generation(
+        image_dir=tmp_path,
+        metadata_preview=False,
+        write_sidecars=True,
+        overwrite_sidecars=False,
+        metadata_only_missing=True,
+        metadata_max_artworks=0,
+        metadata_output_dir="",
+    )
+
+    generated_payload = json.loads(first.with_suffix(".json").read_text(encoding="utf-8"))
+    preserved_payload = json.loads(second.with_suffix(".json").read_text(encoding="utf-8"))
+    assert generated_payload["title"]
+    assert generated_payload["title"].lower().startswith(("amber", "gold", "crimson", "ivory", "rose", "slate", "teal", "azure", "violet", "emerald", "midnight", "charcoal"))
+    assert preserved_payload == preserved
+
+
+def test_generated_artwork_metadata_overwrite_sidecars(tmp_path: Path):
+    image = tmp_path / "override.png"
+    sidecar = image.with_suffix(".json")
+    Image.new("RGB", (500, 700), (35, 48, 75)).save(image)
+    sidecar.write_text(json.dumps({"title": "Manual Keep"}), encoding="utf-8")
+
+    run_artwork_metadata_generation(
+        image_dir=tmp_path,
+        metadata_preview=False,
+        write_sidecars=True,
+        overwrite_sidecars=True,
+        metadata_only_missing=True,
+        metadata_max_artworks=0,
+        metadata_output_dir="",
+    )
+
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert payload["title"] != "Manual Keep"
+    assert set(payload.keys()) == {
+        "title",
+        "subtitle",
+        "description",
+        "tags",
+        "seo_keywords",
+        "audience",
+        "style_keywords",
+        "theme",
+        "collection",
+        "occasion",
+        "artist_note",
+    }
+
+
+def test_artwork_metadata_generator_helper_functions(tmp_path: Path):
+    image = tmp_path / "helper.png"
+    Image.new("RGB", (512, 512), (120, 200, 180)).save(image)
+    generator = HeuristicArtworkMetadataGenerator()
+    candidate = generator.generate_metadata_for_artwork(image)
+
+    assert should_write_sidecar(image.with_suffix(".json"), overwrite_sidecars=False, only_missing=True) is True
+    target = write_artwork_sidecar(candidate=candidate)
+    assert target.exists()
+    assert should_write_sidecar(target, overwrite_sidecars=False, only_missing=True) is False
+    assert should_write_sidecar(target, overwrite_sidecars=True, only_missing=True) is True
+
+    preview = preview_generated_metadata([candidate])
+    assert "helper.png" in preview
+    assert "title:" in preview
 
 
 def test_artwork_metadata_map_loading_and_resolution(tmp_path: Path):
