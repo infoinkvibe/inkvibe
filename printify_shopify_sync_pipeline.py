@@ -620,6 +620,138 @@ def _split_keywords(value: Any) -> List[str]:
     return [str(row).strip() for row in rows if str(row).strip()]
 
 
+TAG_GENERIC_TOKENS = {"print-on-demand", "printify", "style", "design", "artwork", "product", "gift idea"}
+THEME_GENERIC_TERMS = {
+    "art",
+    "artwork",
+    "design",
+    "style",
+    "aesthetic",
+    "vibe",
+    "theme",
+    "gift idea",
+    "decor",
+    "collection",
+}
+THEME_SIGNAL_KEYWORDS = {
+    "abstract",
+    "animal",
+    "beach",
+    "boho",
+    "botanical",
+    "coastal",
+    "culture",
+    "desert",
+    "floral",
+    "forest",
+    "landscape",
+    "mountain",
+    "nature",
+    "neon",
+    "patriotic",
+    "portrait",
+    "retro",
+    "rustic",
+    "snow",
+    "street",
+    "summer",
+    "surf",
+    "tropical",
+    "vintage",
+    "wildlife",
+    "woodland",
+}
+
+
+def normalize_theme_tag(value: Any) -> str:
+    cleaned = str(value or "").strip().lower()
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"[|_]", " ", cleaned)
+    cleaned = re.sub(r"[^a-z0-9&' +/\-]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -")
+    if not cleaned:
+        return ""
+    tokens = [token for token in re.findall(r"[a-z0-9&']+", cleaned) if token]
+    if not tokens:
+        return ""
+    if len(tokens) == 1 and tokens[0] in THEME_GENERIC_TERMS:
+        return ""
+    if len(tokens) > 5:
+        tokens = tokens[:5]
+    candidate = " ".join(tokens).strip()
+    if candidate in THEME_GENERIC_TERMS or len(candidate) > 32:
+        return ""
+    return candidate
+
+
+def extract_theme_signal_candidates(*, artwork: Artwork, context: Dict[str, str], template: ProductTemplate) -> List[str]:
+    metadata = artwork.metadata or {}
+    raw_candidates: List[Any] = [
+        metadata.get("theme"),
+        metadata.get("subtitle"),
+        metadata.get("occasion"),
+        metadata.get("collection"),
+        metadata.get("color_story"),
+        *_split_keywords(metadata.get("style_keywords")),
+        *_split_keywords(metadata.get("seo_keywords")),
+        *template.style_keywords,
+    ]
+    subject_tokens = [token for token in re.findall(r"[a-z0-9]+", str(metadata.get("title") or context.get("artwork_title") or artwork.slug).lower()) if len(token) >= 4]
+    env_source = " ".join(str(row or "") for row in raw_candidates)
+    env_tokens = [token for token in re.findall(r"[a-z0-9]+", env_source.lower()) if len(token) >= 4]
+    if subject_tokens and env_tokens:
+        subject = subject_tokens[0]
+        if any(token in {"mountain", "snow", "forest", "beach", "desert"} for token in env_tokens):
+            raw_candidates.append(f"{env_tokens[0]} {subject}")
+        elif any(token in {"portrait", "wildlife", "nature"} for token in env_tokens):
+            raw_candidates.append(f"{env_tokens[0]} art")
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for raw in raw_candidates:
+        candidate = normalize_theme_tag(raw)
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        normalized.append(candidate)
+    return normalized
+
+
+def choose_best_theme_signal(*, candidates: List[str], existing_tags: List[str]) -> str:
+    if not candidates:
+        return ""
+    existing = {normalize_theme_tag(tag) for tag in existing_tags if normalize_theme_tag(tag)}
+
+    def _score(candidate: str) -> Tuple[int, int, int]:
+        tokens = re.findall(r"[a-z0-9]+", candidate)
+        keyword_hits = sum(1 for token in tokens if token in THEME_SIGNAL_KEYWORDS)
+        specificity = min(len(tokens), 4)
+        brevity_bonus = 2 if len(tokens) <= 3 else 0
+        return (keyword_hits, specificity + brevity_bonus, -len(candidate))
+
+    ranked = sorted(candidates, key=_score, reverse=True)
+    for candidate in ranked:
+        if candidate not in existing:
+            return candidate
+    return ""
+
+
+def _tags_contain_theme_signal(*, tags: Iterable[str], artwork: Artwork, template: ProductTemplate) -> bool:
+    context = build_seo_context(template, artwork)
+    candidates = set(extract_theme_signal_candidates(artwork=artwork, context=context, template=template))
+    normalized_tags = {normalize_theme_tag(tag) for tag in tags if normalize_theme_tag(tag)}
+    if candidates.intersection(normalized_tags):
+        return True
+    artwork_tokens = {token for token in re.findall(r"[a-z0-9]+", artwork.slug.lower()) if len(token) >= 4}
+    for tag in normalized_tags:
+        tag_tokens = {token for token in re.findall(r"[a-z0-9]+", tag) if len(token) >= 4}
+        if tag_tokens.intersection(THEME_SIGNAL_KEYWORDS):
+            return True
+        if len(tag_tokens) >= 2 and artwork_tokens.intersection(tag_tokens):
+            return True
+    return False
+
+
 def load_artwork_metadata(sidecar_path: pathlib.Path) -> Dict[str, Any]:
     if not sidecar_path.exists() or not sidecar_path.is_file():
         return {}
@@ -1197,20 +1329,16 @@ def _render_listing_tags(template: ProductTemplate, artwork: Artwork) -> List[st
     bucket_order = [subject_bucket, theme_style_bucket, family_bucket, optional_bucket]
     tags: List[str] = []
     seen: set[str] = set()
-    generic_tokens = {"print-on-demand", "printify", "style", "design", "artwork", "product", "gift idea"}
+    max_tags = 14
 
     def _push_tag(raw: Any, *, allow_generic: bool = False) -> None:
         nonlocal tags
-        cleaned = str(raw).strip().lower()
+        cleaned = normalize_theme_tag(raw)
         if not cleaned:
-            return
-        cleaned = re.sub(r"\s+", " ", cleaned)
-        cleaned = re.sub(r"[^a-z0-9&' +/\-]", "", cleaned).strip()
-        if not cleaned or len(cleaned) > 32:
             return
         if cleaned in seen:
             return
-        if not allow_generic and cleaned in generic_tokens:
+        if not allow_generic and cleaned in TAG_GENERIC_TOKENS:
             return
         seen.add(cleaned)
         tags.append(cleaned)
@@ -1218,30 +1346,43 @@ def _render_listing_tags(template: ProductTemplate, artwork: Artwork) -> List[st
     for bucket in bucket_order:
         for row in bucket:
             _push_tag(row)
-            if len(tags) >= 14:
+            if len(tags) >= max_tags:
                 break
-        if len(tags) >= 14:
+        if len(tags) >= max_tags:
             break
 
     subject_signals = [metadata.get("title"), metadata.get("theme"), context.get("artwork_title"), artwork.slug]
     if not any(any(token in tag for token in re.findall(r"[a-z0-9]{4,}", str(signal).lower())) for signal in subject_signals for tag in tags):
         for signal in subject_signals:
-            if len(tags) >= 14:
+            if len(tags) >= max_tags:
                 break
             _push_tag(signal)
-
-    theme_signals = [metadata.get("theme"), metadata.get("subtitle"), metadata.get("collection"), metadata.get("color_story"), *_split_keywords(metadata.get("style_keywords"))]
-    if not any(str(signal).strip().lower() in tags for signal in theme_signals if str(signal).strip()):
-        for signal in theme_signals:
-            if len(tags) >= 14:
-                break
-            _push_tag(signal)
+    theme_candidates = extract_theme_signal_candidates(artwork=artwork, context=context, template=template)
+    if not _tags_contain_theme_signal(tags=tags, artwork=artwork, template=template):
+        selected_theme = choose_best_theme_signal(candidates=theme_candidates, existing_tags=tags)
+        if selected_theme:
+            if len(tags) >= max_tags:
+                protected = set(content_engine.family_tags(template))
+                protected.update(
+                    {
+                        token
+                        for signal in subject_signals
+                        for token in [normalize_theme_tag(signal)]
+                        if token
+                    }
+                )
+                evictable = [tag for tag in tags if tag not in protected and (tag in TAG_GENERIC_TOKENS or tag in {"inkvibe", "gift", "gift idea"})]
+                if evictable:
+                    drop = evictable[0]
+                    tags = [tag for tag in tags if tag != drop]
+                    seen.discard(drop)
+            _push_tag(selected_theme, allow_generic=True)
 
     required = set(content_engine.family_tags(template))
     if required and not required.intersection(set(tags)):
         for tag in content_engine.family_tags(template):
             _push_tag(tag, allow_generic=True)
-            if len(tags) >= 14:
+            if len(tags) >= max_tags:
                 break
     if len(tags) < 8:
         for row in optional_bucket:
@@ -3913,8 +4054,7 @@ def validate_storefront_tags(*, tags: List[str], template: ProductTemplate, artw
     family_tags = set(content_engine.family_tags(template))
     if family_tags and not family_tags.intersection(deduped):
         warnings.append("tags_missing_family_signal")
-    artwork_terms = {token for token in re.findall(r"[a-z0-9]+", artwork.slug.lower()) if len(token) >= 4}
-    if artwork_terms and not any(any(term in tag for term in artwork_terms) for tag in deduped):
+    if not _tags_contain_theme_signal(tags=deduped, artwork=artwork, template=template):
         warnings.append("tags_missing_artwork_theme_signal")
     return warnings, errors
 
