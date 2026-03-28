@@ -96,6 +96,9 @@ from printify_shopify_sync_pipeline import (
     sync_shopify_collection,
     _extract_numeric_shopify_id,
     PromptArtworkGenerationResult,
+    normalize_theme_tag,
+    extract_theme_signal_candidates,
+    choose_best_theme_signal,
 )
 from artwork_metadata_generator import (
     CompositeArtworkMetadataGenerator,
@@ -1392,6 +1395,70 @@ def test_storefront_qa_strong_metadata_avoids_generic_copy_warnings(tmp_path: Pa
     assert "tags_generic_only" not in tag_warnings
     assert "tag_count_high" not in tag_warnings
     assert "tags_missing_artwork_theme_signal" not in tag_warnings
+
+
+def test_theme_signal_candidates_normalize_and_dedupe(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    art.metadata = {
+        "theme": " Tropical   Surf!! Lifestyle ",
+        "style_keywords": ["surf culture", "surf culture", "retro"],
+        "seo_keywords": ["summer vibe", "art"],
+        "occasion": "beach party",
+    }
+    template = _template_for_variant_tests()
+    context = build_seo_context(template, art)
+    candidates = extract_theme_signal_candidates(artwork=art, context=context, template=template)
+    assert "tropical surf lifestyle" in candidates
+    assert candidates.count("surf culture") == 1
+    assert "art" not in candidates
+
+
+def test_choose_best_theme_signal_prefers_specific_searchable_phrase():
+    selected = choose_best_theme_signal(
+        candidates=["design", "summer vibe", "wildlife portrait", "nature"],
+        existing_tags=["fox", "poster"],
+    )
+    assert selected == "wildlife portrait"
+
+
+def test_normalize_theme_tag_rejects_generic_filler():
+    assert normalize_theme_tag("style") == ""
+    assert normalize_theme_tag("Gift Idea") == ""
+    assert normalize_theme_tag("  Mountain  Landscape!! ") == "mountain landscape"
+
+
+def test_theme_signal_injected_without_bloating_tag_count(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    art.slug = "lion-portrait"
+    art.metadata = {
+        "title": "Lion Portrait",
+        "theme": "wildlife portrait",
+        "tags": ["lion", "animal", "wall art", "decor", "gift", "inkvibe"],
+    }
+    template = _template_for_variant_tests()
+    template.tags = ["design", "artwork", "style", "printify"]
+    tags = _render_listing_tags(template, art)
+    warnings, _ = validate_storefront_tags(tags=tags, template=template, artwork=art)
+    assert len(tags) <= 14
+    assert any(tag in {"wildlife portrait", "animal art"} for tag in tags)
+    assert "tags_missing_artwork_theme_signal" not in warnings
+
+
+def test_storefront_tag_qa_accepts_contextual_theme_phrases(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    art.slug = "skeleton-surf-beach"
+    art.metadata = {
+        "title": "Skeleton Surfer",
+        "theme": "tropical surf",
+        "style_keywords": ["surf culture", "summer vibe"],
+    }
+    template = _template_for_variant_tests()
+    warnings, _ = validate_storefront_tags(
+        tags=["skeleton surfer", "tropical surf", "surf culture", "poster"],
+        template=template,
+        artwork=art,
+    )
+    assert "tags_missing_artwork_theme_signal" not in warnings
 
 
 def test_upload_strategy_summary_helper():
