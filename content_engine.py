@@ -172,6 +172,11 @@ _FAMILY_CONFIG: Dict[str, Dict[str, Any]] = {
         "tags": ["long sleeve shirt", "gift idea", "graphic apparel", "wearable art"],
         "description_closing": "A clean layer made for everyday style and standout detail.",
     },
+    "tshirt": {
+        "suffix": "T-Shirt",
+        "tags": ["t-shirt", "tee", "short sleeve tee", "gift idea", "graphic apparel"],
+        "description_closing": "An easy everyday tee with comfortable feel and standout artwork.",
+    },
     "tote": {
         "suffix": "Tote Bag",
         "tags": ["tote bag", "gift idea", "everyday carry"],
@@ -205,6 +210,8 @@ def infer_product_family(template: Any) -> str:
     ).lower()
     if "longsleeve" in hint or "long sleeve" in hint:
         return "long_sleeve"
+    if "tshirt" in hint or "t-shirt" in hint or " tee" in hint:
+        return "tshirt"
     if "hoodie" in hint:
         return "hoodie"
     if "sweatshirt" in hint or "crewneck" in hint:

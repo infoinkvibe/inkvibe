@@ -4152,3 +4152,142 @@ def test_family_routing_flows_into_create_publish_processing(tmp_path: Path, mon
     )
     assert ("hoodie_gildan", "prompt-apparel-c01.png") in calls
     assert ("poster_basic", "prompt-poster-c01.png") in calls
+
+
+def test_local_image_batch_max_artworks_processes_first_n_across_templates(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    cfg = tmp_path / "templates.json"
+    cfg.write_text("[]", encoding="utf-8")
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    state_path = tmp_path / "state.json"
+
+    art1 = Artwork("a1", img_dir / "a1.png", "A1", "", [], 100, 100)
+    art2 = Artwork("a2", img_dir / "a2.png", "A2", "", [], 100, 100)
+    art3 = Artwork("a3", img_dir / "a3.png", "A3", "", [], 100, 100)
+    for art in [art1, art2, art3]:
+        Image.new("RGBA", (100, 100), (255, 255, 255, 255)).save(art.src_path)
+
+    templates = [
+        ProductTemplate(key="hoodie_gildan", printify_blueprint_id=77, printify_print_provider_id=99, title_pattern="{artwork_title}", description_pattern="{artwork_title}"),
+        ProductTemplate(key="tshirt_gildan", printify_blueprint_id=6, printify_print_provider_id=99, title_pattern="{artwork_title}", description_pattern="{artwork_title}"),
+    ]
+    monkeypatch.setenv("PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "load_templates", lambda _cfg: templates)
+    monkeypatch.setattr(pipeline, "discover_artworks", lambda *_a, **_k: [art1, art2, art3])
+    monkeypatch.setattr(pipeline, "run_catalog_cli", lambda **kwargs: False)
+    monkeypatch.setattr(pipeline, "audit_printify_integration", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "resolve_shop_id", lambda *a, **k: 1)
+    monkeypatch.setattr(pipeline, "PrintifyClient", lambda token, dry_run=False: types.SimpleNamespace(dry_run=dry_run))
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(pipeline, "process_artwork", lambda **kwargs: calls.append((kwargs["artwork"].slug, kwargs["templates"][0].key)))
+
+    run(cfg, dry_run=True, image_dir=img_dir, state_path=state_path, max_artworks=2)
+    assert len(calls) == 4
+    assert {slug for slug, _ in calls} == {"a1", "a2"}
+
+
+def test_poster_moderately_undersized_uses_bounded_poster_enhancement(tmp_path: Path):
+    path = tmp_path / "posterish.png"
+    Image.new("RGBA", (3200, 4800), (10, 10, 10, 255)).save(path)
+    artwork = Artwork("posterish", path, "Posterish", "", [], 3200, 4800)
+    placement = PlacementRequirement("front", 4500, 5400, allow_upscale=False, artwork_fit_mode="contain")
+    template = ProductTemplate(
+        key="poster_basic",
+        printify_blueprint_id=852,
+        printify_print_provider_id=73,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[placement],
+        poster_safe_max_upscale_factor=1.55,
+        poster_safe_min_source_ratio=0.34,
+        poster_trim_fill_optimization=True,
+    )
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        template=template,
+        template_key="poster_basic",
+        allow_upscale=False,
+        upscale_method="lanczos",
+        skip_undersized=False,
+        max_upscale_factor=None,
+    )
+    assert result.poster_enhancement_status == "applied"
+    assert result.upscaled is True
+    assert result.poster_fill_optimization_used is True
+
+
+def test_poster_too_weak_source_still_safely_falls_back(tmp_path: Path):
+    path = tmp_path / "tiny-poster.png"
+    Image.new("RGBA", (1024, 1536), (10, 10, 10, 255)).save(path)
+    artwork = Artwork("tiny-poster", path, "Tiny Poster", "", [], 1024, 1536)
+    placement = PlacementRequirement("front", 4500, 5400, allow_upscale=False, artwork_fit_mode="contain")
+    template = ProductTemplate(
+        key="poster_basic",
+        printify_blueprint_id=852,
+        printify_print_provider_id=73,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[placement],
+        poster_safe_max_upscale_factor=1.55,
+        poster_safe_min_source_ratio=0.34,
+    )
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        template=template,
+        template_key="poster_basic",
+        allow_upscale=False,
+        upscale_method="lanczos",
+        skip_undersized=False,
+        max_upscale_factor=None,
+    )
+    assert result.poster_enhancement_status == "skipped_outside_safe_limits"
+    assert result.upscaled is False
+
+
+def test_tote_front_primary_publish_only_primary_side():
+    templates = load_templates(Path("product_templates.json"))
+    tote = next(t for t in templates if t.key == "tote_basic")
+    artwork = Artwork("a", Path("a.png"), "A", "", [], 1000, 1000)
+    variant_rows = [{"id": 1, "price": 1000, "is_available": True}]
+    payload = build_printify_product_payload(
+        artwork,
+        tote,
+        variant_rows,
+        upload_map={"front": {"id": "upload-front"}, "back": {"id": "upload-back"}},
+    )
+    assert tote.preferred_primary_placement == "front"
+    assert tote.publish_only_primary_placement is True
+    assert len(payload["print_areas"]) == 1
+    assert payload["print_areas"][0]["placeholders"][0]["position"] == "front"
+
+
+def test_tshirt_template_added_and_longsleeve_copy_is_distinct(tmp_path: Path):
+    templates = load_templates(Path("product_templates.json"))
+    by_key = {template.key: template for template in templates}
+    assert "tshirt_gildan" in by_key
+    assert by_key["tshirt_gildan"].printify_blueprint_id == 6
+    assert by_key["tshirt_gildan"].printify_print_provider_id == 99
+    assert by_key["longsleeve_gildan"].product_type_label == "Long Sleeve T-Shirt"
+    assert by_key["tshirt_gildan"].product_type_label == "T-Shirt"
+
+    art_path = tmp_path / "art.png"
+    Image.new("RGBA", (1200, 1800), (255, 255, 255, 255)).save(art_path)
+    artwork = Artwork("wave-art", art_path, "Wave Art", "", [], 1200, 1800)
+    long_title = render_product_title(by_key["longsleeve_gildan"], artwork)
+    tee_title = render_product_title(by_key["tshirt_gildan"], artwork)
+    long_desc = render_product_description(by_key["longsleeve_gildan"], artwork).lower()
+    tee_desc = render_product_description(by_key["tshirt_gildan"], artwork).lower()
+    long_tags = _render_listing_tags(by_key["longsleeve_gildan"], artwork)
+    tee_tags = _render_listing_tags(by_key["tshirt_gildan"], artwork)
+
+    assert "long sleeve" in long_title.lower()
+    assert "t-shirt" in tee_title.lower() or "tee" in tee_title.lower()
+    assert "long sleeve" in long_desc
+    assert "t-shirt" in tee_desc
+    assert any("long sleeve" in tag.lower() for tag in long_tags)
+    assert any(("t-shirt" in tag.lower()) or ("tee" in tag.lower()) for tag in tee_tags)

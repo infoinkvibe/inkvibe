@@ -141,6 +141,79 @@
     ]
   },
   {
+    "key": "tshirt_gildan",
+    "printify_blueprint_id": 6,
+    "printify_print_provider_id": 99,
+    "title_pattern": "{artwork_title} {product_type_label}",
+    "description_pattern": "<p>{artwork_title} on a comfortable {product_type_label}.</p><p>Best for casual everyday wear. Style notes: minimal, giftable.</p>",
+    "enabled_colors": [
+      "Black",
+      "Dark Heather",
+      "Navy",
+      "Sport Grey",
+      "White"
+    ],
+    "enabled_sizes": [
+      "S",
+      "M",
+      "L",
+      "XL",
+      "2XL",
+      "3XL"
+    ],
+    "max_enabled_variants": 30,
+    "tags": [
+      "t-shirt",
+      "tee",
+      "short sleeve tee",
+      "graphic"
+    ],
+    "seo_keywords": [
+      "graphic t-shirt",
+      "short sleeve tee",
+      "gift idea",
+      "casual streetwear"
+    ],
+    "audience": "casual everyday wear fans",
+    "product_type_label": "T-Shirt",
+    "style_keywords": [
+      "minimal",
+      "giftable"
+    ],
+    "publish_to_shopify": false,
+    "push_via_printify": true,
+    "publish_after_create": true,
+    "publish_title": true,
+    "publish_description": true,
+    "publish_images": true,
+    "publish_variants": true,
+    "publish_tags": true,
+    "base_price": "24.99",
+    "markup_type": "fixed",
+    "markup_value": "5.00",
+    "rounding_mode": "x_99",
+    "placements": [
+      {
+        "placement_name": "front",
+        "width_px": 4500,
+        "height_px": 5400,
+        "file_type": "png",
+        "allow_upscale": true,
+        "placement_scale": 0.72,
+        "placement_x": 0.5,
+        "placement_y": 0.5,
+        "placement_angle": 0,
+        "artwork_fit_mode": "contain",
+        "max_upscale_factor": 6.0
+      }
+    ],
+    "trim_artwork_bounds_for_shirts": true,
+    "aggressive_subject_trim_for_shirts": true,
+    "aggressive_subject_trim_mode": "clipart_central",
+    "shirt_subject_fill_target": 0.7,
+    "max_upscale_factor": 6.0
+  },
+  {
     "key": "mug_new",
     "printify_blueprint_id": 68,
     "printify_print_provider_id": 1,
@@ -195,14 +268,14 @@
     "description_pattern": "<p>{artwork_title}</p>",
     "enabled_colors": [],
     "enabled_sizes": [
-      "11″ x 14″ (Vertical)",
-      "11″ x 17″ (Vertical)",
-      "11″ x 9″ (Horizontal)",
-      "12″ x 16″ (Vertical)",
-      "12″ x 18″ (Vertical)",
-      "14″ x 11″ (Horizontal)",
-      "16″ x 12″ (Horizontal)",
-      "16″ x 20″ (Vertical)"
+      "11\u2033 x 14\u2033 (Vertical)",
+      "11\u2033 x 17\u2033 (Vertical)",
+      "11\u2033 x 9\u2033 (Horizontal)",
+      "12\u2033 x 16\u2033 (Vertical)",
+      "12\u2033 x 18\u2033 (Vertical)",
+      "14\u2033 x 11\u2033 (Horizontal)",
+      "16\u2033 x 12\u2033 (Horizontal)",
+      "16\u2033 x 20\u2033 (Vertical)"
     ],
     "placements": [
       {
@@ -226,7 +299,11 @@
     "style_keywords": [
       "minimal",
       "giftable"
-    ]
+    ],
+    "poster_safe_max_upscale_factor": 1.55,
+    "poster_safe_min_source_ratio": 0.34,
+    "poster_fill_target_pct": 0.94,
+    "poster_trim_fill_optimization": true
   },
   {
     "key": "sweatshirt_gildan",
@@ -309,14 +386,14 @@
     ],
     "placements": [
       {
-        "placement_name": "back",
+        "placement_name": "front",
         "width_px": 4500,
         "height_px": 5400,
         "file_type": "png",
         "allow_upscale": false
       },
       {
-        "placement_name": "front",
+        "placement_name": "back",
         "width_px": 4500,
         "height_px": 5400,
         "file_type": "png",
@@ -336,6 +413,11 @@
     "style_keywords": [
       "minimal",
       "giftable"
-    ]
+    ],
+    "active_placements": [
+      "front"
+    ],
+    "preferred_primary_placement": "front",
+    "publish_only_primary_placement": true
   }
 ]

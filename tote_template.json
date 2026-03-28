@@ -14,14 +14,14 @@
     ],
     "placements": [
       {
-        "placement_name": "back",
+        "placement_name": "front",
         "width_px": 4500,
         "height_px": 5400,
         "file_type": "png",
         "allow_upscale": false
       },
       {
-        "placement_name": "front",
+        "placement_name": "back",
         "width_px": 4500,
         "height_px": 5400,
         "file_type": "png",
@@ -41,6 +41,11 @@
     "style_keywords": [
       "minimal",
       "giftable"
-    ]
+    ],
+    "active_placements": [
+      "front"
+    ],
+    "preferred_primary_placement": "front",
+    "publish_only_primary_placement": true
   }
 ]
