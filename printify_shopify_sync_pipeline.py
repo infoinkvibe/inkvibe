@@ -40,6 +40,15 @@ from artwork_metadata_generator import (
     should_auto_approve_metadata,
     write_artwork_sidecar,
 )
+from artwork_generation import (
+    ArtworkGenerationRequest,
+    GeneratedArtworkAsset,
+    choose_preferred_generated_asset,
+    is_preview_or_low_value_asset,
+    plan_generated_artwork_targets,
+    generate_artwork_with_openai,
+    validate_generated_asset_for_templates,
+)
 
 load_dotenv()
 
@@ -144,6 +153,13 @@ class PlacementTransform:
     x: float
     y: float
     angle: float
+
+
+@dataclass
+class SourceHygieneOptions:
+    filter_preview_assets: bool = True
+    min_source_width: int = 1
+    min_source_height: int = 1
 
 
 def normalize_printify_transform(transform: PlacementTransform) -> Dict[str, Any]:
@@ -2122,17 +2138,37 @@ def create_in_shopify_only(
 # -----------------------------
 
 
-def discover_artworks(image_dir: pathlib.Path) -> List[Artwork]:
+def discover_artworks(
+    image_dir: pathlib.Path,
+    *,
+    candidate_paths: Optional[List[pathlib.Path]] = None,
+    source_hygiene: Optional[SourceHygieneOptions] = None,
+) -> List[Artwork]:
     supported = {".png", ".jpg", ".jpeg", ".webp"}
     artworks: List[Artwork] = []
     metadata_map = load_artwork_metadata_map(ARTWORK_METADATA_MAP_PATH)
+    hygiene = source_hygiene or SourceHygieneOptions()
 
-    for path in sorted(image_dir.glob("**/*")):
+    path_iterable = sorted(candidate_paths) if candidate_paths is not None else sorted(image_dir.glob("**/*"))
+    for path in path_iterable:
         if path.suffix.lower() not in supported or not path.is_file():
+            continue
+        if hygiene.filter_preview_assets and is_preview_or_low_value_asset(path):
+            logger.info("Skipping artwork source due to preview/thumbnail naming: %s", path.name)
             continue
 
         with Image.open(path) as im:
             width, height = im.size
+        if width < hygiene.min_source_width or height < hygiene.min_source_height:
+            logger.info(
+                "Skipping artwork source due to tiny dimensions image=%s size=%sx%s min=%sx%s",
+                path.name,
+                width,
+                height,
+                hygiene.min_source_width,
+                hygiene.min_source_height,
+            )
+            continue
 
         slug = slugify(path.stem)
         metadata, match_info = resolve_artwork_metadata_with_source(path, metadata_map, artwork_slug=slug)
@@ -2177,18 +2213,19 @@ def run_artwork_metadata_generation(
     metadata_review_json: str = "",
     metadata_write_auto_approved_only: bool = False,
     metadata_allow_review_writes: bool = False,
+    artwork_paths: Optional[List[pathlib.Path]] = None,
 ) -> None:
     generator = select_artwork_metadata_generator(
         mode=metadata_generator,
         openai_model=metadata_openai_model,
         openai_timeout_seconds=metadata_openai_timeout,
     )
-    artwork_paths = discover_artwork_images(image_dir)
+    resolved_artwork_paths = artwork_paths[:] if artwork_paths is not None else discover_artwork_images(image_dir)
     if metadata_max_artworks > 0:
-        artwork_paths = artwork_paths[:metadata_max_artworks]
+        resolved_artwork_paths = resolved_artwork_paths[:metadata_max_artworks]
     output_dir = pathlib.Path(metadata_output_dir) if metadata_output_dir else None
 
-    candidates = [generator.generate_metadata_for_artwork(path) for path in artwork_paths]
+    candidates = [generator.generate_metadata_for_artwork(path) for path in resolved_artwork_paths]
     approval_mode_enabled = bool(
         metadata_auto_approve
         or metadata_write_auto_approved_only
@@ -2289,6 +2326,48 @@ def run_artwork_metadata_generation(
         metadata_only_missing and not overwrite_sidecars,
         metadata_generator,
     )
+
+
+def run_prompt_artwork_generation(
+    *,
+    request: ArtworkGenerationRequest,
+    templates: List[ProductTemplate],
+) -> List[pathlib.Path]:
+    plan = plan_generated_artwork_targets(template_keys=[template.key for template in templates], target_mode=request.target_mode)
+    for reason in plan.rationale:
+        logger.info("Artwork generation plan: %s", reason)
+    for target in plan.targets:
+        logger.info("Artwork generation target mode=%s openai_size=%s", target.mode, target.openai_size)
+
+    if request.dry_run_plan:
+        return []
+
+    generated_assets = generate_artwork_with_openai(request=request, plan=plan)
+    hydrated_assets: List[GeneratedArtworkAsset] = []
+    for asset in generated_assets:
+        if not asset.path.exists():
+            asset.skipped_reason = "file_missing_after_generation"
+            logger.warning("Generated asset missing after generation path=%s", asset.path)
+            continue
+        with Image.open(asset.path) as im:
+            asset.width, asset.height = im.size
+        skipped_reason = validate_generated_asset_for_templates(
+            asset,
+            min_width=request.min_source_width,
+            min_height=request.min_source_height,
+        )
+        if skipped_reason:
+            asset.skipped_reason = skipped_reason
+            logger.info("Skipping generated source image=%s reason=%s", asset.path.name, skipped_reason)
+            continue
+        hydrated_assets.append(asset)
+
+    preferred_assets = choose_preferred_generated_asset(hydrated_assets)
+    kept_paths = [asset.path for asset in preferred_assets]
+    dropped_paths = sorted({asset.path for asset in hydrated_assets} - set(kept_paths))
+    for dropped in dropped_paths:
+        logger.info("Skipping generated source image=%s reason=duplicate_concept_preferred_master_selected", dropped.name)
+    return kept_paths
 
 
 def validate_artwork_for_placement(artwork: Artwork, placement: PlacementRequirement) -> Tuple[bool, str]:
@@ -4716,6 +4795,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metadata-review-json", default="", help="Optional JSON path for metadata review queue export")
     parser.add_argument("--metadata-write-auto-approved-only", action="store_true", help="When writing sidecars, write only auto-approved metadata candidates")
     parser.add_argument("--metadata-allow-review-writes", action="store_true", help="Allow writes for needs_review metadata candidates (off by default)")
+    parser.add_argument("--generate-artwork-from-prompt", action="store_true", help="Generate artwork source image(s) from a text prompt before normal pipeline processing")
+    parser.add_argument("--art-prompt", default="", help="Prompt used for artwork generation mode")
+    parser.add_argument("--art-count", type=int, default=1, help="Number of concept sets to generate")
+    parser.add_argument("--art-style", default="", help="Optional style hint appended to the art prompt")
+    parser.add_argument("--art-negative-prompt", default="", help="Optional constraints describing what to avoid in generated artwork")
+    parser.add_argument("--art-visible-text", default="", help="Optional exact visible text to include in the artwork")
+    parser.add_argument("--art-output-dir", default="", help="Output directory for generated artwork (defaults to --image-dir)")
+    parser.add_argument("--art-base-name", default="generated-art", help="Base filename slug for generated artwork files")
+    parser.add_argument("--art-quality", choices=["low", "medium", "high"], default="high", help="OpenAI image quality level")
+    parser.add_argument("--art-background", choices=["auto", "transparent", "opaque"], default="auto", help="OpenAI image background mode")
+    parser.add_argument("--art-generator", choices=["openai"], default="openai", help="Artwork generation provider")
+    parser.add_argument("--art-openai-model", default="", help="Optional OpenAI model override for image generation")
+    parser.add_argument("--art-run-metadata", action="store_true", help="Generate sidecar metadata for newly generated artwork before exiting/continuing")
+    parser.add_argument("--art-run-storefront-qa", action="store_true", help="After generation, run storefront QA against generated artwork")
+    parser.add_argument("--art-publish", action="store_true", help="After generation, run full create/update flow and force publish")
+    parser.add_argument("--art-verify-publish", action="store_true", help="After generation, verify publish/readback indicators")
+    parser.add_argument("--art-target-mode", choices=["auto", "portrait", "square", "multi"], default="auto", help="Target aspect planning mode for generated artwork")
+    parser.add_argument("--art-skip-existing-generated", action="store_true", help="Skip OpenAI generation when expected output filename already exists")
+    parser.add_argument("--art-dry-run-plan", action="store_true", help="Only print generation targets/plan and exit without calling the image API")
+    parser.add_argument("--source-min-width", type=int, default=1, help="Minimum source width allowed when scanning artwork files")
+    parser.add_argument("--source-min-height", type=int, default=1, help="Minimum source height allowed when scanning artwork files")
+    parser.add_argument("--include-preview-assets", action="store_true", help="Include preview/thumbnail/removebg-preview files in artwork discovery")
     parser.add_argument("--launch-plan", default="", help="Optional CSV launch plan path; when set, process enabled rows instead of folder-scan combinations")
     parser.add_argument("--export-launch-plan-template", default="", help="Write a starter launch-plan CSV template to this path and exit")
     parser.add_argument("--export-launch-plan-from-images", default="", help="Write a launch-plan CSV generated from files in --image-dir and exit")
@@ -4929,7 +5030,7 @@ def run_catalog_cli(
     return False
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "") -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "") -> None:
     if publish_mode not in {"default", "publish", "skip"}:
         raise RuntimeError(f"Unsupported publish mode: {publish_mode}")
 
@@ -4999,6 +5100,68 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             f"No templates matched the requested --template-key values: {requested_template_keys}. "
             f"Available template keys: {available_template_keys}"
         )
+    source_hygiene = SourceHygieneOptions(
+        filter_preview_assets=not include_preview_assets,
+        min_source_width=max(1, int(source_min_width)),
+        min_source_height=max(1, int(source_min_height)),
+    )
+    generated_paths: Optional[List[pathlib.Path]] = None
+    if generate_artwork_from_prompt:
+        if not art_prompt.strip():
+            raise RuntimeError("--art-prompt is required when --generate-artwork-from-prompt is set")
+        output_dir = pathlib.Path(art_output_dir) if art_output_dir else image_dir
+        request = ArtworkGenerationRequest(
+            prompt=art_prompt,
+            count=max(1, int(art_count)),
+            style=art_style,
+            negative_prompt=art_negative_prompt,
+            visible_text=art_visible_text,
+            quality=art_quality,
+            background=art_background,
+            generator=art_generator,
+            openai_model=art_openai_model,
+            base_name=slugify(art_base_name or "generated-art"),
+            output_dir=output_dir,
+            target_mode=art_target_mode,
+            dry_run_plan=art_dry_run_plan,
+            skip_existing_generated=art_skip_existing_generated,
+            min_source_width=source_hygiene.min_source_width,
+            min_source_height=source_hygiene.min_source_height,
+        )
+        generated_paths = run_prompt_artwork_generation(request=request, templates=templates)
+        if art_dry_run_plan:
+            return
+        if art_run_metadata and generated_paths:
+            run_artwork_metadata_generation(
+                image_dir=output_dir,
+                metadata_preview=False,
+                write_sidecars=True,
+                overwrite_sidecars=overwrite_sidecars,
+                metadata_only_missing=metadata_only_missing,
+                metadata_max_artworks=0,
+                metadata_output_dir="",
+                metadata_generator=MetadataGeneratorMode.OPENAI.value,
+                metadata_openai_model=metadata_openai_model,
+                metadata_openai_timeout=metadata_openai_timeout,
+                metadata_auto_approve=metadata_auto_approve,
+                metadata_min_confidence=metadata_min_confidence,
+                metadata_review_report="",
+                metadata_review_json="",
+                metadata_write_auto_approved_only=metadata_write_auto_approved_only,
+                metadata_allow_review_writes=metadata_allow_review_writes,
+                artwork_paths=generated_paths,
+            )
+        should_continue = bool(art_run_storefront_qa or art_publish or create_only or update_only or rebuild_product)
+        if not should_continue:
+            logger.info("Prompt artwork generation complete. Stopping before create/publish flow.")
+            return
+        image_dir = output_dir
+        storefront_qa = storefront_qa or art_run_storefront_qa
+        if art_publish:
+            publish_mode = "publish"
+        if art_verify_publish:
+            verify_publish = True
+
     if export_launch_plan_from_images_path:
         exported_count = export_launch_plan_from_images(
             path=pathlib.Path(export_launch_plan_from_images_path),
@@ -5009,7 +5172,10 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         )
         logger.info("Launch-plan CSV exported from images path=%s rows=%s", export_launch_plan_from_images_path, exported_count)
         return
-    artworks = discover_artworks(image_dir)
+    try:
+        artworks = discover_artworks(image_dir, candidate_paths=generated_paths, source_hygiene=source_hygiene)
+    except TypeError:
+        artworks = discover_artworks(image_dir)
     if max_artworks > 0:
         artworks = artworks[:max_artworks]
     if preview_listing_copy_only:
@@ -5331,6 +5497,28 @@ if __name__ == "__main__":
             metadata_review_json=args.metadata_review_json,
             metadata_write_auto_approved_only=args.metadata_write_auto_approved_only,
             metadata_allow_review_writes=args.metadata_allow_review_writes,
+            generate_artwork_from_prompt=args.generate_artwork_from_prompt,
+            art_prompt=args.art_prompt,
+            art_count=args.art_count,
+            art_style=args.art_style,
+            art_negative_prompt=args.art_negative_prompt,
+            art_visible_text=args.art_visible_text,
+            art_output_dir=args.art_output_dir,
+            art_base_name=args.art_base_name,
+            art_quality=args.art_quality,
+            art_background=args.art_background,
+            art_generator=args.art_generator,
+            art_openai_model=args.art_openai_model,
+            art_run_metadata=args.art_run_metadata,
+            art_run_storefront_qa=args.art_run_storefront_qa,
+            art_publish=args.art_publish,
+            art_verify_publish=args.art_verify_publish,
+            art_target_mode=args.art_target_mode,
+            art_skip_existing_generated=args.art_skip_existing_generated,
+            art_dry_run_plan=args.art_dry_run_plan,
+            source_min_width=args.source_min_width,
+            source_min_height=args.source_min_height,
+            include_preview_assets=args.include_preview_assets,
             launch_plan_path=args.launch_plan,
             export_launch_plan_template=args.export_launch_plan_template,
             export_launch_plan_from_images_path=args.export_launch_plan_from_images,
