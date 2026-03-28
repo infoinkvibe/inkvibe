@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
+import mimetypes
+import os
 import pathlib
 import re
+import base64
 from collections import Counter
 from enum import Enum
 from dataclasses import dataclass
@@ -10,8 +14,20 @@ from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 from PIL import Image, ImageStat
 
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - optional dependency in constrained test envs.
+    load_dotenv = None
+
+try:
+    from openai import OpenAI
+except Exception:  # pragma: no cover - optional dependency when OpenAI mode is unused.
+    OpenAI = None  # type: ignore[assignment]
+
 
 SUPPORTED_ARTWORK_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+OPENAI_METADATA_MODEL_DEFAULT = "gpt-4.1-mini"
+logger = logging.getLogger("inkvibeauto")
 
 
 @dataclass
@@ -58,6 +74,7 @@ class GeneratedArtworkMetadataCandidate:
 class MetadataGeneratorMode(str, Enum):
     HEURISTIC = "heuristic"
     VISION = "vision"
+    OPENAI = "openai"
     AUTO = "auto"
 
 
@@ -291,6 +308,280 @@ class LocalVisionAnalyzer:
         return mapping.get(subject, [subject])
 
 
+@dataclass
+class OpenAiArtworkMetadataResponse:
+    main_subject: str
+    supporting_subjects: List[str]
+    visible_design_text: List[str]
+    visual_style: List[str]
+    mood: str
+    color_story: List[str]
+    likely_buyer_appeal: List[str]
+    title: str
+    subtitle: str
+    description: str
+    tags: List[str]
+    seo_keywords: List[str]
+    audience: str
+    style_keywords: List[str]
+    theme: str
+    collection: str
+    occasion: str
+    artist_note: str
+
+    @classmethod
+    def from_payload(cls, payload: Dict[str, Any]) -> "OpenAiArtworkMetadataResponse":
+        return cls(
+            main_subject=_clean_text(payload.get("main_subject", "")),
+            supporting_subjects=_clean_list(payload.get("supporting_subjects", [])),
+            visible_design_text=_clean_list(payload.get("visible_design_text", [])),
+            visual_style=_clean_list(payload.get("visual_style", [])),
+            mood=_clean_text(payload.get("mood", "")),
+            color_story=_clean_list(payload.get("color_story", [])),
+            likely_buyer_appeal=_clean_list(payload.get("likely_buyer_appeal", [])),
+            title=_clean_text(payload.get("title", "")),
+            subtitle=_clean_text(payload.get("subtitle", "")),
+            description=_clean_text(payload.get("description", "")),
+            tags=_clean_list(payload.get("tags", [])),
+            seo_keywords=_clean_list(payload.get("seo_keywords", [])),
+            audience=_clean_text(payload.get("audience", "")),
+            style_keywords=_clean_list(payload.get("style_keywords", [])),
+            theme=_clean_text(payload.get("theme", "")),
+            collection=_clean_text(payload.get("collection", "")),
+            occasion=_clean_text(payload.get("occasion", "")),
+            artist_note=_clean_text(payload.get("artist_note", "")),
+        )
+
+    def to_vision_analysis(self) -> VisionAnalysis:
+        return VisionAnalysis(
+            primary_subject=self.main_subject,
+            secondary_subjects=self.supporting_subjects,
+            style_keywords=_dedupe(self.visual_style + self.style_keywords + ["openai-vision"]),
+            mood=self.mood,
+            palette=self.color_story,
+            visible_text=self.visible_design_text,
+            buyer_appeal=self.likely_buyer_appeal,
+            confidence=0.95,
+            rationale="source=openai_responses_api; analyze=image_pixels",
+        )
+
+    def to_sidecar_metadata(self) -> GeneratedArtworkMetadata:
+        return GeneratedArtworkMetadata(
+            title=self.title,
+            subtitle=self.subtitle,
+            description=self.description,
+            tags=self.tags,
+            seo_keywords=self.seo_keywords,
+            audience=self.audience,
+            style_keywords=self.style_keywords,
+            theme=self.theme,
+            collection=self.collection,
+            occasion=self.occasion,
+            artist_note=self.artist_note,
+        )
+
+    def validate(self) -> None:
+        if not self.main_subject:
+            raise ValueError("openai metadata missing main_subject")
+        if not self.title:
+            raise ValueError("openai metadata missing title")
+        if not self.description:
+            raise ValueError("openai metadata missing description")
+        if not self.tags:
+            raise ValueError("openai metadata missing tags")
+
+
+class OpenAiVisionAnalyzer:
+    """Vision analyzer powered by OpenAI Responses API image understanding."""
+
+    name = "openai_vision"
+
+    def __init__(
+        self,
+        *,
+        api_key: str = "",
+        model: str = "",
+        timeout_seconds: float = 30.0,
+        client: Any = None,
+    ):
+        _load_dotenv_if_available()
+        self.api_key = (api_key or os.getenv("OPENAI_API_KEY", "")).strip()
+        self.model = (model or os.getenv("OPENAI_MODEL", OPENAI_METADATA_MODEL_DEFAULT)).strip()
+        self.timeout_seconds = float(timeout_seconds)
+        self._client = client
+        logger.info(
+            "OpenAI metadata analyzer configured model=%s api_key_configured=%s timeout_seconds=%.1f",
+            self.model,
+            bool(self.api_key),
+            self.timeout_seconds,
+        )
+
+    def analyze_image(self, image_path: pathlib.Path) -> Optional[VisionAnalysis]:
+        response = self.analyze_image_with_metadata(image_path)
+        if not response:
+            return None
+        return response.to_vision_analysis()
+
+    def analyze_image_with_metadata(self, image_path: pathlib.Path) -> Optional[OpenAiArtworkMetadataResponse]:
+        if not self.api_key:
+            logger.info("OpenAI metadata skipped: OPENAI_API_KEY not configured.")
+            return None
+        if OpenAI is None and self._client is None:
+            logger.warning("OpenAI metadata skipped: openai SDK unavailable.")
+            return None
+        image_payload = self._build_data_url(image_path)
+        prompt = self._build_prompt()
+        schema = self._response_schema()
+        client = self._client or OpenAI(api_key=self.api_key, timeout=self.timeout_seconds)
+        max_attempts = 2
+        for attempt in range(max_attempts):
+            try:
+                resp = client.responses.create(
+                    model=self.model,
+                    input=[
+                        {"role": "system", "content": [{"type": "input_text", "text": prompt}]},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": "Analyze this artwork image and return JSON only."},
+                                {"type": "input_image", "image_url": image_payload},
+                            ],
+                        },
+                    ],
+                    text={"format": schema},
+                )
+                payload = self._extract_json_payload(resp)
+                parsed = OpenAiArtworkMetadataResponse.from_payload(payload)
+                parsed.validate()
+                logger.info("OpenAI metadata generation succeeded model=%s image=%s", self.model, image_path.name)
+                return parsed
+            except Exception as exc:
+                safe_error = str(exc).replace("\n", " ")[:240]
+                logger.warning(
+                    "OpenAI metadata generation failed model=%s image=%s attempt=%s/%s reason=%s",
+                    self.model,
+                    image_path.name,
+                    attempt + 1,
+                    max_attempts,
+                    safe_error,
+                )
+        return None
+
+    def _extract_json_payload(self, response: Any) -> Dict[str, Any]:
+        output_text = getattr(response, "output_text", "")
+        if output_text:
+            return json.loads(output_text)
+        output = getattr(response, "output", []) or []
+        for item in output:
+            content = item.get("content", []) if isinstance(item, dict) else getattr(item, "content", [])
+            for block in content:
+                text = block.get("text") if isinstance(block, dict) else getattr(block, "text", "")
+                if text:
+                    return json.loads(text)
+        raise ValueError("openai response missing parsable JSON output")
+
+    def _build_data_url(self, image_path: pathlib.Path) -> str:
+        mime_type = mimetypes.guess_type(str(image_path))[0] or "image/png"
+        encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
+
+    def _build_prompt(self) -> str:
+        return (
+            "You are generating storefront metadata for a single artwork image. Analyze image pixels only; do not infer from filename. "
+            "Return concise, product-agnostic, storefront-safe metadata. "
+            "Avoid filler terms like 'AI generated'. Use design text only if truly visible in the artwork. "
+            "Avoid speculative details when uncertain. "
+            "Return valid JSON matching the schema exactly."
+        )
+
+    def _response_schema(self) -> Dict[str, Any]:
+        required = [
+            "main_subject",
+            "supporting_subjects",
+            "visible_design_text",
+            "visual_style",
+            "mood",
+            "color_story",
+            "likely_buyer_appeal",
+            "title",
+            "subtitle",
+            "description",
+            "tags",
+            "seo_keywords",
+            "audience",
+            "style_keywords",
+            "theme",
+            "collection",
+            "occasion",
+            "artist_note",
+        ]
+        return {
+            "type": "json_schema",
+            "name": "openai_artwork_metadata",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "main_subject": {"type": "string"},
+                    "supporting_subjects": {"type": "array", "items": {"type": "string"}},
+                    "visible_design_text": {"type": "array", "items": {"type": "string"}},
+                    "visual_style": {"type": "array", "items": {"type": "string"}},
+                    "mood": {"type": "string"},
+                    "color_story": {"type": "array", "items": {"type": "string"}},
+                    "likely_buyer_appeal": {"type": "array", "items": {"type": "string"}},
+                    "title": {"type": "string"},
+                    "subtitle": {"type": "string"},
+                    "description": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "seo_keywords": {"type": "array", "items": {"type": "string"}},
+                    "audience": {"type": "string"},
+                    "style_keywords": {"type": "array", "items": {"type": "string"}},
+                    "theme": {"type": "string"},
+                    "collection": {"type": "string"},
+                    "occasion": {"type": "string"},
+                    "artist_note": {"type": "string"},
+                },
+                "required": required,
+            },
+        }
+
+
+class OpenAiArtworkMetadataGenerator:
+    """Direct OpenAI-backed metadata generator with strict schema validation."""
+
+    name = "openai_subject"
+
+    def __init__(self, analyzer: Optional[OpenAiVisionAnalyzer] = None):
+        self.analyzer = analyzer or OpenAiVisionAnalyzer()
+
+    def generate_metadata_for_artwork(self, image_path: pathlib.Path) -> GeneratedArtworkMetadataCandidate:
+        analysis = self.analyzer.analyze_image_with_metadata(image_path)
+        if not analysis:
+            raise RuntimeError("openai analyzer unavailable or did not return metadata")
+        metadata = analysis.to_sidecar_metadata()
+        return GeneratedArtworkMetadataCandidate(
+            image_path=image_path,
+            sidecar_path=image_path.with_suffix(".json"),
+            metadata=metadata,
+            generator=self.name,
+            rationale=f"subject={analysis.main_subject}; model={self.analyzer.model}; analyzer={self.analyzer.name}",
+            source_signals=_dedupe(
+                [
+                    "openai_vision_subject",
+                    "openai_vision_text" if analysis.visible_design_text else "",
+                    "openai_vision_style" if analysis.visual_style else "",
+                ]
+            ),
+            debug_signals={
+                "detected_subject": analysis.main_subject,
+                "visible_text": analysis.visible_design_text,
+                "confidence": 0.95,
+                "model": self.analyzer.model,
+            },
+        )
+
+
 class VisionArtworkMetadataGenerator:
     """Subject-aware generator driven by an injectable vision analyzer."""
 
@@ -347,9 +638,14 @@ class VisionArtworkMetadataGenerator:
             occasion="",
             artist_note="Generated from subject-aware vision analysis and conservative style inference.",
         )
-        source_signals = ["vision_subject"]
+        subject_signal = "vision_subject"
+        text_signal = "vision_text"
+        if "local" in self.analyzer.name:
+            subject_signal = "local_vision_subject"
+            text_signal = "local_vision_text"
+        source_signals = [subject_signal]
         if visible_text:
-            source_signals.append("vision_text")
+            source_signals.append(text_signal)
         if analysis.rationale:
             source_signals.append("vision_rationale")
         return GeneratedArtworkMetadataCandidate(
@@ -382,6 +678,14 @@ class CompositeArtworkMetadataGenerator:
             candidate.generator = f"{self.name}:{candidate.generator}"
             return candidate
         except Exception as exc:
+            logger.warning(
+                "Metadata generator fallback engaged mode=%s image=%s primary=%s fallback=%s reason=%s",
+                self.name,
+                image_path.name,
+                getattr(self.primary, "name", type(self.primary).__name__),
+                getattr(self.fallback, "name", type(self.fallback).__name__),
+                f"{type(exc).__name__}: {exc}"[:240],
+            )
             fallback_candidate = self.fallback.generate_metadata_for_artwork(image_path)
             fallback_candidate.generator = f"{self.name}:{fallback_candidate.generator}"
             rationale = fallback_candidate.rationale
@@ -454,16 +758,37 @@ def select_artwork_metadata_generator(
     *,
     mode: str = MetadataGeneratorMode.HEURISTIC.value,
     vision_analyzer: Optional[VisionAnalyzer] = None,
+    openai_analyzer: Optional[OpenAiVisionAnalyzer] = None,
+    openai_model: str = "",
+    openai_timeout_seconds: float = 30.0,
 ) -> ArtworkMetadataGenerator:
     normalized = (mode or MetadataGeneratorMode.HEURISTIC.value).strip().lower()
     heuristic = HeuristicArtworkMetadataGenerator()
     vision = VisionArtworkMetadataGenerator(analyzer=vision_analyzer or LocalVisionAnalyzer())
+    openai_generator = OpenAiArtworkMetadataGenerator(
+        analyzer=openai_analyzer or OpenAiVisionAnalyzer(model=openai_model, timeout_seconds=openai_timeout_seconds)
+    )
+    openai_with_vision_fallback = CompositeArtworkMetadataGenerator(
+        primary=openai_generator,
+        fallback=vision,
+        name=MetadataGeneratorMode.OPENAI.value,
+    )
     if normalized == MetadataGeneratorMode.HEURISTIC.value:
         return heuristic
     if normalized == MetadataGeneratorMode.VISION.value:
         return CompositeArtworkMetadataGenerator(primary=vision, fallback=heuristic, name=MetadataGeneratorMode.VISION.value)
+    if normalized == MetadataGeneratorMode.OPENAI.value:
+        return CompositeArtworkMetadataGenerator(
+            primary=openai_with_vision_fallback,
+            fallback=heuristic,
+            name=MetadataGeneratorMode.OPENAI.value,
+        )
     if normalized == MetadataGeneratorMode.AUTO.value:
-        return CompositeArtworkMetadataGenerator(primary=vision, fallback=heuristic, name=MetadataGeneratorMode.AUTO.value)
+        return CompositeArtworkMetadataGenerator(
+            primary=openai_with_vision_fallback,
+            fallback=heuristic,
+            name=MetadataGeneratorMode.AUTO.value,
+        )
     raise ValueError(f"unsupported metadata generator mode: {mode}")
 
 
@@ -720,6 +1045,26 @@ def _build_vision_audience(*, subject: str, buyer_appeal: Sequence[str]) -> str:
 
 def _title_case_phrase(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip()).title()
+
+
+def _clean_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _clean_list(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return _dedupe(token.strip() for token in value.split(","))
+    if isinstance(value, (list, tuple, set)):
+        return _dedupe(str(item) for item in value)
+    return []
+
+
+def _load_dotenv_if_available() -> None:
+    if load_dotenv:
+        try:
+            load_dotenv()
+        except Exception:
+            return
 
 
 def _dedupe(values: Sequence[str]) -> List[str]:
