@@ -111,6 +111,19 @@ Run storefront QA from local images only:
 python printify_shopify_sync_pipeline.py --local-image-batch 3 --storefront-qa --export-storefront-qa-report ./exports/storefront_qa_local.csv
 ```
 
+Run a 3-image all-family batch with collection sync + family enforcement:
+
+```bash
+python printify_shopify_sync_pipeline.py \
+  --local-image-batch 3 \
+  --publish \
+  --verify-publish \
+  --sync-collections \
+  --enforce-family-collection-membership \
+  --collection-removal-mode conservative \
+  --export-run-report ./exports/run_report_local3.csv
+```
+
 Current supported template families include:
 - `hoodie_gildan`
 - `longsleeve_gildan`
@@ -119,6 +132,13 @@ Current supported template families include:
 - `mug_new`
 - `poster_basic`
 - `tote_basic`
+
+### Storefront merchandising controls
+
+- **Strict family collections:** family routing is deterministic (`tshirt_gildan -> t-shirts`, `sweatshirt_gildan -> sweatshirts`, etc.) and can be enforced via `--enforce-family-collection-membership`.
+- **Collection visuals:** launch-plan rows can now include `collection_image_src` and `collection_sort_order` so collection tiles/sorting are intentionally merchandised.
+- **Default mockup diversity:** templates now support `preferred_mockup_colors`, `preferred_default_variant_color`, `preferred_mockup_types`, and `preferred_featured_image_strategy` to avoid white-dominant defaults when alternatives exist.
+- **Tote merchandising:** tote front remains primary/front-only while a modest tote front fill boost is applied for stronger collection-card presence.
 
 ## Catalog exploration workflows
 

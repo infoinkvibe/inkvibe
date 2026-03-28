@@ -210,12 +210,12 @@ def infer_product_family(template: Any) -> str:
     ).lower()
     if "longsleeve" in hint or "long sleeve" in hint:
         return "long_sleeve"
-    if "tshirt" in hint or "t-shirt" in hint or " tee" in hint:
-        return "tshirt"
-    if "hoodie" in hint:
-        return "hoodie"
     if "sweatshirt" in hint or "crewneck" in hint:
         return "sweatshirt"
+    if "hoodie" in hint:
+        return "hoodie"
+    if "tshirt" in hint or "t-shirt" in hint or " tee" in hint:
+        return "tshirt"
     if "tote" in hint:
         return "tote"
     if "poster" in hint:
