@@ -1315,6 +1315,51 @@ def test_listing_tags_include_family_brand_and_dedupe(tmp_path: Path):
     assert "inkvibe" in tags
     assert "poster" in tags
     assert tags.count("inkvibe") == 1
+    assert len(tags) <= 14
+
+
+def test_title_rendering_includes_family_signal_for_all_active_families(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1200, 1800)
+    art.metadata = {"title": "Aurora Fox", "theme": "northern sky"}
+    families = [
+        ("hoodie_gildan", "Hoodie"),
+        ("sweatshirt_gildan", "Sweatshirt"),
+        ("tshirt_gildan", "T-Shirt"),
+        ("longsleeve_gildan", "Long Sleeve T-Shirt"),
+        ("mug_11oz", "Mug"),
+        ("poster_basic", "Poster"),
+        ("tote_basic", "Tote Bag"),
+    ]
+    for key, label in families:
+        template = _template_for_variant_tests()
+        template.key = key
+        template.product_type_label = label
+        template.shopify_product_type = label
+        template.title_pattern = "{artwork_title}"
+        title = render_product_title(template, art)
+        assert title_semantically_includes_product_label(title, label), f"{key} missing family signal: {title}"
+
+
+def test_storefront_tag_builder_keeps_subject_theme_and_avoids_excess(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1200, 1800)
+    art.slug = "golden-field-fox-portrait"
+    art.metadata = {
+        "title": "Golden Field Fox",
+        "theme": "wildlife portrait",
+        "subtitle": "warm dusk palette",
+        "style_keywords": ["botanical", "textured"],
+        "tags": ["fox", "wildlife portrait", "wall art", "wall art"],
+    }
+    template = _template_for_variant_tests()
+    template.key = "poster_basic"
+    template.tags = ["wall art", "wall decor", "design", "artwork"]
+    tags = _render_listing_tags(template, art)
+    warnings, _ = validate_storefront_tags(tags=tags, template=template, artwork=art)
+    assert len(tags) <= 14
+    assert any("fox" in tag for tag in tags)
+    assert any(tag in {"wildlife portrait", "warm dusk palette", "botanical", "textured"} for tag in tags)
+    assert "tag_count_high" not in warnings
+    assert "tags_missing_artwork_theme_signal" not in warnings
 
 
 def test_storefront_qa_strong_metadata_avoids_generic_copy_warnings(tmp_path: Path):
@@ -1342,8 +1387,11 @@ def test_storefront_qa_strong_metadata_avoids_generic_copy_warnings(tmp_path: Pa
     description_warnings, _ = validate_storefront_description(description_html=description, template=template, artwork=art)
     tag_warnings, _ = validate_storefront_tags(tags=tags, template=template, artwork=art)
     assert "title_bad_fallback" not in title_warnings
+    assert "title_missing_product_signal" not in title_warnings
     assert "description_generic_fallback_with_metadata" not in description_warnings
     assert "tags_generic_only" not in tag_warnings
+    assert "tag_count_high" not in tag_warnings
+    assert "tags_missing_artwork_theme_signal" not in tag_warnings
 
 
 def test_upload_strategy_summary_helper():
@@ -4220,7 +4268,7 @@ def test_poster_moderately_undersized_uses_bounded_poster_enhancement(tmp_path: 
     assert result.poster_fill_optimization_used is True
 
 
-def test_poster_too_weak_source_still_safely_falls_back(tmp_path: Path):
+def test_poster_small_portrait_source_uses_bounded_small_source_tier(tmp_path: Path):
     path = tmp_path / "tiny-poster.png"
     Image.new("RGBA", (1024, 1536), (10, 10, 10, 255)).save(path)
     artwork = Artwork("tiny-poster", path, "Tiny Poster", "", [], 1024, 1536)
@@ -4245,8 +4293,67 @@ def test_poster_too_weak_source_still_safely_falls_back(tmp_path: Path):
         skip_undersized=False,
         max_upscale_factor=None,
     )
+    assert result.poster_enhancement_status == "applied"
+    assert result.poster_enhancement_tier == "bounded_small_source"
+    assert result.poster_source_ratio > 0.22
+    assert result.upscaled is True
+
+
+def test_poster_tiny_weak_source_still_safely_falls_back(tmp_path: Path):
+    path = tmp_path / "too-tiny-poster.png"
+    Image.new("RGBA", (640, 900), (10, 10, 10, 255)).save(path)
+    artwork = Artwork("too-tiny-poster", path, "Too Tiny Poster", "", [], 640, 900)
+    placement = PlacementRequirement("front", 4500, 5400, allow_upscale=False, artwork_fit_mode="contain")
+    template = ProductTemplate(
+        key="poster_basic",
+        printify_blueprint_id=852,
+        printify_print_provider_id=73,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[placement],
+        poster_safe_max_upscale_factor=1.55,
+        poster_safe_min_source_ratio=0.34,
+    )
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        template=template,
+        template_key="poster_basic",
+        allow_upscale=False,
+        upscale_method="lanczos",
+        skip_undersized=False,
+        max_upscale_factor=None,
+    )
     assert result.poster_enhancement_status == "skipped_outside_safe_limits"
+    assert result.poster_enhancement_tier == "none"
     assert result.upscaled is False
+
+
+def test_non_poster_templates_do_not_use_poster_enhancement_path(tmp_path: Path):
+    path = tmp_path / "shirt.png"
+    Image.new("RGBA", (1024, 1536), (10, 10, 10, 255)).save(path)
+    artwork = Artwork("shirt", path, "Shirt", "", [], 1024, 1536)
+    placement = PlacementRequirement("front", 4500, 5400, allow_upscale=False, artwork_fit_mode="contain")
+    template = ProductTemplate(
+        key="hoodie_gildan",
+        printify_blueprint_id=852,
+        printify_print_provider_id=73,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[placement],
+    )
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        template=template,
+        template_key="hoodie_gildan",
+        allow_upscale=False,
+        upscale_method="lanczos",
+        skip_undersized=False,
+        max_upscale_factor=None,
+    )
+    assert result.poster_enhancement_status == ""
+    assert result.poster_enhancement_tier == ""
 
 
 def test_tote_front_primary_publish_only_primary_side():
