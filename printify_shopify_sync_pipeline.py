@@ -322,6 +322,8 @@ class RunReportRow:
     tote_active_placements: str = ""
     poster_cover_eligible: str = ""
     poster_enhancement_status: str = ""
+    poster_enhancement_tier: str = ""
+    poster_source_ratio: str = ""
     poster_requested_upscale_factor: str = ""
     poster_applied_upscale_factor: str = ""
     poster_fill_optimization_used: bool = False
@@ -412,6 +414,8 @@ class PreparedArtwork:
     aggressive_trim_used: bool = False
     poster_cover_eligible: Optional[bool] = None
     poster_enhancement_status: str = ""
+    poster_enhancement_tier: str = ""
+    poster_source_ratio: float = 0.0
     poster_requested_upscale_factor: float = 1.0
     poster_applied_upscale_factor: float = 1.0
     poster_fill_optimization_used: bool = False
@@ -448,6 +452,8 @@ class ArtworkResolution:
     aggressive_trim_used: bool = False
     poster_cover_eligible: Optional[bool] = None
     poster_enhancement_status: str = ""
+    poster_enhancement_tier: str = ""
+    poster_source_ratio: float = 0.0
     poster_requested_upscale_factor: float = 1.0
     poster_applied_upscale_factor: float = 1.0
     poster_fill_optimization_used: bool = False
@@ -484,6 +490,9 @@ TRIM_PRESETS: Dict[str, Dict[str, float]] = {
 POSTER_SAFE_ENHANCEMENT_MAX_UPSCALE_FACTOR = 1.35
 POSTER_SAFE_ENHANCEMENT_MIN_SOURCE_RATIO = 0.45
 POSTER_FILL_TARGET_PCT_DEFAULT = 0.94
+POSTER_SMALL_SOURCE_SAFE_MAX_UPSCALE_FACTOR = 1.85
+POSTER_SMALL_SOURCE_MIN_SOURCE_RATIO = 0.22
+POSTER_SMALL_SOURCE_PORTRAIT_ASPECT_MAX = 0.8
 
 
 LAUNCH_PLAN_OVERRIDE_COLUMNS = [
@@ -559,14 +568,47 @@ def title_semantically_includes_product_label(cleaned_title: str, product_label:
 
 def _dedupe_rendered_title(title: str) -> str:
     title = re.sub(r"\s+", " ", title).strip()
+    title = re.sub(r"\s+[|–—:]+\s*", " - ", title)
+    title = re.sub(r"\s+[-]+\s+", " - ", title)
     patterns = [
         (r"\b(t-?shirt)\s+\1\b", r"\1"),
         (r"\b(tee)\s+\1\b", r"\1"),
+        (r"\b(long sleeve t-?shirt)\s+\1\b", r"\1"),
         (r"\b(mug)\s+\1\b", r"\1"),
+        (r"\b(poster)\s+\1\b", r"\1"),
+        (r"\b(tote bag)\s+\1\b", r"\1"),
     ]
     for pattern, repl in patterns:
         title = re.sub(pattern, repl, title, flags=re.IGNORECASE)
+    title = re.sub(r"(?:\s*-\s*){2,}", " - ", title)
     return re.sub(r"\s+", " ", title).strip()
+
+
+def _title_product_signal_label(template: ProductTemplate) -> str:
+    explicit_label = (template.product_type_label or "").strip()
+    if explicit_label:
+        return explicit_label
+    shopify_type = (template.shopify_product_type or "").strip()
+    if shopify_type and shopify_type.lower() not in {"apparel", "product", "accessories", "merchandise"}:
+        return shopify_type
+    family = content_engine.infer_product_family(template)
+    if family == "default":
+        return ""
+    return content_engine.family_title_suffix(template).strip()
+
+
+def _refine_rendered_title(*, artwork_title: str, rendered_title: str, product_label: str) -> str:
+    candidate = _dedupe_rendered_title(rendered_title)
+    candidate = re.sub(r"\b(signature product|untitled design|untitled)\b", "", candidate, flags=re.IGNORECASE)
+    candidate = _dedupe_rendered_title(candidate).strip(" -")
+    if not candidate:
+        candidate = artwork_title.strip()
+    if product_label and not title_semantically_includes_product_label(candidate, product_label):
+        if candidate.lower() == artwork_title.strip().lower():
+            candidate = f"{candidate} {product_label}".strip()
+        else:
+            candidate = f"{candidate} - {product_label}".strip()
+    return _dedupe_rendered_title(candidate)
 
 def _split_keywords(value: Any) -> List[str]:
     if isinstance(value, list):
@@ -1116,18 +1158,16 @@ def build_seo_context(template: ProductTemplate, artwork: Artwork) -> Dict[str, 
 
 def render_product_title(template: ProductTemplate, artwork: Artwork) -> str:
     context = build_seo_context(template, artwork)
-    product_label = context.get("product_type_label", "")
+    product_label = _title_product_signal_label(template)
     if product_label and title_semantically_includes_product_label(context.get("artwork_title", ""), product_label):
         context = dict(context)
         context["product_type_label"] = ""
     rendered = template.title_pattern.format(**context).strip()
-    deduped = _dedupe_rendered_title(rendered)
-    if deduped.lower() == context.get("artwork_title", "").strip().lower():
-        family = content_engine.infer_product_family(template)
-        suffix = content_engine.family_title_suffix(template) if family != "default" else ""
-        if suffix and not title_semantically_includes_product_label(deduped, suffix):
-            deduped = f"{deduped} {suffix}".strip()
-    return _dedupe_rendered_title(deduped)
+    return _refine_rendered_title(
+        artwork_title=context.get("artwork_title", ""),
+        rendered_title=rendered,
+        product_label=product_label,
+    )
 
 
 def _render_listing_tags(template: ProductTemplate, artwork: Artwork) -> List[str]:
@@ -1135,56 +1175,79 @@ def _render_listing_tags(template: ProductTemplate, artwork: Artwork) -> List[st
     context = build_seo_context(template, artwork)
     family = content_engine.infer_product_family(template)
     family_label = str(context.get("family_label", "")).strip().lower()
-    family_bucket = [*content_engine.family_tags(template), family_label, template.product_type_label, template.shopify_product_type]
-    theme_bucket = [
+    family_bucket = [family_label, template.product_type_label, template.shopify_product_type, *content_engine.family_tags(template)]
+    subject_bucket = [
+        metadata.get("title"),
+        context.get("artwork_title"),
+        metadata.get("theme"),
+        metadata.get("collection"),
+        *_split_keywords(metadata.get("tags")),
+        *artwork.tags,
+    ]
+    theme_style_bucket = [
         metadata.get("theme"),
         metadata.get("subtitle"),
-        metadata.get("collection"),
         metadata.get("color_story"),
-        context.get("artwork_title"),
         *template.tags,
-        *artwork.tags,
-        *_split_keywords(metadata.get("tags")),
         *_split_keywords(metadata.get("seo_keywords")),
-    ]
-    audience_style_bucket = [
-        metadata.get("audience"),
         *template.style_keywords,
         *_split_keywords(metadata.get("style_keywords")),
     ]
-    gifting_bucket = [metadata.get("occasion"), "gift idea", "inkvibe", *DEFAULT_TAGS]
-    bucket_order = [family_bucket, theme_bucket, audience_style_bucket, gifting_bucket]
+    optional_bucket = [metadata.get("audience"), metadata.get("occasion"), "inkvibe", "gift idea", *DEFAULT_TAGS]
+    bucket_order = [subject_bucket, theme_style_bucket, family_bucket, optional_bucket]
     tags: List[str] = []
     seen: set[str] = set()
-    generic_tokens = {"print-on-demand", "printify", "style", "design", "artwork", "product"}
+    generic_tokens = {"print-on-demand", "printify", "style", "design", "artwork", "product", "gift idea"}
+
+    def _push_tag(raw: Any, *, allow_generic: bool = False) -> None:
+        nonlocal tags
+        cleaned = str(raw).strip().lower()
+        if not cleaned:
+            return
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = re.sub(r"[^a-z0-9&' +/\-]", "", cleaned).strip()
+        if not cleaned or len(cleaned) > 32:
+            return
+        if cleaned in seen:
+            return
+        if not allow_generic and cleaned in generic_tokens:
+            return
+        seen.add(cleaned)
+        tags.append(cleaned)
+
     for bucket in bucket_order:
         for row in bucket:
-            cleaned = str(row).strip().lower()
-            if not cleaned:
-                continue
-            cleaned = re.sub(r"\s+", " ", cleaned)
-            cleaned = re.sub(r"[^a-z0-9&' +/\-]", "", cleaned).strip()
-            if not cleaned or len(cleaned) > 32:
-                continue
-            if cleaned in seen:
-                continue
-            if cleaned in generic_tokens and len(tags) >= 8:
-                continue
-            seen.add(cleaned)
-            tags.append(cleaned)
-            if len(tags) >= 20:
+            _push_tag(row)
+            if len(tags) >= 14:
                 break
-        if len(tags) >= 20:
+        if len(tags) >= 14:
             break
-    if family in {"hoodie", "sweatshirt", "long_sleeve", "poster", "mug", "tote"}:
-        required = set(content_engine.family_tags(template))
-        if required and not required.intersection(set(tags)):
-            for tag in content_engine.family_tags(template):
-                lowered = tag.lower()
-                if lowered not in seen and len(lowered) <= 32:
-                    tags.append(lowered)
-                    seen.add(lowered)
-                    break
+
+    subject_signals = [metadata.get("title"), metadata.get("theme"), context.get("artwork_title"), artwork.slug]
+    if not any(any(token in tag for token in re.findall(r"[a-z0-9]{4,}", str(signal).lower())) for signal in subject_signals for tag in tags):
+        for signal in subject_signals:
+            if len(tags) >= 14:
+                break
+            _push_tag(signal)
+
+    theme_signals = [metadata.get("theme"), metadata.get("subtitle"), metadata.get("collection"), metadata.get("color_story"), *_split_keywords(metadata.get("style_keywords"))]
+    if not any(str(signal).strip().lower() in tags for signal in theme_signals if str(signal).strip()):
+        for signal in theme_signals:
+            if len(tags) >= 14:
+                break
+            _push_tag(signal)
+
+    required = set(content_engine.family_tags(template))
+    if required and not required.intersection(set(tags)):
+        for tag in content_engine.family_tags(template):
+            _push_tag(tag, allow_generic=True)
+            if len(tags) >= 14:
+                break
+    if len(tags) < 8:
+        for row in optional_bucket:
+            _push_tag(row, allow_generic=True)
+            if len(tags) >= 8:
+                break
     return tags
 
 
@@ -2750,6 +2813,8 @@ def resolve_artwork_for_placement(
     poster_cover_eligible = False
     poster_enhancement_considered = False
     poster_enhancement_applied = False
+    poster_enhancement_tier = "none"
+    poster_source_ratio = 0.0
     poster_requested_upscale_factor = 1.0
     poster_applied_upscale_factor = 1.0
     poster_trim_fill_optimization_applied = False
@@ -2801,16 +2866,27 @@ def resolve_artwork_for_placement(
             poster_requested_scale = min(placement.width_px / image.width, placement.height_px / image.height)
             poster_requested_upscale_factor = poster_requested_scale if poster_requested_scale > 1.0 else 1.0
             min_source_ratio = min(image.width / placement.width_px, image.height / placement.height_px)
-            if poster_trim_fill_optimization and min_source_ratio >= poster_min_source_ratio:
-                poster_trim_fill_optimization_applied = True
-                _ = min(1.0, max(0.5, poster_fill_target_pct))
-
-            enhancement_within_limits = (
+            poster_source_ratio = min_source_ratio
+            source_aspect = image.width / max(1, image.height)
+            is_small_source_portrait = source_aspect <= POSTER_SMALL_SOURCE_PORTRAIT_ASPECT_MAX
+            standard_eligible = (
                 poster_requested_upscale_factor > 1.0
                 and poster_requested_upscale_factor <= poster_max_upscale
                 and min_source_ratio >= poster_min_source_ratio
             )
-            if enhancement_within_limits:
+            small_source_eligible = (
+                poster_requested_upscale_factor > 1.0
+                and template is not None
+                and is_small_source_portrait
+                and min_source_ratio >= POSTER_SMALL_SOURCE_MIN_SOURCE_RATIO
+            )
+            if poster_trim_fill_optimization and min_source_ratio >= poster_min_source_ratio:
+                poster_trim_fill_optimization_applied = True
+                _ = min(1.0, max(0.5, poster_fill_target_pct))
+            elif poster_trim_fill_optimization and small_source_eligible:
+                poster_trim_fill_optimization_applied = True
+
+            if standard_eligible:
                 effective_allow_upscale = True
                 effective_max_upscale_factor = (
                     min(max_upscale_factor, poster_max_upscale)
@@ -2819,28 +2895,58 @@ def resolve_artwork_for_placement(
                 )
                 poster_enhancement_applied = True
                 poster_enhancement_status = "applied"
+                poster_enhancement_tier = "bounded_standard"
                 poster_applied_upscale_factor = min(
                     poster_requested_upscale_factor,
                     effective_max_upscale_factor if effective_max_upscale_factor else poster_requested_upscale_factor,
                 )
                 logger.info(
-                    "Poster enhancement applied placement=%s strategy=bounded_contain_upscale requested_upscale_factor=%.3f applied_upscale_factor=%.3f max_allowed=%.3f trim_fill_optimization_applied=%s",
+                    "Poster enhancement applied placement=%s tier=%s strategy=bounded_contain_upscale requested_upscale_factor=%.3f applied_upscale_factor=%.3f max_allowed=%.3f source_ratio=%.3f trim_fill_optimization_applied=%s",
                     placement.placement_name,
+                    poster_enhancement_tier,
                     poster_requested_upscale_factor,
                     poster_applied_upscale_factor,
                     effective_max_upscale_factor if effective_max_upscale_factor is not None else 0.0,
+                    min_source_ratio,
+                    poster_trim_fill_optimization_applied,
+                )
+            elif small_source_eligible:
+                effective_allow_upscale = True
+                small_source_max = max(poster_max_upscale, POSTER_SMALL_SOURCE_SAFE_MAX_UPSCALE_FACTOR)
+                effective_max_upscale_factor = (
+                    min(max_upscale_factor, small_source_max)
+                    if max_upscale_factor is not None and max_upscale_factor > 0
+                    else small_source_max
+                )
+                poster_enhancement_applied = True
+                poster_enhancement_status = "applied"
+                poster_enhancement_tier = "bounded_small_source"
+                poster_applied_upscale_factor = min(
+                    poster_requested_upscale_factor,
+                    effective_max_upscale_factor if effective_max_upscale_factor else poster_requested_upscale_factor,
+                )
+                logger.info(
+                    "Poster enhancement applied placement=%s tier=%s strategy=bounded_small_source_poster_upscale requested_upscale_factor=%.3f applied_upscale_factor=%.3f max_allowed=%.3f source_ratio=%.3f aspect=%.3f trim_fill_optimization_applied=%s",
+                    placement.placement_name,
+                    poster_enhancement_tier,
+                    poster_requested_upscale_factor,
+                    poster_applied_upscale_factor,
+                    effective_max_upscale_factor if effective_max_upscale_factor is not None else 0.0,
+                    min_source_ratio,
+                    source_aspect,
                     poster_trim_fill_optimization_applied,
                 )
             else:
                 effective_allow_upscale = False
                 poster_enhancement_status = "skipped_outside_safe_limits"
                 logger.info(
-                    "Poster enhancement skipped placement=%s reason=outside_safe_limits requested_upscale_factor=%.3f max_safe_upscale_factor=%.3f min_source_ratio=%.3f min_required_source_ratio=%.3f trim_fill_optimization_applied=%s",
+                    "Poster enhancement skipped placement=%s reason=outside_safe_limits requested_upscale_factor=%.3f max_safe_upscale_factor=%.3f min_source_ratio=%.3f min_required_source_ratio=%.3f small_source_portrait=%s trim_fill_optimization_applied=%s",
                     placement.placement_name,
                     poster_requested_upscale_factor,
                     poster_max_upscale,
                     min_source_ratio,
                     poster_min_source_ratio,
+                    is_small_source_portrait,
                     poster_trim_fill_optimization_applied,
                 )
 
@@ -2996,14 +3102,16 @@ def resolve_artwork_for_placement(
             placement.placement_name,
         )
         logger.info(
-            "Poster final resolution path chosen strategy=%s fit_mode=%s action=%s upscaled=%s upscale_capped=%s enhancement_considered=%s enhancement_applied=%s requested_upscale_factor=%.3f applied_upscale_factor=%.3f trim_fill_optimization_applied=%s",
+            "Poster final resolution path chosen strategy=%s tier=%s fit_mode=%s action=%s upscaled=%s upscale_capped=%s enhancement_considered=%s enhancement_applied=%s source_ratio=%.3f requested_upscale_factor=%.3f applied_upscale_factor=%.3f trim_fill_optimization_applied=%s",
             poster_strategy_path or fit_mode,
+            poster_enhancement_tier,
             fit_mode,
             action,
             upscaled,
             upscale_capped,
             poster_enhancement_considered,
             poster_enhancement_applied,
+            poster_source_ratio,
             poster_requested_upscale_factor,
             applied_upscale_factor,
             poster_trim_fill_optimization_applied,
@@ -3051,6 +3159,8 @@ def resolve_artwork_for_placement(
         aggressive_trim_used=aggressive_trim_used,
         poster_cover_eligible=poster_cover_eligible if template_key == "poster_basic" else None,
         poster_enhancement_status=poster_enhancement_status if template_key == "poster_basic" else "",
+        poster_enhancement_tier=poster_enhancement_tier if template_key == "poster_basic" else "",
+        poster_source_ratio=poster_source_ratio if template_key == "poster_basic" else 0.0,
         poster_requested_upscale_factor=poster_requested_upscale_factor if template_key == "poster_basic" else 1.0,
         poster_applied_upscale_factor=applied_upscale_factor if template_key == "poster_basic" else 1.0,
         poster_fill_optimization_used=poster_trim_fill_optimization_applied if template_key == "poster_basic" else False,
@@ -3153,6 +3263,8 @@ def prepare_artwork_export(
         aggressive_trim_used=resolution.aggressive_trim_used,
         poster_cover_eligible=resolution.poster_cover_eligible,
         poster_enhancement_status=resolution.poster_enhancement_status,
+        poster_enhancement_tier=resolution.poster_enhancement_tier,
+        poster_source_ratio=resolution.poster_source_ratio,
         poster_requested_upscale_factor=resolution.poster_requested_upscale_factor,
         poster_applied_upscale_factor=resolution.poster_applied_upscale_factor,
         poster_fill_optimization_used=resolution.poster_fill_optimization_used,
@@ -3748,9 +3860,10 @@ def validate_storefront_title(*, title: str, title_source: str, title_quality: s
             break
     if title_source in {"filename_slug", "fallback"} and title_quality in {"hash_like", "slug_like", "too_short"}:
         warnings.append("title_low_quality_source")
-    if not title_semantically_includes_product_label(normalized_title, template.product_type_label or template.shopify_product_type or ""):
+    required_signal = _title_product_signal_label(template)
+    if required_signal and not title_semantically_includes_product_label(normalized_title, required_signal):
         family = content_engine.infer_product_family(template)
-        if family in {"shirt", "sweatshirt", "mug", "poster", "tote"} and "default" not in family:
+        if family in {"tshirt", "long_sleeve", "hoodie", "sweatshirt", "mug", "poster", "tote"}:
             warnings.append("title_missing_product_signal")
     return warnings, errors
 
@@ -3789,9 +3902,9 @@ def validate_storefront_tags(*, tags: List[str], template: ProductTemplate, artw
         warnings.append("tags_contain_duplicates")
     if any(len(tag) > 32 for tag in tags):
         warnings.append("tag_too_long")
-    if len(tags) >= 20:
+    if len(tags) >= 15:
         warnings.append("tag_count_high")
-    elif len(tags) >= 16:
+    elif len(tags) >= 13:
         warnings.append("tag_count_near_limit")
     generic = {"print-on-demand", "printify", "gift", "style", "inkvibe", "apparel", "shirt", "clothing"}
     non_generic = [tag for tag in deduped if tag not in generic]
@@ -4519,6 +4632,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
         tote_active_placements_report = ""
         poster_cover_eligible_report = ""
         poster_enhancement_status_report = ""
+        poster_enhancement_tier_report = ""
+        poster_source_ratio_report = ""
         poster_requested_upscale_factor_report = ""
         poster_applied_upscale_factor_report = ""
         poster_fill_optimization_used_report = False
@@ -4570,6 +4685,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                         tote_active_placements=tote_active_placements_report,
                         poster_cover_eligible=poster_cover_eligible_report,
                         poster_enhancement_status=poster_enhancement_status_report,
+                        poster_enhancement_tier=poster_enhancement_tier_report,
+                        poster_source_ratio=poster_source_ratio_report,
                         poster_requested_upscale_factor=poster_requested_upscale_factor_report,
                         poster_applied_upscale_factor=poster_applied_upscale_factor_report,
                         poster_fill_optimization_used=poster_fill_optimization_used_report,
@@ -4644,6 +4761,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                         "" if first_prepared.poster_cover_eligible is None else str(first_prepared.poster_cover_eligible).lower()
                     )
                     poster_enhancement_status_report = first_prepared.poster_enhancement_status
+                    poster_enhancement_tier_report = first_prepared.poster_enhancement_tier
+                    poster_source_ratio_report = f"{first_prepared.poster_source_ratio:.3f}"
                     poster_requested_upscale_factor_report = f"{first_prepared.poster_requested_upscale_factor:.3f}"
                     poster_applied_upscale_factor_report = f"{first_prepared.poster_applied_upscale_factor:.3f}"
                     poster_fill_optimization_used_report = first_prepared.poster_fill_optimization_used
@@ -4812,6 +4931,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     tote_active_placements=tote_active_placements_report,
                     poster_cover_eligible=poster_cover_eligible_report,
                     poster_enhancement_status=poster_enhancement_status_report,
+                    poster_enhancement_tier=poster_enhancement_tier_report,
+                    poster_source_ratio=poster_source_ratio_report,
                     poster_requested_upscale_factor=poster_requested_upscale_factor_report,
                     poster_applied_upscale_factor=poster_applied_upscale_factor_report,
                     poster_fill_optimization_used=poster_fill_optimization_used_report,
