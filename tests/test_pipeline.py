@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 import sys
@@ -115,6 +116,16 @@ from artwork_metadata_generator import (
     write_artwork_sidecar,
     preview_generated_metadata,
     select_artwork_metadata_generator,
+)
+from artwork_generation import (
+    ArtworkGenerationRequest,
+    GeneratedArtworkAsset,
+    build_generation_prompt,
+    choose_generation_aspect_modes,
+    generate_artwork_with_openai,
+    is_preview_or_low_value_asset,
+    plan_generated_artwork_targets,
+    validate_generated_asset_for_templates,
 )
 
 
@@ -3897,3 +3908,74 @@ def test_run_storefront_qa_cli_path_does_not_mutate(monkeypatch, tmp_path: Path)
     )
     assert called["process"] == 0
     assert state_path.read_text(encoding="utf-8") == before
+
+
+def test_parse_args_prompt_generation_flags(monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prog",
+            "--generate-artwork-from-prompt",
+            "--art-prompt",
+            "retro tiger sunset",
+            "--art-target-mode",
+            "multi",
+            "--art-count",
+            "2",
+        ],
+    )
+    args = pipeline.parse_args()
+    assert args.generate_artwork_from_prompt is True
+    assert args.art_prompt == "retro tiger sunset"
+    assert args.art_target_mode == "multi"
+    assert args.art_count == 2
+
+
+def test_artwork_generation_target_planning_modes():
+    assert choose_generation_aspect_modes(template_keys=["hoodie_unisex", "poster_24x36"], target_mode="auto") == ["portrait"]
+    assert choose_generation_aspect_modes(template_keys=["mug_11oz", "tote_bag"], target_mode="auto") == ["square"]
+    assert choose_generation_aspect_modes(template_keys=["hoodie_unisex", "mug_11oz"], target_mode="auto") == ["portrait", "square"]
+
+
+def test_plan_generated_artwork_targets_multi():
+    plan = plan_generated_artwork_targets(template_keys=["hoodie_unisex", "mug_11oz"], target_mode="auto")
+    assert [target.mode for target in plan.targets] == ["portrait", "square"]
+    assert any("Mixed template families" in reason for reason in plan.rationale)
+
+
+def test_openai_generation_client_can_be_mocked(tmp_path: Path):
+    payload = base64.b64encode(b"pngbytes").decode("ascii")
+
+    class StubImagesClient:
+        def __init__(self):
+            self.images = self
+
+        def generate(self, **kwargs):
+            return types.SimpleNamespace(data=[types.SimpleNamespace(b64_json=payload)])
+
+    req = ArtworkGenerationRequest(prompt="wolf", output_dir=tmp_path, base_name="wolf", count=1)
+    plan = plan_generated_artwork_targets(template_keys=["hoodie_unisex"], target_mode="portrait")
+    assets = generate_artwork_with_openai(request=req, plan=plan, client=StubImagesClient())
+    assert len(assets) == 1
+    assert assets[0].path.exists()
+    assert assets[0].path.read_bytes() == b"pngbytes"
+
+
+def test_source_hygiene_filters_preview_and_tiny_assets(tmp_path: Path):
+    preview_path = tmp_path / "my-removebg-preview.png"
+    preview_path.write_bytes(b"x")
+    assert is_preview_or_low_value_asset(preview_path) is True
+
+    tiny = GeneratedArtworkAsset(path=tmp_path / "tiny.png", mode="square", concept_index=1, width=512, height=512)
+    assert validate_generated_asset_for_templates(tiny, min_width=1024, min_height=1024).startswith("tiny_source_")
+
+
+def test_build_generation_prompt_includes_pod_composition_rules():
+    request = ArtworkGenerationRequest(prompt="vintage truck", visible_text="")
+    prompt = build_generation_prompt(request, mode="portrait")
+    assert "not a product mockup" in prompt
+    assert "strong subject fill" in prompt
+    assert "Do not add any text" in prompt
