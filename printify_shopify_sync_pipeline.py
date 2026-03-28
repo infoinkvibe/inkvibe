@@ -27,10 +27,17 @@ import content_engine
 import state_store
 from artwork_metadata_generator import (
     MetadataGeneratorMode,
+    MetadataReviewDecision,
+    MetadataReviewRow,
+    build_metadata_review_row,
     discover_artwork_images,
+    evaluate_generated_metadata,
+    export_metadata_review_csv,
+    export_metadata_review_json,
     preview_generated_metadata,
     select_artwork_metadata_generator,
     should_write_sidecar,
+    should_auto_approve_metadata,
     write_artwork_sidecar,
 )
 
@@ -2164,6 +2171,12 @@ def run_artwork_metadata_generation(
     metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value,
     metadata_openai_model: str = "",
     metadata_openai_timeout: float = 30.0,
+    metadata_auto_approve: bool = False,
+    metadata_min_confidence: float = 0.9,
+    metadata_review_report: str = "",
+    metadata_review_json: str = "",
+    metadata_write_auto_approved_only: bool = False,
+    metadata_allow_review_writes: bool = False,
 ) -> None:
     generator = select_artwork_metadata_generator(
         mode=metadata_generator,
@@ -2176,34 +2189,102 @@ def run_artwork_metadata_generation(
     output_dir = pathlib.Path(metadata_output_dir) if metadata_output_dir else None
 
     candidates = [generator.generate_metadata_for_artwork(path) for path in artwork_paths]
+    approval_mode_enabled = bool(
+        metadata_auto_approve
+        or metadata_write_auto_approved_only
+        or metadata_review_report
+        or metadata_review_json
+        or metadata_allow_review_writes
+    )
+    review_decisions: Dict[str, MetadataReviewDecision] = {}
+    for candidate in candidates:
+        decision = evaluate_generated_metadata(candidate, min_confidence=metadata_min_confidence)
+        review_decisions[str(candidate.image_path)] = decision
     if metadata_preview or not write_sidecars:
         preview_text = preview_generated_metadata(candidates)
+        if approval_mode_enabled and preview_text:
+            lines: List[str] = []
+            for line in preview_text.splitlines():
+                lines.append(line)
+                if line.startswith("[") and " -> " in line:
+                    image_name = line.split("] ", 1)[-1].split(" -> ", 1)[0].strip()
+                    candidate = next((item for item in candidates if item.image_path.name == image_name), None)
+                    if candidate:
+                        decision = review_decisions.get(str(candidate.image_path))
+                        if decision:
+                            reasons = ", ".join(decision.review_reasons) if decision.review_reasons else "none"
+                            lines.append(
+                                f"    approval_status: {decision.approval_status} "
+                                f"(confidence={decision.confidence:.3f}, reasons={reasons})"
+                            )
+            preview_text = "\n".join(lines)
         if preview_text:
             print(preview_text)
         logger.info("Artwork metadata preview generated artworks=%s", len(candidates))
+
+    review_rows: List[MetadataReviewRow] = []
+    for candidate in candidates:
+        review_rows.append(build_metadata_review_row(candidate, review_decisions[str(candidate.image_path)]))
+    if metadata_review_report:
+        export_metadata_review_csv(review_rows, pathlib.Path(metadata_review_report))
+    if metadata_review_json:
+        export_metadata_review_json(review_rows, pathlib.Path(metadata_review_json))
 
     if not write_sidecars:
         return
 
     write_count = 0
     skipped_count = 0
+    review_skipped_count = 0
+    rejected_count = 0
+    auto_approved_count = 0
     for candidate in candidates:
         target_sidecar = candidate.sidecar_path if not output_dir else (output_dir / f"{candidate.image_path.stem}.json")
+        decision = review_decisions[str(candidate.image_path)]
+        enforce_auto_approved_only = metadata_auto_approve or metadata_write_auto_approved_only
+        can_write_for_approval = True
+        if approval_mode_enabled:
+            if decision.approval_status == "auto_approved":
+                auto_approved_count += 1
+            if decision.approval_status == "rejected":
+                rejected_count += 1
+                can_write_for_approval = False
+            elif enforce_auto_approved_only and not should_auto_approve_metadata(decision):
+                can_write_for_approval = bool(metadata_allow_review_writes)
+            elif decision.approval_status == "needs_review" and not metadata_allow_review_writes and metadata_auto_approve:
+                can_write_for_approval = False
+        if not can_write_for_approval:
+            review_skipped_count += 1
+            skipped_count += 1
+            decision.would_write_sidecar = False
+            continue
         if not should_write_sidecar(
             target_sidecar,
             overwrite_sidecars=overwrite_sidecars,
             only_missing=metadata_only_missing and not overwrite_sidecars,
         ):
             skipped_count += 1
+            decision.would_write_sidecar = False
             continue
         write_artwork_sidecar(candidate=candidate, output_dir=output_dir)
         write_count += 1
+        decision.would_write_sidecar = True
+
+    if metadata_review_report or metadata_review_json:
+        review_rows = [build_metadata_review_row(candidate, review_decisions[str(candidate.image_path)]) for candidate in candidates]
+        if metadata_review_report:
+            export_metadata_review_csv(review_rows, pathlib.Path(metadata_review_report))
+        if metadata_review_json:
+            export_metadata_review_json(review_rows, pathlib.Path(metadata_review_json))
 
     logger.info(
-        "Artwork metadata generation complete generated=%s written=%s skipped=%s overwrite=%s only_missing=%s generator=%s",
+        "Artwork metadata generation complete generated=%s written=%s skipped=%s review_skipped=%s rejected=%s auto_approved=%s overwrite=%s only_missing=%s generator=%s",
         len(candidates),
         write_count,
         skipped_count,
+        review_skipped_count,
+        rejected_count,
+        auto_approved_count,
         overwrite_sidecars,
         metadata_only_missing and not overwrite_sidecars,
         metadata_generator,
@@ -4629,6 +4710,12 @@ def parse_args() -> argparse.Namespace:
         default=30.0,
         help="OpenAI metadata request timeout in seconds",
     )
+    parser.add_argument("--metadata-auto-approve", action="store_true", help="Enable confidence/quality gated metadata approval workflow")
+    parser.add_argument("--metadata-min-confidence", type=float, default=0.9, help="Minimum confidence required for metadata auto-approval")
+    parser.add_argument("--metadata-review-report", default="", help="Optional CSV path for metadata review queue export")
+    parser.add_argument("--metadata-review-json", default="", help="Optional JSON path for metadata review queue export")
+    parser.add_argument("--metadata-write-auto-approved-only", action="store_true", help="When writing sidecars, write only auto-approved metadata candidates")
+    parser.add_argument("--metadata-allow-review-writes", action="store_true", help="Allow writes for needs_review metadata candidates (off by default)")
     parser.add_argument("--launch-plan", default="", help="Optional CSV launch plan path; when set, process enabled rows instead of folder-scan combinations")
     parser.add_argument("--export-launch-plan-template", default="", help="Write a starter launch-plan CSV template to this path and exit")
     parser.add_argument("--export-launch-plan-from-images", default="", help="Write a launch-plan CSV generated from files in --image-dir and exit")
@@ -4842,7 +4929,7 @@ def run_catalog_cli(
     return False
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "") -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "") -> None:
     if publish_mode not in {"default", "publish", "skip"}:
         raise RuntimeError(f"Unsupported publish mode: {publish_mode}")
 
@@ -4863,6 +4950,12 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             metadata_generator=metadata_generator,
             metadata_openai_model=metadata_openai_model,
             metadata_openai_timeout=metadata_openai_timeout,
+            metadata_auto_approve=metadata_auto_approve,
+            metadata_min_confidence=metadata_min_confidence,
+            metadata_review_report=metadata_review_report,
+            metadata_review_json=metadata_review_json,
+            metadata_write_auto_approved_only=metadata_write_auto_approved_only,
+            metadata_allow_review_writes=metadata_allow_review_writes,
         )
         return
 
@@ -5232,6 +5325,12 @@ if __name__ == "__main__":
             metadata_generator=args.metadata_generator,
             metadata_openai_model=args.metadata_openai_model,
             metadata_openai_timeout=args.metadata_openai_timeout,
+            metadata_auto_approve=args.metadata_auto_approve,
+            metadata_min_confidence=args.metadata_min_confidence,
+            metadata_review_report=args.metadata_review_report,
+            metadata_review_json=args.metadata_review_json,
+            metadata_write_auto_approved_only=args.metadata_write_auto_approved_only,
+            metadata_allow_review_writes=args.metadata_allow_review_writes,
             launch_plan_path=args.launch_plan,
             export_launch_plan_template=args.export_launch_plan_template,
             export_launch_plan_from_images_path=args.export_launch_plan_from_images,

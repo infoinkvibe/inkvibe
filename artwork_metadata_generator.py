@@ -7,9 +7,10 @@ import os
 import pathlib
 import re
 import base64
+import csv
 from collections import Counter
 from enum import Enum
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 from PIL import Image, ImageStat
@@ -69,6 +70,33 @@ class GeneratedArtworkMetadataCandidate:
     rationale: str = ""
     source_signals: List[str] | None = None
     debug_signals: Dict[str, Any] | None = None
+
+
+@dataclass
+class MetadataReviewDecision:
+    approval_status: str
+    confidence: float
+    review_reasons: List[str]
+    quality_flags: List[str]
+    would_write_sidecar: bool = False
+
+
+@dataclass
+class MetadataReviewRow:
+    artwork_filename: str
+    proposed_title: str
+    subtitle: str
+    short_description_preview: str
+    tags_preview: str
+    detected_subject: str
+    visible_text: str
+    confidence: float
+    generator_mode: str
+    provenance_markers: str
+    approval_status: str
+    review_reasons: str
+    quality_flags: str
+    would_write_sidecar: bool
 
 
 class MetadataGeneratorMode(str, Enum):
@@ -754,6 +782,157 @@ def preview_generated_metadata(candidates: Sequence[GeneratedArtworkMetadataCand
     return "\n".join(lines)
 
 
+def should_auto_approve_metadata(decision: MetadataReviewDecision) -> bool:
+    return decision.approval_status == "auto_approved"
+
+
+def evaluate_generated_metadata(
+    candidate: GeneratedArtworkMetadataCandidate,
+    *,
+    min_confidence: float = 0.9,
+    max_tags: int = 18,
+) -> MetadataReviewDecision:
+    payload = candidate.metadata.as_sidecar_dict()
+    debug = candidate.debug_signals or {}
+    confidence = _safe_float(debug.get("confidence"), default=0.0)
+    detected_subject = str(debug.get("detected_subject") or "").strip().lower()
+    visible_text = _clean_list(debug.get("visible_text", []))
+    title = payload.get("title", "").strip()
+    description = payload.get("description", "").strip()
+    tags = _dedupe(payload.get("tags", []))
+    sources = [str(item).strip().lower() for item in (candidate.source_signals or []) if str(item).strip()]
+
+    review_reasons: List[str] = []
+    quality_flags: List[str] = []
+    rejection_flags: List[str] = []
+    generic_title_phrases = {
+        "signature product",
+        "signature design",
+        "graphic design",
+        "digital artwork",
+        "art print",
+    }
+    generic_description_phrases = {
+        "perfect for any occasion",
+        "great gift idea",
+        "style upgrade",
+        "versatile piece",
+    }
+    generic_tags = {
+        "art",
+        "design",
+        "graphic",
+        "print",
+        "poster",
+        "wall art",
+        "gift",
+        "home decor",
+        "creative",
+    }
+
+    if not title:
+        rejection_flags.append("missing_title")
+    if not description:
+        rejection_flags.append("missing_description")
+    if not tags:
+        rejection_flags.append("missing_tags")
+
+    if confidence < float(min_confidence):
+        review_reasons.append("confidence_below_threshold")
+    if not detected_subject and ("openai" in candidate.generator or "vision" in candidate.generator):
+        review_reasons.append("no_detected_subject")
+    if title.lower() in generic_title_phrases or "signature product" in title.lower():
+        quality_flags.append("title_generic_filler")
+    if len(title) > 96:
+        quality_flags.append("title_too_long")
+    if len(description.split()) < 8:
+        quality_flags.append("description_too_vague")
+    if len(description) > 420:
+        quality_flags.append("description_too_long")
+    if any(phrase in description.lower() for phrase in generic_description_phrases):
+        quality_flags.append("description_generic_filler")
+    if len(tags) > max_tags:
+        quality_flags.append("tags_too_many")
+    if len(set(term.lower() for term in tags)) != len(tags):
+        quality_flags.append("tags_duplicate_terms")
+    if tags and all(tag.lower() in generic_tags for tag in tags):
+        quality_flags.append("tags_generic_only")
+    if detected_subject:
+        subject_tokens = [token for token in re.split(r"[^a-z0-9]+", detected_subject) if token]
+        haystack = " ".join([title.lower(), description.lower(), " ".join(tag.lower() for tag in tags)])
+        if subject_tokens and not any(token in haystack for token in subject_tokens):
+            quality_flags.append("subject_signal_mismatch")
+    if "fallback" in sources:
+        review_reasons.append("fallback_chain_triggered")
+    if visible_text and confidence < (float(min_confidence) + 0.05):
+        review_reasons.append("visible_text_signal_used_while_uncertain")
+
+    if rejection_flags:
+        return MetadataReviewDecision(
+            approval_status="rejected",
+            confidence=confidence,
+            review_reasons=_dedupe(review_reasons + rejection_flags),
+            quality_flags=_dedupe(quality_flags + rejection_flags),
+        )
+
+    all_reasons = _dedupe(review_reasons + quality_flags)
+    if confidence >= float(min_confidence) and not all_reasons:
+        return MetadataReviewDecision(
+            approval_status="auto_approved",
+            confidence=confidence,
+            review_reasons=[],
+            quality_flags=[],
+        )
+    return MetadataReviewDecision(
+        approval_status="needs_review",
+        confidence=confidence,
+        review_reasons=all_reasons,
+        quality_flags=quality_flags,
+    )
+
+
+def build_metadata_review_row(
+    candidate: GeneratedArtworkMetadataCandidate,
+    decision: MetadataReviewDecision,
+) -> MetadataReviewRow:
+    payload = candidate.metadata.as_sidecar_dict()
+    debug = candidate.debug_signals or {}
+    return MetadataReviewRow(
+        artwork_filename=candidate.image_path.name,
+        proposed_title=payload.get("title", ""),
+        subtitle=payload.get("subtitle", ""),
+        short_description_preview=_truncate_text(payload.get("description", ""), 140),
+        tags_preview=", ".join(payload.get("tags", [])[:12]),
+        detected_subject=str(debug.get("detected_subject", "")).strip(),
+        visible_text=", ".join(_clean_list(debug.get("visible_text", []))),
+        confidence=round(float(decision.confidence), 3),
+        generator_mode=candidate.generator,
+        provenance_markers=", ".join(candidate.source_signals or []),
+        approval_status=decision.approval_status,
+        review_reasons=", ".join(decision.review_reasons),
+        quality_flags=", ".join(decision.quality_flags),
+        would_write_sidecar=bool(decision.would_write_sidecar),
+    )
+
+
+def export_metadata_review_csv(rows: Sequence[MetadataReviewRow], output_path: pathlib.Path) -> pathlib.Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(asdict(rows[0]).keys()) if rows else list(MetadataReviewRow.__dataclass_fields__.keys())
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(asdict(row))
+    return output_path
+
+
+def export_metadata_review_json(rows: Sequence[MetadataReviewRow], output_path: pathlib.Path) -> pathlib.Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = [asdict(row) for row in rows]
+    output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return output_path
+
+
 def select_artwork_metadata_generator(
     *,
     mode: str = MetadataGeneratorMode.HEURISTIC.value,
@@ -1057,6 +1236,20 @@ def _clean_list(value: Any) -> List[str]:
     if isinstance(value, (list, tuple, set)):
         return _dedupe(str(item) for item in value)
     return []
+
+
+def _safe_float(value: Any, *, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _truncate_text(value: str, limit: int) -> str:
+    normalized = re.sub(r"\s+", " ", str(value or "").strip())
+    if len(normalized) <= limit:
+        return normalized
+    return f"{normalized[: max(0, limit - 3)].rstrip()}..."
 
 
 def _load_dotenv_if_available() -> None:

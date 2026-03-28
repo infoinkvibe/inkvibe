@@ -506,6 +506,7 @@ Safe defaults:
 - `--write-sidecars` writes generated sidecars.
 - Existing sidecars are preserved by default (`--metadata-only-missing` safe mode).
 - `--overwrite-sidecars` is required to replace existing sidecars.
+- `--metadata-auto-approve` adds confidence/quality gating so low-confidence results are queued for review instead of written by default.
 
 Common commands:
 
@@ -523,6 +524,16 @@ python printify_shopify_sync_pipeline.py \
   --metadata-max-artworks 20 \
   --image-dir ./images
 
+# Auto-approve only high-confidence metadata and export review queue
+python printify_shopify_sync_pipeline.py \
+  --generate-artwork-metadata \
+  --write-sidecars \
+  --metadata-auto-approve \
+  --metadata-min-confidence 0.90 \
+  --metadata-review-report ./exports/metadata_review.csv \
+  --metadata-review-json ./exports/metadata_review.json \
+  --image-dir ./images
+
 # Explicitly overwrite existing sidecars (opt-in only)
 python printify_shopify_sync_pipeline.py \
   --generate-artwork-metadata \
@@ -537,6 +548,12 @@ Optional controls:
 - `--metadata-generator heuristic|vision|openai|auto` chooses generator mode.
 - `--metadata-openai-model <model>` overrides model for OpenAI mode.
 - `--metadata-openai-timeout <seconds>` sets API timeout for OpenAI mode.
+- `--metadata-auto-approve` enables confidence/quality routing (`auto_approved`, `needs_review`, `rejected`).
+- `--metadata-min-confidence <float>` sets minimum confidence for auto-approval (default `0.90`).
+- `--metadata-review-report <path>` exports spreadsheet-friendly review CSV with reasons/flags and write intent.
+- `--metadata-review-json <path>` exports optional JSON review payload.
+- `--metadata-write-auto-approved-only` enforces approved-only writes in write mode.
+- `--metadata-allow-review-writes` allows writing `needs_review` candidates (off by default).
 
 OpenAI mode notes:
 - Set `OPENAI_API_KEY` in your environment (or `.env`) to enable OpenAI-backed vision metadata.

@@ -97,14 +97,21 @@ from printify_shopify_sync_pipeline import (
 )
 from artwork_metadata_generator import (
     CompositeArtworkMetadataGenerator,
+    GeneratedArtworkMetadata,
+    GeneratedArtworkMetadataCandidate,
     HeuristicArtworkMetadataGenerator,
     LocalVisionAnalyzer,
+    MetadataReviewDecision,
     MetadataGeneratorMode,
     OpenAiArtworkMetadataGenerator,
     OpenAiVisionAnalyzer,
     VisionAnalysis,
     VisionArtworkMetadataGenerator,
+    build_metadata_review_row,
+    evaluate_generated_metadata,
+    export_metadata_review_csv,
     should_write_sidecar,
+    should_auto_approve_metadata,
     write_artwork_sidecar,
     preview_generated_metadata,
     select_artwork_metadata_generator,
@@ -141,6 +148,16 @@ class StubOpenAiClient:
         if self.error:
             raise self.error
         return types.SimpleNamespace(output_text=self.output_text)
+
+
+class StubMetadataGenerator:
+    name = "stub_review_generator"
+
+    def __init__(self, candidates):
+        self._candidates = candidates
+
+    def generate_metadata_for_artwork(self, image_path: Path):
+        return self._candidates[image_path.name]
 
 
 def test_template_validation_rejects_missing_fields(tmp_path: Path):
@@ -821,6 +838,125 @@ def test_metadata_preview_surfaces_vision_debug_signals(tmp_path: Path, capsys):
     out = capsys.readouterr().out
     assert "detected_subject: lion" in out
     assert "confidence:" in out
+
+
+def test_metadata_review_decision_auto_approved_for_high_confidence_subject(tmp_path: Path):
+    image = tmp_path / "wolf.png"
+    Image.new("RGB", (512, 512), (80, 70, 60)).save(image)
+    candidate = GeneratedArtworkMetadataCandidate(
+        image_path=image,
+        sidecar_path=image.with_suffix(".json"),
+        metadata=GeneratedArtworkMetadata(
+            title="Moonlit Wolf Trail",
+            subtitle="Wildlife nightscape",
+            description="A moonlit wolf crossing a pine ridge with calm, cinematic atmosphere.",
+            tags=["wolf", "wildlife", "forest", "night"],
+            seo_keywords=["wolf print"],
+            audience="wildlife decor fans",
+            style_keywords=["cinematic"],
+            theme="Moonlit Wilderness",
+            collection="Moonlit Wilderness",
+        ),
+        generator="openai:openai_subject",
+        source_signals=["openai_vision_subject"],
+        debug_signals={"confidence": 0.97, "detected_subject": "wolf", "visible_text": []},
+    )
+    decision = evaluate_generated_metadata(candidate, min_confidence=0.9)
+    assert decision.approval_status == "auto_approved"
+    assert should_auto_approve_metadata(decision) is True
+
+
+def test_metadata_review_decision_needs_review_for_low_confidence_generic(tmp_path: Path):
+    image = tmp_path / "generic.png"
+    Image.new("RGB", (512, 512), (90, 90, 90)).save(image)
+    candidate = GeneratedArtworkMetadataCandidate(
+        image_path=image,
+        sidecar_path=image.with_suffix(".json"),
+        metadata=GeneratedArtworkMetadata(
+            title="Signature Product",
+            description="Great gift idea.",
+            tags=["art", "design", "print"],
+        ),
+        generator="openai:openai_subject",
+        source_signals=["openai_vision_subject", "fallback"],
+        debug_signals={"confidence": 0.52, "detected_subject": "", "visible_text": ["stay wild"]},
+    )
+    decision = evaluate_generated_metadata(candidate, min_confidence=0.9)
+    assert decision.approval_status == "needs_review"
+    assert "confidence_below_threshold" in decision.review_reasons
+
+
+def test_metadata_review_csv_exports_rows(tmp_path: Path):
+    image = tmp_path / "row.png"
+    Image.new("RGB", (200, 200), (120, 100, 90)).save(image)
+    candidate = GeneratedArtworkMetadataCandidate(
+        image_path=image,
+        sidecar_path=image.with_suffix(".json"),
+        metadata=GeneratedArtworkMetadata(title="Forest Fox", description="A fox in forest light.", tags=["fox", "forest"]),
+        generator="vision:vision_subject",
+        source_signals=["local_vision_subject"],
+        debug_signals={"confidence": 0.94, "detected_subject": "fox"},
+    )
+    decision = MetadataReviewDecision(approval_status="auto_approved", confidence=0.94, review_reasons=[], quality_flags=[], would_write_sidecar=True)
+    row = build_metadata_review_row(candidate, decision)
+    report = tmp_path / "review.csv"
+    export_metadata_review_csv([row], report)
+    text = report.read_text(encoding="utf-8")
+    assert "artwork_filename" in text
+    assert "row.png" in text
+    assert "auto_approved" in text
+
+
+def test_metadata_auto_approved_only_write_mode_skips_review_needed(tmp_path: Path, monkeypatch):
+    high_image = tmp_path / "high.png"
+    low_image = tmp_path / "low.png"
+    Image.new("RGB", (512, 512), (120, 120, 120)).save(high_image)
+    Image.new("RGB", (512, 512), (80, 80, 80)).save(low_image)
+    candidates = {
+        "high.png": GeneratedArtworkMetadataCandidate(
+            image_path=high_image,
+            sidecar_path=high_image.with_suffix(".json"),
+            metadata=GeneratedArtworkMetadata(
+                title="Golden Lion",
+                description="A striking lion portrait with warm golden tones and textured brushwork.",
+                tags=["lion", "wildlife", "golden"],
+            ),
+            generator="openai:openai_subject",
+            source_signals=["openai_vision_subject"],
+            debug_signals={"confidence": 0.96, "detected_subject": "lion", "visible_text": []},
+        ),
+        "low.png": GeneratedArtworkMetadataCandidate(
+            image_path=low_image,
+            sidecar_path=low_image.with_suffix(".json"),
+            metadata=GeneratedArtworkMetadata(title="Signature Product", description="Great gift idea.", tags=["art", "design", "print"]),
+            generator="openai:openai_subject",
+            source_signals=["openai_vision_subject"],
+            debug_signals={"confidence": 0.45, "detected_subject": "", "visible_text": []},
+        ),
+    }
+    monkeypatch.setattr("printify_shopify_sync_pipeline.select_artwork_metadata_generator", lambda **kwargs: StubMetadataGenerator(candidates))
+
+    report = tmp_path / "metadata-review.csv"
+    run_artwork_metadata_generation(
+        image_dir=tmp_path,
+        metadata_preview=False,
+        write_sidecars=True,
+        overwrite_sidecars=False,
+        metadata_only_missing=True,
+        metadata_max_artworks=0,
+        metadata_output_dir="",
+        metadata_auto_approve=True,
+        metadata_min_confidence=0.9,
+        metadata_review_report=str(report),
+        metadata_write_auto_approved_only=True,
+        metadata_allow_review_writes=False,
+    )
+
+    assert high_image.with_suffix(".json").exists()
+    assert not low_image.with_suffix(".json").exists()
+    report_text = report.read_text(encoding="utf-8")
+    assert "needs_review" in report_text
+    assert "auto_approved" in report_text
 
 
 def test_vision_subject_titles_are_not_generic_palette_labels(tmp_path: Path):
