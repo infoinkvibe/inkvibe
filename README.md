@@ -499,7 +499,7 @@ Example sidecar files:
 
 ### Reviewable artwork metadata generation workflow
 
-Use the metadata generator to create candidate sidecars from local image analysis (color palette, contrast, composition cues) without changing create/update/publish flows.
+Use the metadata generator to create candidate sidecars from image analysis without changing create/update/publish flows.
 
 Safe defaults:
 - `--generate-artwork-metadata` with `--metadata-preview` previews only (no writes).
@@ -534,6 +534,15 @@ python printify_shopify_sync_pipeline.py \
 Optional controls:
 - `--metadata-max-artworks <n>` limit batch size.
 - `--metadata-output-dir <path>` write generated sidecars to a review folder instead of beside source images.
+- `--metadata-generator heuristic|vision|openai|auto` chooses generator mode.
+- `--metadata-openai-model <model>` overrides model for OpenAI mode.
+- `--metadata-openai-timeout <seconds>` sets API timeout for OpenAI mode.
+
+OpenAI mode notes:
+- Set `OPENAI_API_KEY` in your environment (or `.env`) to enable OpenAI-backed vision metadata.
+- Optional `OPENAI_MODEL` env var sets the default model (unless overridden by `--metadata-openai-model`).
+- `auto` mode now prefers `openai`, then local `vision`, then `heuristic` fallback.
+- Missing key / API errors gracefully fall back and are surfaced in preview `sources:` output.
 
 Preview listing copy without creating/updating products:
 

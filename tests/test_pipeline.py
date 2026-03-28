@@ -100,6 +100,8 @@ from artwork_metadata_generator import (
     HeuristicArtworkMetadataGenerator,
     LocalVisionAnalyzer,
     MetadataGeneratorMode,
+    OpenAiArtworkMetadataGenerator,
+    OpenAiVisionAnalyzer,
     VisionAnalysis,
     VisionArtworkMetadataGenerator,
     should_write_sidecar,
@@ -127,6 +129,18 @@ class StubVisionAnalyzer:
 
     def analyze_image(self, image_path: Path) -> VisionAnalysis | None:
         return self.analysis
+
+
+class StubOpenAiClient:
+    def __init__(self, output_text: str = "", error: Exception | None = None):
+        self.output_text = output_text
+        self.error = error
+        self.responses = self
+
+    def create(self, **kwargs):
+        if self.error:
+            raise self.error
+        return types.SimpleNamespace(output_text=self.output_text)
 
 
 def test_template_validation_rejects_missing_fields(tmp_path: Path):
@@ -647,6 +661,8 @@ def test_metadata_generator_strategy_selection_modes():
 
     auto = select_artwork_metadata_generator(mode=MetadataGeneratorMode.AUTO.value)
     assert isinstance(auto, CompositeArtworkMetadataGenerator)
+    openai = select_artwork_metadata_generator(mode=MetadataGeneratorMode.OPENAI.value)
+    assert isinstance(openai, CompositeArtworkMetadataGenerator)
 
 
 def test_vision_generator_supports_injected_analyzer(tmp_path: Path):
@@ -686,6 +702,75 @@ def test_auto_metadata_generator_falls_back_to_heuristic(tmp_path: Path):
     assert candidate.metadata.title
 
 
+def test_openai_analyzer_missing_api_key_degrades_safely(tmp_path: Path):
+    image = tmp_path / "openai-missing-key.png"
+    Image.new("RGB", (500, 500), (45, 40, 70)).save(image)
+    analyzer = OpenAiVisionAnalyzer(api_key="", client=StubOpenAiClient())
+    assert analyzer.analyze_image_with_metadata(image) is None
+
+
+def test_openai_generator_supports_mocked_response(tmp_path: Path):
+    image = tmp_path / "uuid-like-8321310.png"
+    Image.new("RGB", (640, 640), (90, 120, 160)).save(image)
+    payload = {
+        "main_subject": "moonlit wolf",
+        "supporting_subjects": ["pine forest"],
+        "visible_design_text": ["stay wild"],
+        "visual_style": ["painterly", "moody"],
+        "mood": "moody",
+        "color_story": ["midnight blue", "silver"],
+        "likely_buyer_appeal": ["wildlife", "outdoors"],
+        "title": "Moonlit Wolf",
+        "subtitle": "Atmospheric wildlife artwork",
+        "description": "A moonlit wolf stands at the edge of a pine forest in a calm, cinematic scene.",
+        "tags": ["wolf", "wildlife art", "forest", "moody"],
+        "seo_keywords": ["wolf wall art", "moonlit wolf print"],
+        "audience": "Wildlife and outdoors decor fans",
+        "style_keywords": ["painterly", "cinematic"],
+        "theme": "Moonlit Wilderness",
+        "collection": "Moonlit Wilderness",
+        "occasion": "",
+        "artist_note": "Generated from image-first OpenAI vision analysis.",
+    }
+    analyzer = OpenAiVisionAnalyzer(
+        api_key="test-key",
+        model="gpt-test",
+        client=StubOpenAiClient(output_text=json.dumps(payload)),
+    )
+    generator = OpenAiArtworkMetadataGenerator(analyzer=analyzer)
+    candidate = generator.generate_metadata_for_artwork(image)
+    sidecar = candidate.metadata.as_sidecar_dict()
+    assert "wolf" in sidecar["title"].lower()
+    assert "wolf" in " ".join(sidecar["tags"]).lower()
+    assert "openai_vision_subject" in (candidate.source_signals or [])
+    preview = preview_generated_metadata([candidate])
+    assert "openai_vision_subject" in preview
+    assert "openai_vision_text" in preview
+
+
+def test_auto_mode_prefers_openai_then_falls_back_to_vision_then_heuristic(tmp_path: Path):
+    image = tmp_path / "lion-retro.png"
+    Image.new("RGB", (640, 640), (120, 95, 80)).save(image)
+    failing_openai = OpenAiVisionAnalyzer(api_key="test-key", client=StubOpenAiClient(error=RuntimeError("boom")))
+    generator = select_artwork_metadata_generator(
+        mode=MetadataGeneratorMode.AUTO.value,
+        openai_analyzer=failing_openai,
+    )
+    candidate = generator.generate_metadata_for_artwork(image)
+    assert candidate.generator.startswith("auto:openai:vision_subject")
+    assert "lion" in candidate.metadata.title.lower()
+
+
+def test_openai_mode_missing_key_can_fallback_to_heuristic(tmp_path: Path):
+    image = tmp_path / "ai-generated-8321310.png"
+    Image.new("RGB", (640, 480), (70, 100, 150)).save(image)
+    generator = select_artwork_metadata_generator(mode=MetadataGeneratorMode.OPENAI.value)
+    candidate = generator.generate_metadata_for_artwork(image)
+    assert candidate.generator.startswith("openai:")
+    assert "fallback" in (candidate.source_signals or [])
+    assert candidate.metadata.title
+
+
 def test_vision_mode_uses_local_subject_detection_from_filename(tmp_path: Path):
     image = tmp_path / "majestic-lion-retro.png"
     Image.new("RGB", (600, 600), (140, 90, 55)).save(image)
@@ -695,7 +780,7 @@ def test_vision_mode_uses_local_subject_detection_from_filename(tmp_path: Path):
     assert "lion" in title
     assert candidate.generator.startswith("vision:")
     assert "fallback" not in (candidate.source_signals or [])
-    assert "vision_subject" in (candidate.source_signals or [])
+    assert "local_vision_subject" in (candidate.source_signals or [])
 
 
 def test_auto_mode_prefers_subject_aware_over_heuristic_when_detected(tmp_path: Path):
@@ -703,7 +788,7 @@ def test_auto_mode_prefers_subject_aware_over_heuristic_when_detected(tmp_path: 
     Image.new("RGB", (640, 480), (80, 80, 90)).save(image)
     generator = select_artwork_metadata_generator(mode=MetadataGeneratorMode.AUTO.value)
     candidate = generator.generate_metadata_for_artwork(image)
-    assert candidate.generator.startswith("auto:vision_subject")
+    assert candidate.generator.startswith("auto:openai:vision_subject")
     assert "wolf" in candidate.metadata.title.lower()
     assert "heuristic_palette" not in (candidate.source_signals or [])
 
