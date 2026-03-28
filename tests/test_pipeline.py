@@ -99,6 +99,8 @@ from printify_shopify_sync_pipeline import (
     normalize_theme_tag,
     extract_theme_signal_candidates,
     choose_best_theme_signal,
+    choose_preferred_featured_variant_color,
+    resolve_family_collection_target,
 )
 from artwork_metadata_generator import (
     CompositeArtworkMetadataGenerator,
@@ -3748,6 +3750,49 @@ def test_sync_shopify_collection_dry_run_returns_non_mutating_status():
         verify_membership=False,
     )
     assert result["collection_sync_status"] == "dry-run"
+
+
+def test_family_collection_mapping_routes_active_families_correctly():
+    templates = load_templates(Path("product_templates.json"))
+    actual = {template.key: resolve_family_collection_target(template).get("handle", "") for template in templates}
+    assert actual["tshirt_gildan"] == "t-shirts"
+    assert actual["longsleeve_gildan"] == "long-sleeve-shirts"
+    assert actual["hoodie_gildan"] == "hoodies"
+    assert actual["sweatshirt_gildan"] == "sweatshirts"
+    assert actual["mug_new"] == "mugs"
+    assert actual["poster_basic"] == "posters"
+    assert actual["tote_basic"] == "tote-bags"
+
+
+def test_preferred_mockup_color_selection_prefers_non_white_when_available():
+    template = ProductTemplate(
+        key="tshirt_gildan",
+        printify_blueprint_id=6,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="<p>{artwork_title}</p>",
+        placements=[PlacementRequirement("front", 100, 100)],
+        preferred_mockup_colors=["Black", "Dark Heather", "White"],
+    )
+    variants = [
+        {"options": {"color": "White"}},
+        {"options": {"color": "Black"}},
+    ]
+    assert choose_preferred_featured_variant_color(template=template, variant_rows=variants) == "Black"
+
+
+def test_preferred_mockup_color_selection_falls_back_when_preferred_missing():
+    template = ProductTemplate(
+        key="tshirt_gildan",
+        printify_blueprint_id=6,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="<p>{artwork_title}</p>",
+        placements=[PlacementRequirement("front", 100, 100)],
+        preferred_mockup_colors=["Black"],
+    )
+    variants = [{"options": {"color": "White"}}]
+    assert choose_preferred_featured_variant_color(template=template, variant_rows=variants) == "White"
 
 
 def test_process_artwork_collection_sync_fields_in_run_report(tmp_path: Path, monkeypatch):

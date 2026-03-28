@@ -234,6 +234,12 @@ class ProductTemplate:
     poster_safe_min_source_ratio: Optional[float] = None
     poster_fill_target_pct: Optional[float] = None
     poster_trim_fill_optimization: bool = False
+    preferred_mockup_colors: List[str] = field(default_factory=list)
+    preferred_default_variant_color: Optional[str] = None
+    preferred_mockup_types: List[str] = field(default_factory=list)
+    preferred_featured_image_strategy: str = "variant_color_then_mockup_type"
+    preferred_mockup_position: Optional[str] = None
+    secondary_collection_handles: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -327,6 +333,14 @@ class RunReportRow:
     poster_requested_upscale_factor: str = ""
     poster_applied_upscale_factor: str = ""
     poster_fill_optimization_used: bool = False
+    family_collection_handle: str = ""
+    collection_image_source: str = ""
+    collection_sort_strategy: str = ""
+    preferred_featured_variant_color: str = ""
+    selected_featured_mockup_color: str = ""
+    featured_image_strategy: str = ""
+    featured_image_source: str = ""
+    tote_scale_strategy: str = ""
 
 
 @dataclass
@@ -388,6 +402,9 @@ class LaunchPlanRow:
     launch_name: str = ""
     campaign: str = ""
     merch_theme: str = ""
+    collection_image_src: str = ""
+    collection_sort_order: str = ""
+    secondary_collection_handles: str = ""
 
 
 @dataclass
@@ -513,7 +530,20 @@ LAUNCH_PLAN_OVERRIDE_COLUMNS = [
     "launch_name",
     "campaign",
     "merch_theme",
+    "collection_image_src",
+    "collection_sort_order",
+    "secondary_collection_handles",
 ]
+
+FAMILY_COLLECTION_RULES: Dict[str, Dict[str, str]] = {
+    "tshirt": {"handle": "t-shirts", "title": "T-Shirts"},
+    "long_sleeve": {"handle": "long-sleeve-shirts", "title": "Long Sleeve Shirts"},
+    "hoodie": {"handle": "hoodies", "title": "Hoodies"},
+    "sweatshirt": {"handle": "sweatshirts", "title": "Sweatshirts"},
+    "mug": {"handle": "mugs", "title": "Mugs"},
+    "poster": {"handle": "posters", "title": "Posters"},
+    "tote": {"handle": "tote-bags", "title": "Tote Bags"},
+}
 
 
 # -----------------------------
@@ -541,6 +571,49 @@ def _normalize_title_tokens(value: str) -> List[str]:
 def filename_slug_to_title(value: str) -> str:
     return content_engine.filename_slug_to_title(value)
 
+
+def _normalize_color_name(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def _is_white_like_color(value: str) -> bool:
+    normalized = _normalize_color_name(value)
+    return normalized in {"white", "white glossy", "snowwhite"}
+
+
+def resolve_family_collection_target(template: ProductTemplate) -> Dict[str, str]:
+    family = content_engine.infer_product_family(template)
+    return dict(FAMILY_COLLECTION_RULES.get(family, {}))
+
+
+def choose_preferred_featured_variant_color(*, template: ProductTemplate, variant_rows: List[Dict[str, Any]]) -> str:
+    available_colors: List[str] = []
+    seen: set[str] = set()
+    for variant in variant_rows:
+        color = _variant_option_value(variant, "color")
+        if not color:
+            continue
+        key = _normalize_color_name(color)
+        if key in seen:
+            continue
+        seen.add(key)
+        available_colors.append(color)
+    if not available_colors:
+        return ""
+
+    ranking = [template.preferred_default_variant_color] if template.preferred_default_variant_color else []
+    ranking.extend(template.preferred_mockup_colors or [])
+    for preferred in ranking:
+        if not preferred:
+            continue
+        needle = _normalize_color_name(preferred)
+        for available in available_colors:
+            if _normalize_color_name(available) == needle:
+                return available
+    for available in available_colors:
+        if not _is_white_like_color(available):
+            return available
+    return available_colors[0]
 
 
 def _semantic_product_tokens(value: str) -> set[str]:
@@ -1772,6 +1845,20 @@ def compute_placement_transform_for_artwork(
             orientation,
             scale,
         )
+    elif template_key == "tote_basic":
+        tote_orientation_scale = {
+            "portrait": 0.82,
+            "square": 0.8,
+            "landscape": 0.78,
+        }
+        scale = max(scale, tote_orientation_scale.get(orientation, scale))
+        logger.info(
+            "Tote transform strategy template=%s placement=%s orientation=%s strategy=front_fill_boost scale=%.3f",
+            template_key,
+            placement.placement_name,
+            orientation,
+            scale,
+        )
 
     return PlacementTransform(
         scale=scale,
@@ -1837,7 +1924,17 @@ def resolve_launch_plan_rows(
             if template_key not in template_map:
                 raise ValueError(f"Unknown template_key '{template_key}'")
             _resolve_artwork_path_for_launch_plan(artwork_file, image_dir)
-            metadata_keys = {"collection_handle", "collection_title", "collection_description", "launch_name", "campaign", "merch_theme"}
+            metadata_keys = {
+                "collection_handle",
+                "collection_title",
+                "collection_description",
+                "launch_name",
+                "campaign",
+                "merch_theme",
+                "collection_image_src",
+                "collection_sort_order",
+                "secondary_collection_handles",
+            }
             overrides = {
                 key: str(row.get(key) or "").strip()
                 for key in LAUNCH_PLAN_OVERRIDE_COLUMNS
@@ -1855,6 +1952,9 @@ def resolve_launch_plan_rows(
                 launch_name=str(row.get("launch_name") or "").strip(),
                 campaign=str(row.get("campaign") or "").strip(),
                 merch_theme=str(row.get("merch_theme") or "").strip(),
+                collection_image_src=str(row.get("collection_image_src") or "").strip(),
+                collection_sort_order=str(row.get("collection_sort_order") or "").strip(),
+                secondary_collection_handles=str(row.get("secondary_collection_handles") or "").strip(),
             ))
         except Exception as exc:
             failures.append(FailureReportRow(
@@ -2141,6 +2241,26 @@ class ShopifyClient(BaseApiClient):
         response = self.put(f"/admin/api/{SHOPIFY_API_VERSION}/custom_collections/{collection_id}.json", payload)
         return response.get("custom_collection", {}) if isinstance(response, dict) else {}
 
+    def update_custom_collection_merchandising(
+        self,
+        *,
+        collection_id: int,
+        sort_order: str = "",
+        image_src: str = "",
+    ) -> Dict[str, Any]:
+        custom_collection: Dict[str, Any] = {"id": collection_id}
+        if sort_order.strip():
+            custom_collection["sort_order"] = sort_order.strip()
+        if image_src.strip():
+            custom_collection["image"] = {"src": image_src.strip()}
+        if len(custom_collection) == 1:
+            return {}
+        response = self.put(
+            f"/admin/api/{SHOPIFY_API_VERSION}/custom_collections/{collection_id}.json",
+            {"custom_collection": custom_collection},
+        )
+        return response.get("custom_collection", {}) if isinstance(response, dict) else {}
+
     def list_collects(self, **params: Any) -> List[Dict[str, Any]]:
         response = self.get(f"/admin/api/{SHOPIFY_API_VERSION}/collects.json", **params)
         return response.get("collects", []) if isinstance(response, dict) else []
@@ -2152,6 +2272,12 @@ class ShopifyClient(BaseApiClient):
 
     def is_product_in_collection(self, *, collection_id: int, product_id: int) -> bool:
         return bool(self.list_collects(collection_id=collection_id, product_id=product_id, limit=1))
+
+    def list_product_collects(self, *, product_id: int) -> List[Dict[str, Any]]:
+        return self.list_collects(product_id=product_id, limit=250)
+
+    def delete_collect(self, *, collect_id: int) -> None:
+        self.delete(f"/admin/api/{SHOPIFY_API_VERSION}/collects/{collect_id}.json")
 
 
 def _extract_numeric_shopify_id(value: Any) -> Optional[int]:
@@ -2178,6 +2304,13 @@ def sync_shopify_collection(
     collection_title: str,
     collection_description: str,
     verify_membership: bool,
+    secondary_collection_handles: Optional[List[str]] = None,
+    enforce_family_collection_membership: bool = False,
+    collection_removal_mode: str = "conservative",
+    family_collection_handle: str = "",
+    allowed_family_collection_handles: Optional[List[str]] = None,
+    collection_sort_order: str = "",
+    collection_image_src: str = "",
 ) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "collection_sync_attempted": False,
@@ -2188,12 +2321,17 @@ def sync_shopify_collection(
         "collection_membership_verified": False,
         "collection_warning": "",
         "collection_error": "",
+        "family_collection_handle": family_collection_handle.strip(),
+        "collection_image_source": collection_image_src.strip(),
+        "collection_sort_strategy": collection_sort_order.strip(),
+        "removed_collection_ids": [],
     }
     normalized_handle = collection_handle.strip()
     normalized_title = collection_title.strip()
     normalized_description = collection_description.strip()
+    secondary_handles = [str(v).strip() for v in (secondary_collection_handles or []) if str(v).strip()]
 
-    if not normalized_handle and not normalized_title:
+    if not normalized_handle and not normalized_title and not secondary_handles:
         result["collection_sync_status"] = "skipped_no_collection_metadata"
         result["collection_warning"] = "No collection_handle or collection_title provided"
         logger.info("Collection sync skipped: no collection metadata provided")
@@ -2217,70 +2355,76 @@ def sync_shopify_collection(
     resolved_title = normalized_title or normalized_handle.replace("-", " ").title()
 
     try:
-        collection = shopify.find_custom_collection(handle=resolved_handle, title=resolved_title)
-        created = False
-        if collection:
-            logger.info("Collection resolved handle=%s title=%s id=%s", resolved_handle, resolved_title, collection.get("id"))
-        if not collection:
-            try:
-                collection = shopify.create_custom_collection(handle=resolved_handle, title=resolved_title, description=normalized_description)
-                created = True
-                logger.info("Collection created handle=%s title=%s id=%s", resolved_handle, resolved_title, collection.get("id"))
-            except DryRunMutationSkipped:
-                result["collection_sync_status"] = "dry-run"
-                logger.info("Collection sync dry-run: create skipped handle=%s", resolved_handle)
-                return result
+        target_handles = [resolved_handle, *secondary_handles]
+        target_handles = list(dict.fromkeys(h for h in target_handles if h))
+        target_collections: List[Tuple[str, str]] = []
+        for handle in target_handles:
+            title = resolved_title if handle == resolved_handle else handle.replace("-", " ").title()
+            target_collections.append((handle, title))
+        created_any = False
+        target_collection_ids: List[int] = []
+        for idx, (target_handle, target_title) in enumerate(target_collections):
+            collection = shopify.find_custom_collection(handle=target_handle, title=target_title)
+            if not collection:
+                try:
+                    collection = shopify.create_custom_collection(handle=target_handle, title=target_title, description=normalized_description)
+                except DryRunMutationSkipped:
+                    result["collection_sync_status"] = "dry-run"
+                    return result
+                created_any = True
+            collection_id = _extract_numeric_shopify_id(collection.get("id")) if isinstance(collection, dict) else None
+            if collection_id is None:
+                raise RuntimeError(f"Resolved collection is missing id: {collection}")
+            target_collection_ids.append(collection_id)
+            if idx == 0:
+                result["collection_id"] = str(collection_id)
+                result["collection_handle"] = str(collection.get("handle") or target_handle)
+                result["collection_title"] = str(collection.get("title") or target_title)
+            existing_title = str(collection.get("title") or "").strip()
+            existing_description = str(collection.get("body_html") or "").strip()
+            if (target_title and existing_title != target_title) or (normalized_description and existing_description != normalized_description):
+                try:
+                    shopify.update_custom_collection(collection_id=collection_id, title=target_title, description=normalized_description)
+                except DryRunMutationSkipped:
+                    result["collection_sync_status"] = "dry-run"
+                    return result
+            if not shopify.is_product_in_collection(collection_id=collection_id, product_id=numeric_product_id):
+                try:
+                    shopify.add_product_to_collection(collection_id=collection_id, product_id=numeric_product_id)
+                except DryRunMutationSkipped:
+                    result["collection_sync_status"] = "dry-run"
+                    return result
+            if collection_sort_order.strip() or collection_image_src.strip():
+                try:
+                    shopify.update_custom_collection_merchandising(
+                        collection_id=collection_id,
+                        sort_order=collection_sort_order,
+                        image_src=collection_image_src,
+                    )
+                except DryRunMutationSkipped:
+                    result["collection_sync_status"] = "dry-run"
+                    return result
+            if verify_membership:
+                result["collection_membership_verified"] = shopify.is_product_in_collection(collection_id=collection_id, product_id=numeric_product_id)
 
-        collection_id = _extract_numeric_shopify_id(collection.get("id")) if isinstance(collection, dict) else None
-        if collection_id is None:
-            raise RuntimeError(f"Resolved collection is missing id: {collection}")
+        if enforce_family_collection_membership and not shopify.dry_run:
+            target_ids = set(target_collection_ids)
+            allowed_handles = {h.casefold() for h in (allowed_family_collection_handles or []) if h}
+            for collect in shopify.list_product_collects(product_id=numeric_product_id):
+                collect_id = _extract_numeric_shopify_id(collect.get("id"))
+                collection_id = _extract_numeric_shopify_id(collect.get("collection_id"))
+                if collect_id is None or collection_id is None or collection_id in target_ids:
+                    continue
+                if collection_removal_mode == "strict":
+                    shopify.delete_collect(collect_id=collect_id)
+                    result["removed_collection_ids"].append(str(collection_id))
+                elif allowed_handles:
+                    handle_hint = str(collect.get("collection_handle") or "").strip().casefold()
+                    if handle_hint in allowed_handles:
+                        shopify.delete_collect(collect_id=collect_id)
+                        result["removed_collection_ids"].append(str(collection_id))
 
-        existing_title = str(collection.get("title") or "").strip()
-        existing_description = str(collection.get("body_html") or "").strip()
-        needs_update = bool(
-            (resolved_title and existing_title != resolved_title) or
-            (normalized_description and existing_description != normalized_description)
-        )
-        if needs_update:
-            try:
-                collection = shopify.update_custom_collection(
-                    collection_id=collection_id,
-                    title=resolved_title,
-                    description=normalized_description,
-                )
-                logger.info("Collection updated id=%s title=%s", collection_id, resolved_title)
-            except DryRunMutationSkipped:
-                result["collection_sync_status"] = "dry-run"
-                logger.info("Collection sync dry-run: update skipped id=%s", collection_id)
-                return result
-
-        if not shopify.is_product_in_collection(collection_id=collection_id, product_id=numeric_product_id):
-            try:
-                shopify.add_product_to_collection(collection_id=collection_id, product_id=numeric_product_id)
-                logger.info("Product attached to collection product_id=%s collection_id=%s", numeric_product_id, collection_id)
-            except DryRunMutationSkipped:
-                result["collection_sync_status"] = "dry-run"
-                logger.info("Collection sync dry-run: collect create skipped collection_id=%s", collection_id)
-                return result
-        else:
-            logger.info("Collection membership already exists product_id=%s collection_id=%s", numeric_product_id, collection_id)
-
-        result["collection_sync_status"] = "created" if created else "synced"
-        result["collection_id"] = str(collection_id)
-        result["collection_handle"] = str(collection.get("handle") or resolved_handle)
-        result["collection_title"] = str(collection.get("title") or resolved_title)
-
-        if verify_membership:
-            result["collection_membership_verified"] = shopify.is_product_in_collection(
-                collection_id=collection_id,
-                product_id=numeric_product_id,
-            )
-            logger.info(
-                "Collection verification result product_id=%s collection_id=%s verified=%s",
-                numeric_product_id,
-                collection_id,
-                result["collection_membership_verified"],
-            )
+        result["collection_sync_status"] = "created" if created_any else "synced"
     except Exception as exc:
         result["collection_sync_status"] = "error"
         result["collection_error"] = str(exc)
@@ -3495,6 +3639,12 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
             raise TemplateValidationError(f"Template[{index}] poster_fill_target_pct must be > 0 and <= 1 when provided")
     if row.get("poster_trim_fill_optimization") is not None and not isinstance(row.get("poster_trim_fill_optimization"), bool):
         raise TemplateValidationError(f"Template[{index}] poster_trim_fill_optimization must be boolean when provided")
+    if row.get("preferred_featured_image_strategy") is not None:
+        strategy = str(row.get("preferred_featured_image_strategy", "")).strip().lower()
+        if strategy and strategy not in {"variant_color_then_mockup_type", "mockup_type_then_variant_color"}:
+            raise TemplateValidationError(
+                f"Template[{index}] preferred_featured_image_strategy must be variant_color_then_mockup_type|mockup_type_then_variant_color"
+            )
     option_filters = row.get("enabled_variant_option_filters")
     if option_filters is not None and not isinstance(option_filters, dict):
         raise TemplateValidationError(f"Template[{index}] enabled_variant_option_filters must be an object")
@@ -3567,6 +3717,12 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
                 poster_safe_min_source_ratio=float(row["poster_safe_min_source_ratio"]) if row.get("poster_safe_min_source_ratio") is not None else None,
                 poster_fill_target_pct=float(row["poster_fill_target_pct"]) if row.get("poster_fill_target_pct") is not None else None,
                 poster_trim_fill_optimization=bool(row.get("poster_trim_fill_optimization", False)),
+                preferred_mockup_colors=[str(v) for v in row.get("preferred_mockup_colors", [])],
+                preferred_default_variant_color=str(row.get("preferred_default_variant_color", "")).strip() or None,
+                preferred_mockup_types=[str(v) for v in row.get("preferred_mockup_types", [])],
+                preferred_featured_image_strategy=str(row.get("preferred_featured_image_strategy", "variant_color_then_mockup_type")).strip().lower() or "variant_color_then_mockup_type",
+                preferred_mockup_position=str(row.get("preferred_mockup_position", "")).strip() or None,
+                secondary_collection_handles=[str(v) for v in row.get("secondary_collection_handles", [])],
                 placements=[PlacementRequirement(**p) for p in row.get("placements", [])],
             )
         )
@@ -4712,7 +4868,7 @@ def upsert_in_printify(
     return result
 
 
-def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, verify_collections: bool = False, summary: Optional[RunSummary] = None, failure_rows: Optional[List[FailureReportRow]] = None, run_rows: Optional[List[RunReportRow]] = None, launch_plan_row: str = "", launch_plan_row_id: str = "", collection_handle: str = "", collection_title: str = "", collection_description: str = "", launch_name: str = "", campaign: str = "", merch_theme: str = "", routed_asset_family: str = "", routed_asset_mode: str = "") -> None:
+def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, verify_collections: bool = False, summary: Optional[RunSummary] = None, failure_rows: Optional[List[FailureReportRow]] = None, run_rows: Optional[List[RunReportRow]] = None, launch_plan_row: str = "", launch_plan_row_id: str = "", collection_handle: str = "", collection_title: str = "", collection_description: str = "", launch_name: str = "", campaign: str = "", merch_theme: str = "", routed_asset_family: str = "", routed_asset_mode: str = "", enforce_family_collection_membership: bool = True, collection_removal_mode: str = "conservative", collection_sort_order: str = "", collection_image_src: str = "", secondary_collection_handles: str = "") -> None:
     processed = state.setdefault("processed", {})
     existing = processed.get(artwork.slug, {})
     existing_products = existing.get("products", []) if isinstance(existing.get("products", []), list) else []
@@ -4950,15 +5106,25 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 result["shopify"] = create_in_shopify_only(shopify, artwork, template, variant_rows)
 
             printify_result = result.get("printify", {}) if isinstance(result.get("printify"), dict) else {}
+            family_collection = resolve_family_collection_target(resolved_template)
+            family_collection_handle = str(family_collection.get("handle") or "").strip()
+            family_collection_title = str(family_collection.get("title") or "").strip()
+            chosen_collection_handle = collection_handle.strip() or family_collection_handle
+            chosen_collection_title = collection_title.strip() or family_collection_title
+            preferred_featured_variant_color = choose_preferred_featured_variant_color(template=resolved_template, variant_rows=variant_rows)
             collection_result = {
                 "collection_sync_attempted": False,
                 "collection_sync_status": "skipped_disabled",
                 "collection_id": "",
-                "collection_handle": collection_handle,
-                "collection_title": collection_title,
+                "collection_handle": chosen_collection_handle,
+                "collection_title": chosen_collection_title,
                 "collection_membership_verified": False,
                 "collection_warning": "",
                 "collection_error": "",
+                "family_collection_handle": family_collection_handle,
+                "collection_image_source": collection_image_src,
+                "collection_sort_strategy": collection_sort_order,
+                "removed_collection_ids": [],
             }
             if sync_collections:
                 shopify_product_id = str(
@@ -4970,12 +5136,19 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 collection_result = sync_shopify_collection(
                     shopify=shopify,
                     shopify_product_id=shopify_product_id,
-                    collection_handle=collection_handle,
-                    collection_title=collection_title,
+                    collection_handle=chosen_collection_handle,
+                    collection_title=chosen_collection_title,
                     collection_description=collection_description,
                     verify_membership=verify_collections,
+                    secondary_collection_handles=[v.strip() for v in secondary_collection_handles.split(",") if v.strip()] + list(resolved_template.secondary_collection_handles or []),
+                    enforce_family_collection_membership=enforce_family_collection_membership,
+                    collection_removal_mode=collection_removal_mode,
+                    family_collection_handle=family_collection_handle,
+                    allowed_family_collection_handles=[cfg.get("handle", "") for cfg in FAMILY_COLLECTION_RULES.values()],
+                    collection_sort_order=collection_sort_order,
+                    collection_image_src=collection_image_src,
                 )
-            elif collection_handle.strip() or collection_title.strip():
+            elif chosen_collection_handle.strip() or chosen_collection_title.strip():
                 collection_result["collection_warning"] = "Collection sync disabled (use --sync-collections)"
                 logger.info(
                     "Collection sync skipped by CLI setting artwork=%s template=%s row_id=%s",
@@ -5001,8 +5174,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 "rendered_title": rendered_title,
                 "launch_plan_row": launch_plan_row,
                 "launch_plan_row_id": launch_plan_row_id,
-                "collection_handle": collection_handle,
-                "collection_title": collection_title,
+                "collection_handle": chosen_collection_handle,
+                "collection_title": chosen_collection_title,
                 "collection_description": collection_description,
                 "launch_name": launch_name,
                 "campaign": campaign,
@@ -5015,6 +5188,14 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 "collection_membership_verified": bool(collection_result.get("collection_membership_verified", False)),
                 "collection_warning": str(collection_result.get("collection_warning") or ""),
                 "collection_error": str(collection_result.get("collection_error") or ""),
+                "family_collection_handle": str(collection_result.get("family_collection_handle") or family_collection_handle),
+                "collection_image_source": str(collection_result.get("collection_image_source") or collection_image_src),
+                "collection_sort_strategy": str(collection_result.get("collection_sort_strategy") or collection_sort_order),
+                "preferred_featured_variant_color": preferred_featured_variant_color,
+                "selected_featured_mockup_color": preferred_featured_variant_color,
+                "featured_image_strategy": resolved_template.preferred_featured_image_strategy,
+                "featured_image_source": "printify_mockup_recommendation",
+                "tote_scale_strategy": "tuned_fill_0.82" if resolved_template.key == "tote_basic" else "",
                 "result": result,
                 "dry_run": bool(printify.dry_run),
                 "completion_status": "dry-run-only" if printify.dry_run else "real-completed",
@@ -5047,8 +5228,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     orientation_bucket=orientation_report,
                     launch_plan_row=launch_plan_row,
                     launch_plan_row_id=launch_plan_row_id,
-                    collection_handle=collection_handle,
-                    collection_title=collection_title,
+                    collection_handle=chosen_collection_handle,
+                    collection_title=chosen_collection_title,
                     collection_description=collection_description,
                     launch_name=launch_name,
                     campaign=campaign,
@@ -5076,6 +5257,14 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     poster_requested_upscale_factor=poster_requested_upscale_factor_report,
                     poster_applied_upscale_factor=poster_applied_upscale_factor_report,
                     poster_fill_optimization_used=poster_fill_optimization_used_report,
+                    family_collection_handle=str(collection_result.get("family_collection_handle") or family_collection_handle),
+                    collection_image_source=str(collection_result.get("collection_image_source") or collection_image_src),
+                    collection_sort_strategy=str(collection_result.get("collection_sort_strategy") or collection_sort_order),
+                    preferred_featured_variant_color=preferred_featured_variant_color,
+                    selected_featured_mockup_color=preferred_featured_variant_color,
+                    featured_image_strategy=resolved_template.preferred_featured_image_strategy,
+                    featured_image_source="printify_mockup_recommendation",
+                    tote_scale_strategy="tuned_fill_0.82" if resolved_template.key == "tote_basic" else "",
                 ))
             if summary is not None:
                 printify_action = (result.get("printify", {}) or {}).get("action", action)
@@ -5313,6 +5502,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sync-collections", action="store_true", help="Sync Shopify custom collections from launch-plan collection metadata")
     parser.add_argument("--skip-collections", action="store_true", help="Explicitly disable Shopify collection sync")
     parser.add_argument("--verify-collections", action="store_true", help="Read-only verify Shopify collection membership after sync")
+    parser.add_argument("--enforce-family-collection-membership", action="store_true", help="Enforce deterministic family collection routing during collection sync")
+    parser.add_argument("--collection-removal-mode", choices=["conservative", "strict"], default="conservative", help="Collection removal scope when family enforcement is active")
     parser.epilog = (
         "Examples:\n"
         "  python printify_shopify_sync_pipeline.py --dry-run --template-key tshirt_gildan --template-key mug_11oz\n"
@@ -5513,7 +5704,7 @@ def run_catalog_cli(
     return False
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "") -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "") -> None:
     if publish_mode not in {"default", "publish", "skip"}:
         raise RuntimeError(f"Unsupported publish mode: {publish_mode}")
 
@@ -5825,6 +6016,8 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                 auto_rebuild_on_incompatible_update=auto_rebuild_on_incompatible_update,
                 sync_collections=collection_sync_enabled,
                 verify_collections=verify_collections,
+                enforce_family_collection_membership=enforce_family_collection_membership,
+                collection_removal_mode=collection_removal_mode,
                 summary=summary,
                 failure_rows=failure_rows,
                 run_rows=run_rows,
@@ -5836,6 +6029,9 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                 launch_name=launch_row.launch_name,
                 campaign=launch_row.campaign,
                 merch_theme=launch_row.merch_theme,
+                collection_image_src=launch_row.collection_image_src,
+                collection_sort_order=launch_row.collection_sort_order,
+                secondary_collection_handles=launch_row.secondary_collection_handles,
             )
             if summary.failures > before_failures:
                 if fail_fast:
@@ -5885,6 +6081,8 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                     auto_rebuild_on_incompatible_update=auto_rebuild_on_incompatible_update,
                     sync_collections=collection_sync_enabled,
                     verify_collections=verify_collections,
+                    enforce_family_collection_membership=enforce_family_collection_membership,
+                    collection_removal_mode=collection_removal_mode,
                     summary=summary,
                     failure_rows=failure_rows,
                     run_rows=run_rows,
@@ -5933,6 +6131,8 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                     auto_rebuild_on_incompatible_update=auto_rebuild_on_incompatible_update,
                     sync_collections=collection_sync_enabled,
                     verify_collections=verify_collections,
+                    enforce_family_collection_membership=enforce_family_collection_membership,
+                    collection_removal_mode=collection_removal_mode,
                     summary=summary,
                     failure_rows=failure_rows,
                     run_rows=run_rows,
@@ -6023,6 +6223,8 @@ if __name__ == "__main__":
             sync_collections=args.sync_collections,
             skip_collections=args.skip_collections,
             verify_collections=args.verify_collections,
+            enforce_family_collection_membership=args.enforce_family_collection_membership,
+            collection_removal_mode=args.collection_removal_mode,
             inspect_state_key_value=args.inspect_state_key,
             list_state_keys_only=args.list_state_keys,
             list_failures_only=args.list_failures,
