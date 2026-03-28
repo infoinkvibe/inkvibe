@@ -95,6 +95,7 @@ from printify_shopify_sync_pipeline import (
     run_artwork_metadata_generation,
     sync_shopify_collection,
     _extract_numeric_shopify_id,
+    PromptArtworkGenerationResult,
 )
 from artwork_metadata_generator import (
     CompositeArtworkMetadataGenerator,
@@ -118,13 +119,18 @@ from artwork_metadata_generator import (
     select_artwork_metadata_generator,
 )
 from artwork_generation import (
+    APPAREL_FAMILY,
+    POSTER_FAMILY,
     ArtworkGenerationRequest,
     GeneratedArtworkAsset,
     build_generation_prompt,
     choose_generation_aspect_modes,
     generate_artwork_with_openai,
     is_preview_or_low_value_asset,
+    plan_family_artwork_targets,
     plan_generated_artwork_targets,
+    route_templates_to_generated_assets,
+    TemplateAssetRouting,
     validate_generated_asset_for_templates,
 )
 
@@ -3934,6 +3940,32 @@ def test_parse_args_prompt_generation_flags(monkeypatch):
     assert args.art_count == 2
 
 
+def test_parse_args_family_aware_flags(monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prog",
+            "--generate-artwork-from-prompt",
+            "--art-prompt",
+            "retro tiger sunset",
+            "--art-family-aware",
+            "--art-family-mode",
+            "split",
+            "--art-generate-poster-master",
+            "--art-mug-tote-master",
+            "square",
+        ],
+    )
+    args = pipeline.parse_args()
+    assert args.art_family_aware is True
+    assert args.art_family_mode == "split"
+    assert args.art_generate_poster_master is True
+    assert args.art_mug_tote_master == "square"
+
+
 def test_artwork_generation_target_planning_modes():
     assert choose_generation_aspect_modes(template_keys=["hoodie_unisex", "poster_24x36"], target_mode="auto") == ["portrait"]
     assert choose_generation_aspect_modes(template_keys=["mug_11oz", "tote_bag"], target_mode="auto") == ["square"]
@@ -3944,6 +3976,40 @@ def test_plan_generated_artwork_targets_multi():
     plan = plan_generated_artwork_targets(template_keys=["hoodie_unisex", "mug_11oz"], target_mode="auto")
     assert [target.mode for target in plan.targets] == ["portrait", "square"]
     assert any("Mixed template families" in reason for reason in plan.rationale)
+
+
+def test_family_plan_auto_splits_poster_and_apparel():
+    plan = plan_family_artwork_targets(
+        template_keys=["hoodie_gildan", "poster_basic", "mug_new"],
+        family_mode="auto",
+        mug_tote_master="apparel",
+    )
+    families = {target.family for target in plan.targets}
+    assert APPAREL_FAMILY in families
+    assert POSTER_FAMILY in families
+
+
+def test_family_plan_poster_only():
+    plan = plan_family_artwork_targets(template_keys=["poster_basic"], family_mode="auto")
+    assert [target.family for target in plan.targets] == [POSTER_FAMILY]
+
+
+def test_family_plan_apparel_only():
+    plan = plan_family_artwork_targets(template_keys=["hoodie_gildan", "sweatshirt_gildan"], family_mode="auto")
+    assert [target.family for target in plan.targets] == [APPAREL_FAMILY]
+
+
+def test_family_template_routing_maps_templates_to_family_assets(tmp_path: Path):
+    apparel_asset = GeneratedArtworkAsset(path=tmp_path / "x-apparel-c01.png", mode="portrait", concept_index=1, family=APPAREL_FAMILY)
+    poster_asset = GeneratedArtworkAsset(path=tmp_path / "x-poster-c01.png", mode="portrait", concept_index=1, family=POSTER_FAMILY)
+    routing = route_templates_to_generated_assets(
+        template_keys=["hoodie_gildan", "poster_basic"],
+        assets=[apparel_asset, poster_asset],
+        template_family_map={"hoodie_gildan": APPAREL_FAMILY, "poster_basic": POSTER_FAMILY},
+    )
+    by_template = {row.template_key: row for row in routing}
+    assert by_template["hoodie_gildan"].asset_path == apparel_asset.path
+    assert by_template["poster_basic"].asset_path == poster_asset.path
 
 
 def test_openai_generation_client_can_be_mocked(tmp_path: Path):
@@ -3979,3 +4045,110 @@ def test_build_generation_prompt_includes_pod_composition_rules():
     assert "not a product mockup" in prompt
     assert "strong subject fill" in prompt
     assert "Do not add any text" in prompt
+
+
+def test_build_generation_prompt_has_family_specific_guidance():
+    request = ArtworkGenerationRequest(prompt="vintage truck")
+    apparel_prompt = build_generation_prompt(request, mode="portrait", family=APPAREL_FAMILY)
+    poster_prompt = build_generation_prompt(request, mode="portrait", family=POSTER_FAMILY)
+    assert "isolated standalone graphic" in apparel_prompt
+    assert "no poster rectangle" in apparel_prompt
+    assert "rich scenic wall-art composition" in poster_prompt
+
+
+def test_run_prompt_generation_family_result_routes_templates(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    hoodie = ProductTemplate(key="hoodie_gildan", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{title}", description_pattern="{description_html}")
+    poster = ProductTemplate(key="poster_basic", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{title}", description_pattern="{description_html}")
+
+    generated = [
+        GeneratedArtworkAsset(path=tmp_path / "prompt-apparel-c01.png", mode="portrait", concept_index=1, width=1200, height=1800, family=APPAREL_FAMILY),
+        GeneratedArtworkAsset(path=tmp_path / "prompt-poster-c01.png", mode="portrait", concept_index=1, width=1200, height=1800, family=POSTER_FAMILY),
+    ]
+    for row in generated:
+        Image.new("RGBA", (1200, 1800), (255, 0, 0, 255)).save(row.path)
+
+    monkeypatch.setattr(pipeline, "generate_artwork_with_openai", lambda **kwargs: generated)
+
+    request = ArtworkGenerationRequest(prompt="forest", output_dir=tmp_path, base_name="prompt", family_aware=True)
+    result = pipeline.run_prompt_artwork_generation(request=request, templates=[hoodie, poster])
+    by_template = {row.template_key: row.asset_path.name for row in result.template_routing}
+    assert by_template["hoodie_gildan"].endswith("apparel-c01.png")
+    assert by_template["poster_basic"].endswith("poster-c01.png")
+
+
+def test_non_family_aware_prompt_mode_still_returns_generated_paths(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    hoodie = ProductTemplate(key="hoodie_gildan", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{title}", description_pattern="{description_html}")
+    asset = GeneratedArtworkAsset(path=tmp_path / "prompt-portrait-c01.png", mode="portrait", concept_index=1, width=1200, height=1800, family="single")
+    Image.new("RGBA", (1200, 1800), (255, 0, 0, 255)).save(asset.path)
+    monkeypatch.setattr(pipeline, "generate_artwork_with_openai", lambda **kwargs: [asset])
+
+    request = ArtworkGenerationRequest(prompt="forest", output_dir=tmp_path, base_name="prompt", family_aware=False)
+    result = pipeline.run_prompt_artwork_generation(request=request, templates=[hoodie])
+    assert result.generated_paths == [asset.path]
+    assert result.template_routing == []
+
+
+def test_family_routing_flows_into_create_publish_processing(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    cfg = tmp_path / "templates.json"
+    cfg.write_text("[]", encoding="utf-8")
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    state_path = tmp_path / "state.json"
+
+    hoodie_template = ProductTemplate(key="hoodie_gildan", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{title}", description_pattern="{description_html}")
+    poster_template = ProductTemplate(key="poster_basic", printify_blueprint_id=2, printify_print_provider_id=2, title_pattern="{title}", description_pattern="{description_html}")
+
+    apparel_path = img_dir / "prompt-apparel-c01.png"
+    poster_path = img_dir / "prompt-poster-c01.png"
+    Image.new("RGBA", (1200, 1800), (255, 0, 0, 255)).save(apparel_path)
+    Image.new("RGBA", (1200, 1800), (0, 0, 255, 255)).save(poster_path)
+
+    artworks = [
+        Artwork(slug="prompt-apparel-c01", src_path=apparel_path, title="Apparel", description_html="<p>Apparel</p>", tags=["a"], image_width=1200, image_height=1800),
+        Artwork(slug="prompt-poster-c01", src_path=poster_path, title="Poster", description_html="<p>Poster</p>", tags=["p"], image_width=1200, image_height=1800),
+    ]
+
+    monkeypatch.setenv("PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "load_templates", lambda _cfg: [hoodie_template, poster_template])
+    monkeypatch.setattr(pipeline, "discover_artworks", lambda *_a, **_k: artworks)
+    monkeypatch.setattr(pipeline, "run_catalog_cli", lambda **kwargs: False)
+    monkeypatch.setattr(pipeline, "audit_printify_integration", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "resolve_shop_id", lambda *a, **k: 1)
+    monkeypatch.setattr(pipeline, "PrintifyClient", lambda token, dry_run=False: types.SimpleNamespace(dry_run=dry_run))
+    monkeypatch.setattr(
+        pipeline,
+        "run_prompt_artwork_generation",
+        lambda **kwargs: PromptArtworkGenerationResult(
+            generated_paths=[apparel_path, poster_path],
+            template_routing=[
+                TemplateAssetRouting(template_key="hoodie_gildan", family=APPAREL_FAMILY, concept_index=1, asset_path=apparel_path),
+                TemplateAssetRouting(template_key="poster_basic", family=POSTER_FAMILY, concept_index=1, asset_path=poster_path),
+            ],
+        ),
+    )
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        pipeline,
+        "process_artwork",
+        lambda **kwargs: calls.append((kwargs["templates"][0].key, kwargs["artwork"].src_path.name)),
+    )
+
+    run(
+        cfg,
+        dry_run=True,
+        image_dir=img_dir,
+        state_path=state_path,
+        generate_artwork_from_prompt=True,
+        art_prompt="forest wolf",
+        art_family_aware=True,
+        create_only=True,
+    )
+    assert ("hoodie_gildan", "prompt-apparel-c01.png") in calls
+    assert ("poster_basic", "prompt-poster-c01.png") in calls

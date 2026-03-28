@@ -41,6 +41,13 @@ class ArtworkGenerationRequest:
     skip_existing_generated: bool = False
     min_source_width: int = 1024
     min_source_height: int = 1024
+    family_aware: bool = False
+    family_mode: str = "auto"
+    generate_poster_master: bool = False
+    generate_apparel_master: bool = False
+    mug_tote_master: str = "apparel"
+    apparel_style: str = ""
+    poster_style: str = ""
 
 
 @dataclass
@@ -48,6 +55,7 @@ class ArtworkGenerationTarget:
     mode: str
     label: str
     openai_size: str
+    family: str = "single"
 
 
 @dataclass
@@ -55,6 +63,8 @@ class ArtworkGenerationPlan:
     targets: List[ArtworkGenerationTarget]
     template_keys: List[str]
     rationale: List[str] = field(default_factory=list)
+    family_aware: bool = False
+    template_family_map: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -66,6 +76,114 @@ class GeneratedArtworkAsset:
     height: int = 0
     source: str = "openai"
     skipped_reason: str = ""
+    family: str = "single"
+
+
+@dataclass
+class FamilyArtworkPlan:
+    family: str
+    mode: str
+    openai_size: str
+    label: str
+
+
+@dataclass
+class FamilyGeneratedAsset:
+    path: pathlib.Path
+    family: str
+    mode: str
+    concept_index: int
+
+
+@dataclass
+class TemplateAssetRouting:
+    template_key: str
+    family: str
+    concept_index: int
+    asset_path: pathlib.Path
+
+
+APPAREL_FAMILY = "apparel"
+POSTER_FAMILY = "poster"
+SQUARE_FAMILY = "square"
+
+
+def classify_template_family(template_key: str, *, mug_tote_master: str = "apparel") -> str:
+    key = (template_key or "").strip().lower()
+    if "poster" in key:
+        return POSTER_FAMILY
+    if "mug" in key or "tote" in key:
+        if mug_tote_master == "square":
+            return SQUARE_FAMILY
+        return APPAREL_FAMILY
+    return APPAREL_FAMILY
+
+
+def plan_family_artwork_targets(
+    *,
+    template_keys: Sequence[str],
+    family_mode: str = "auto",
+    generate_poster_master: bool = False,
+    generate_apparel_master: bool = False,
+    mug_tote_master: str = "apparel",
+) -> ArtworkGenerationPlan:
+    normalized_mode = (family_mode or "auto").strip().lower()
+    template_family_map = {
+        key: classify_template_family(key, mug_tote_master=mug_tote_master)
+        for key in template_keys
+    }
+    families_in_templates = set(template_family_map.values())
+    required_families: List[str] = []
+    rationale: List[str] = []
+
+    if normalized_mode == "single":
+        required_families = [APPAREL_FAMILY]
+        rationale.append("Family-aware single mode enabled; generating apparel master only.")
+    elif normalized_mode == "split":
+        required_families = [APPAREL_FAMILY, POSTER_FAMILY]
+        if SQUARE_FAMILY in families_in_templates:
+            required_families.append(SQUARE_FAMILY)
+        rationale.append("Family-aware split mode enabled; generating dedicated family masters.")
+    else:
+        if POSTER_FAMILY in families_in_templates:
+            required_families.append(POSTER_FAMILY)
+        if APPAREL_FAMILY in families_in_templates:
+            required_families.append(APPAREL_FAMILY)
+        if SQUARE_FAMILY in families_in_templates:
+            required_families.append(SQUARE_FAMILY)
+        if not required_families:
+            required_families.append(APPAREL_FAMILY)
+        rationale.append("Family-aware auto mode selected family masters from template mix.")
+
+    if generate_apparel_master and APPAREL_FAMILY not in required_families:
+        required_families.append(APPAREL_FAMILY)
+        rationale.append("Forced apparel master via CLI override.")
+    if generate_poster_master and POSTER_FAMILY not in required_families:
+        required_families.append(POSTER_FAMILY)
+        rationale.append("Forced poster master via CLI override.")
+
+    size_by_mode = {"portrait": "1024x1536", "square": "1024x1024"}
+    mode_by_family = {
+        APPAREL_FAMILY: "portrait",
+        POSTER_FAMILY: "portrait",
+        SQUARE_FAMILY: "square",
+    }
+    targets = [
+        ArtworkGenerationTarget(
+            mode=mode_by_family[family],
+            label=f"{family}_master",
+            openai_size=size_by_mode[mode_by_family[family]],
+            family=family,
+        )
+        for family in required_families
+    ]
+    return ArtworkGenerationPlan(
+        targets=targets,
+        template_keys=list(template_keys),
+        rationale=rationale,
+        family_aware=True,
+        template_family_map=template_family_map,
+    )
 
 
 def _load_dotenv_if_available() -> None:
@@ -115,11 +233,11 @@ def plan_generated_artwork_targets(*, template_keys: Sequence[str], target_mode:
     else:
         rationale.append("Square-heavy template mix detected; prioritizing square source generation.")
 
-    targets = [ArtworkGenerationTarget(mode=mode, label=f"{mode}_master", openai_size=size_by_mode[mode]) for mode in modes]
+    targets = [ArtworkGenerationTarget(mode=mode, label=f"{mode}_master", openai_size=size_by_mode[mode], family="single") for mode in modes]
     return ArtworkGenerationPlan(targets=targets, template_keys=list(template_keys), rationale=rationale)
 
 
-def build_generation_prompt(request: ArtworkGenerationRequest, *, mode: str) -> str:
+def build_generation_prompt(request: ArtworkGenerationRequest, *, mode: str, family: str = "single") -> str:
     orientation = "portrait orientation" if mode == "portrait" else "square orientation"
     chunks = [
         "Create standalone print-ready artwork only (not a product mockup, not a scene).",
@@ -137,6 +255,21 @@ def build_generation_prompt(request: ArtworkGenerationRequest, *, mode: str) -> 
         chunks.append("Do not add any text in the artwork.")
     if request.negative_prompt.strip():
         chunks.append(f"Avoid: {request.negative_prompt.strip()}")
+    if family == APPAREL_FAMILY:
+        chunks.extend([
+            "Output as isolated standalone graphic optimized for garment printing.",
+            "Keep transparent or very clean background; no frame and no poster rectangle.",
+            "No scenic full-bleed background; avoid wall-art framing.",
+        ])
+        if request.apparel_style.strip():
+            chunks.append(f"Apparel style guidance: {request.apparel_style.strip()}")
+    elif family == POSTER_FAMILY:
+        chunks.extend([
+            "Output as rich scenic wall-art composition with full-background coverage.",
+            "Poster-like framing and cinematic detail are encouraged; avoid clipart look.",
+        ])
+        if request.poster_style.strip():
+            chunks.append(f"Poster style guidance: {request.poster_style.strip()}")
     return " ".join(chunks)
 
 
@@ -168,7 +301,8 @@ def generate_artwork_with_openai(
 
     for concept_index in range(1, max(1, int(request.count)) + 1):
         for target in plan.targets:
-            suffix = f"{target.mode}-c{concept_index:02d}"
+            suffix_token = target.family if (target.family and target.family != "single") else target.mode
+            suffix = f"{suffix_token}-c{concept_index:02d}"
             output_name = f"{request.base_name}-{suffix}.png"
             output_path = request.output_dir / output_name
             if request.skip_existing_generated and output_path.exists():
@@ -176,7 +310,7 @@ def generate_artwork_with_openai(
                     GeneratedArtworkAsset(path=output_path, mode=target.mode, concept_index=concept_index, source="existing")
                 )
                 continue
-            prompt = build_generation_prompt(request, mode=target.mode)
+            prompt = build_generation_prompt(request, mode=target.mode, family=target.family)
             response = image_client.images.generate(
                 model=resolved_model,
                 prompt=prompt,
@@ -191,7 +325,7 @@ def generate_artwork_with_openai(
             if not image_b64:
                 raise RuntimeError("OpenAI image generation did not return image bytes")
             save_generated_artwork(base64.b64decode(image_b64), output_path)
-            assets.append(GeneratedArtworkAsset(path=output_path, mode=target.mode, concept_index=concept_index, source="openai"))
+            assets.append(GeneratedArtworkAsset(path=output_path, mode=target.mode, concept_index=concept_index, source="openai", family=target.family))
     return assets
 
 
@@ -206,14 +340,50 @@ def is_preview_or_low_value_asset(path: pathlib.Path) -> bool:
 
 
 def choose_preferred_generated_asset(assets: Iterable[GeneratedArtworkAsset]) -> List[GeneratedArtworkAsset]:
-    grouped: Dict[tuple[int, str], List[GeneratedArtworkAsset]] = {}
+    grouped: Dict[tuple[int, str, str], List[GeneratedArtworkAsset]] = {}
     for asset in assets:
-        key = (asset.concept_index, asset.mode)
+        key = (asset.concept_index, asset.mode, asset.family)
         grouped.setdefault(key, []).append(asset)
     preferred: List[GeneratedArtworkAsset] = []
     for group_assets in grouped.values():
         preferred.append(max(group_assets, key=lambda item: int(item.width or 0) * int(item.height or 0)))
     return preferred
+
+
+def route_templates_to_generated_assets(
+    *,
+    template_keys: Sequence[str],
+    assets: Sequence[GeneratedArtworkAsset],
+    template_family_map: Optional[Dict[str, str]] = None,
+    mug_tote_master: str = "apparel",
+) -> List[TemplateAssetRouting]:
+    by_family_concept: Dict[tuple[str, int], GeneratedArtworkAsset] = {}
+    for asset in assets:
+        by_family_concept[(asset.family or "single", int(asset.concept_index))] = asset
+    routing: List[TemplateAssetRouting] = []
+    concepts = sorted({int(asset.concept_index) for asset in assets}) or [1]
+    for concept_index in concepts:
+        for template_key in template_keys:
+            family = (template_family_map or {}).get(template_key) or classify_template_family(
+                template_key,
+                mug_tote_master=mug_tote_master,
+            )
+            candidate = by_family_concept.get((family, concept_index))
+            if candidate is None:
+                candidate = by_family_concept.get((APPAREL_FAMILY, concept_index))
+            if candidate is None:
+                candidate = by_family_concept.get(("single", concept_index))
+            if candidate is None:
+                continue
+            routing.append(
+                TemplateAssetRouting(
+                    template_key=template_key,
+                    family=family,
+                    concept_index=concept_index,
+                    asset_path=candidate.path,
+                )
+            )
+    return routing
 
 
 def validate_generated_asset_for_templates(

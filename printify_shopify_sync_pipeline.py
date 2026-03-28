@@ -43,9 +43,12 @@ from artwork_metadata_generator import (
 from artwork_generation import (
     ArtworkGenerationRequest,
     GeneratedArtworkAsset,
+    TemplateAssetRouting,
     choose_preferred_generated_asset,
     is_preview_or_low_value_asset,
+    plan_family_artwork_targets,
     plan_generated_artwork_targets,
+    route_templates_to_generated_assets,
     generate_artwork_with_openai,
     validate_generated_asset_for_templates,
 )
@@ -304,6 +307,14 @@ class RunReportRow:
     collection_membership_verified: bool = False
     collection_warning: str = ""
     collection_error: str = ""
+    routed_asset_family: str = ""
+    routed_asset_mode: str = ""
+
+
+@dataclass
+class PromptArtworkGenerationResult:
+    generated_paths: List[pathlib.Path] = field(default_factory=list)
+    template_routing: List[TemplateAssetRouting] = field(default_factory=list)
 
 
 @dataclass
@@ -2332,15 +2343,25 @@ def run_prompt_artwork_generation(
     *,
     request: ArtworkGenerationRequest,
     templates: List[ProductTemplate],
-) -> List[pathlib.Path]:
-    plan = plan_generated_artwork_targets(template_keys=[template.key for template in templates], target_mode=request.target_mode)
+) -> PromptArtworkGenerationResult:
+    template_keys = [template.key for template in templates]
+    if request.family_aware:
+        plan = plan_family_artwork_targets(
+            template_keys=template_keys,
+            family_mode=request.family_mode,
+            generate_poster_master=request.generate_poster_master,
+            generate_apparel_master=request.generate_apparel_master,
+            mug_tote_master=request.mug_tote_master,
+        )
+    else:
+        plan = plan_generated_artwork_targets(template_keys=template_keys, target_mode=request.target_mode)
     for reason in plan.rationale:
         logger.info("Artwork generation plan: %s", reason)
     for target in plan.targets:
-        logger.info("Artwork generation target mode=%s openai_size=%s", target.mode, target.openai_size)
+        logger.info("Artwork generation target family=%s mode=%s openai_size=%s", target.family, target.mode, target.openai_size)
 
     if request.dry_run_plan:
-        return []
+        return PromptArtworkGenerationResult()
 
     generated_assets = generate_artwork_with_openai(request=request, plan=plan)
     hydrated_assets: List[GeneratedArtworkAsset] = []
@@ -2367,7 +2388,24 @@ def run_prompt_artwork_generation(
     dropped_paths = sorted({asset.path for asset in hydrated_assets} - set(kept_paths))
     for dropped in dropped_paths:
         logger.info("Skipping generated source image=%s reason=duplicate_concept_preferred_master_selected", dropped.name)
-    return kept_paths
+    routing: List[TemplateAssetRouting] = []
+    if request.family_aware and preferred_assets:
+        routing = route_templates_to_generated_assets(
+            template_keys=template_keys,
+            assets=preferred_assets,
+            template_family_map=plan.template_family_map,
+            mug_tote_master=request.mug_tote_master,
+        )
+        logger.info("Family routing planned mappings=%s", len(routing))
+        for row in routing:
+            logger.info(
+                "Template routing template=%s family=%s concept=%s asset=%s",
+                row.template_key,
+                row.family,
+                row.concept_index,
+                row.asset_path.name,
+            )
+    return PromptArtworkGenerationResult(generated_paths=kept_paths, template_routing=routing)
 
 
 def validate_artwork_for_placement(artwork: Artwork, placement: PlacementRequirement) -> Tuple[bool, str]:
@@ -4297,7 +4335,7 @@ def upsert_in_printify(
     return result
 
 
-def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, verify_collections: bool = False, summary: Optional[RunSummary] = None, failure_rows: Optional[List[FailureReportRow]] = None, run_rows: Optional[List[RunReportRow]] = None, launch_plan_row: str = "", launch_plan_row_id: str = "", collection_handle: str = "", collection_title: str = "", collection_description: str = "", launch_name: str = "", campaign: str = "", merch_theme: str = "") -> None:
+def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, verify_collections: bool = False, summary: Optional[RunSummary] = None, failure_rows: Optional[List[FailureReportRow]] = None, run_rows: Optional[List[RunReportRow]] = None, launch_plan_row: str = "", launch_plan_row_id: str = "", collection_handle: str = "", collection_title: str = "", collection_description: str = "", launch_name: str = "", campaign: str = "", merch_theme: str = "", routed_asset_family: str = "", routed_asset_mode: str = "") -> None:
     processed = state.setdefault("processed", {})
     existing = processed.get(artwork.slug, {})
     existing_products = existing.get("products", []) if isinstance(existing.get("products", []), list) else []
@@ -4391,6 +4429,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                         rendered_title=rendered_title,
                         launch_plan_row=launch_plan_row,
                         launch_plan_row_id=launch_plan_row_id,
+                        routed_asset_family=routed_asset_family,
+                        routed_asset_mode=routed_asset_mode,
                     ))
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=True, result=result, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
@@ -4546,8 +4586,10 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 "collection_description": collection_description,
                 "launch_name": launch_name,
                 "campaign": campaign,
-                "merch_theme": merch_theme,
-                "collection_sync_attempted": bool(collection_result.get("collection_sync_attempted", False)),
+                    "merch_theme": merch_theme,
+                    "routed_asset_family": routed_asset_family,
+                    "routed_asset_mode": routed_asset_mode,
+                    "collection_sync_attempted": bool(collection_result.get("collection_sync_attempted", False)),
                 "collection_sync_status": str(collection_result.get("collection_sync_status") or ""),
                 "shopify_collection_id": str(collection_result.get("collection_id") or ""),
                 "collection_membership_verified": bool(collection_result.get("collection_membership_verified", False)),
@@ -4601,6 +4643,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     collection_membership_verified=bool(collection_result.get("collection_membership_verified", False)),
                     collection_warning=str(collection_result.get("collection_warning") or ""),
                     collection_error=str(collection_result.get("collection_error") or ""),
+                    routed_asset_family=routed_asset_family,
+                    routed_asset_mode=routed_asset_mode,
                 ))
             if summary is not None:
                 printify_action = (result.get("printify", {}) or {}).get("action", action)
@@ -4812,6 +4856,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--art-publish", action="store_true", help="After generation, run full create/update flow and force publish")
     parser.add_argument("--art-verify-publish", action="store_true", help="After generation, verify publish/readback indicators")
     parser.add_argument("--art-target-mode", choices=["auto", "portrait", "square", "multi"], default="auto", help="Target aspect planning mode for generated artwork")
+    parser.add_argument("--art-family-aware", action="store_true", help="Enable family-aware prompt planning/routing for generated masters")
+    parser.add_argument("--art-family-mode", choices=["auto", "split", "single"], default="auto", help="Family-aware planning mode")
+    parser.add_argument("--art-generate-poster-master", action="store_true", help="Force poster master generation when family-aware mode is enabled")
+    parser.add_argument("--art-generate-apparel-master", action="store_true", help="Force apparel master generation when family-aware mode is enabled")
+    parser.add_argument("--art-mug-tote-master", choices=["apparel", "square", "auto"], default="apparel", help="Family master preference for mug/tote templates")
+    parser.add_argument("--art-apparel-style", default="", help="Optional apparel-family style override appended only to apparel master prompts")
+    parser.add_argument("--art-poster-style", default="", help="Optional poster-family style override appended only to poster master prompts")
     parser.add_argument("--art-skip-existing-generated", action="store_true", help="Skip OpenAI generation when expected output filename already exists")
     parser.add_argument("--art-dry-run-plan", action="store_true", help="Only print generation targets/plan and exit without calling the image API")
     parser.add_argument("--source-min-width", type=int, default=1, help="Minimum source width allowed when scanning artwork files")
@@ -5030,7 +5081,7 @@ def run_catalog_cli(
     return False
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "") -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "") -> None:
     if publish_mode not in {"default", "publish", "skip"}:
         raise RuntimeError(f"Unsupported publish mode: {publish_mode}")
 
@@ -5106,6 +5157,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         min_source_height=max(1, int(source_min_height)),
     )
     generated_paths: Optional[List[pathlib.Path]] = None
+    generated_template_routing: List[TemplateAssetRouting] = []
     if generate_artwork_from_prompt:
         if not art_prompt.strip():
             raise RuntimeError("--art-prompt is required when --generate-artwork-from-prompt is set")
@@ -5123,12 +5175,21 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             base_name=slugify(art_base_name or "generated-art"),
             output_dir=output_dir,
             target_mode=art_target_mode,
+            family_aware=art_family_aware,
+            family_mode=art_family_mode,
+            generate_poster_master=art_generate_poster_master,
+            generate_apparel_master=art_generate_apparel_master,
+            mug_tote_master=art_mug_tote_master,
+            apparel_style=art_apparel_style,
+            poster_style=art_poster_style,
             dry_run_plan=art_dry_run_plan,
             skip_existing_generated=art_skip_existing_generated,
             min_source_width=source_hygiene.min_source_width,
             min_source_height=source_hygiene.min_source_height,
         )
-        generated_paths = run_prompt_artwork_generation(request=request, templates=templates)
+        generation_result = run_prompt_artwork_generation(request=request, templates=templates)
+        generated_paths = generation_result.generated_paths
+        generated_template_routing = generation_result.template_routing
         if art_dry_run_plan:
             return
         if art_run_metadata and generated_paths:
@@ -5352,7 +5413,62 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                     stop_requested = True
                     break
     else:
+        if generated_template_routing:
+            artwork_by_resolved = {str(artwork.src_path.resolve()): artwork for artwork in artworks}
+            artwork_by_name = {artwork.src_path.name: artwork for artwork in artworks}
+            template_by_key = {template.key: template for template in templates}
+            for route in generated_template_routing:
+                if batch_size > 0 and combinations_processed >= batch_size:
+                    stop_requested = True
+                    break
+                template = template_by_key.get(route.template_key)
+                if template is None:
+                    continue
+                resolved_key = str(route.asset_path.resolve())
+                artwork = artwork_by_resolved.get(resolved_key) or artwork_by_name.get(route.asset_path.name)
+                if artwork is None:
+                    continue
+                if resume and is_state_key_successful(state, f"{artwork.slug}:{template.key}"):
+                    continue
+                combinations_processed += 1
+                before_failures = summary.failures
+                process_artwork(
+                    printify=printify,
+                    shopify=shopify,
+                    shop_id=shop_id,
+                    artwork=artwork,
+                    templates=[template],
+                    state=state,
+                    force=force,
+                    export_dir=export_dir,
+                    state_path=state_path,
+                    artwork_options=artwork_options,
+                    upload_strategy=upload_strategy,
+                    r2_config=r2_config,
+                    create_only=create_only,
+                    update_only=update_only,
+                    rebuild_product=rebuild_product,
+                    publish_mode=publish_mode,
+                    verify_publish=verify_publish,
+                    auto_rebuild_on_incompatible_update=auto_rebuild_on_incompatible_update,
+                    sync_collections=collection_sync_enabled,
+                    verify_collections=verify_collections,
+                    summary=summary,
+                    failure_rows=failure_rows,
+                    run_rows=run_rows,
+                    routed_asset_family=route.family,
+                    routed_asset_mode="family-aware",
+                )
+                if summary.failures > before_failures:
+                    if fail_fast:
+                        stop_requested = True
+                        break
+                    if stop_after_failures > 0 and summary.failures >= stop_after_failures:
+                        stop_requested = True
+                        break
         for artwork in artworks:
+            if generated_template_routing:
+                break
             templates_for_artwork: List[ProductTemplate] = []
             for template in templates:
                 if batch_size > 0 and combinations_processed >= batch_size:
@@ -5514,6 +5630,13 @@ if __name__ == "__main__":
             art_publish=args.art_publish,
             art_verify_publish=args.art_verify_publish,
             art_target_mode=args.art_target_mode,
+            art_family_aware=args.art_family_aware,
+            art_family_mode=args.art_family_mode,
+            art_generate_poster_master=args.art_generate_poster_master,
+            art_generate_apparel_master=args.art_generate_apparel_master,
+            art_mug_tote_master=args.art_mug_tote_master,
+            art_apparel_style=args.art_apparel_style,
+            art_poster_style=args.art_poster_style,
             art_skip_existing_generated=args.art_skip_existing_generated,
             art_dry_run_plan=args.art_dry_run_plan,
             source_min_width=args.source_min_width,
