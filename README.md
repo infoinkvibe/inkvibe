@@ -85,6 +85,41 @@ python printify_shopify_sync_pipeline.py --template-key hoodie_gildan --template
 python printify_shopify_sync_pipeline.py --generate-template-snippet --blueprint-id 68 --auto-provider --key mug_new --template-output-file ./mug_template.json
 ```
 
+## Local-image-first (cheap batch) workflow
+
+This is now a first-class primary workflow when you want to avoid AI image generation cost.
+
+Use existing files in `--image-dir` and run only the first `N` local images:
+
+```bash
+# First 3 local images across all active product templates (including tshirt_gildan)
+python printify_shopify_sync_pipeline.py --local-image-batch 3
+
+# Equivalent legacy form (kept for compatibility)
+python printify_shopify_sync_pipeline.py --max-artworks 3
+```
+
+Create/publish/verify directly from local images (no `--generate-artwork-from-prompt`):
+
+```bash
+python printify_shopify_sync_pipeline.py --local-image-batch 3 --publish --verify-publish
+```
+
+Run storefront QA from local images only:
+
+```bash
+python printify_shopify_sync_pipeline.py --local-image-batch 3 --storefront-qa --export-storefront-qa-report ./exports/storefront_qa_local.csv
+```
+
+Current supported template families include:
+- `hoodie_gildan`
+- `longsleeve_gildan`
+- `tshirt_gildan` (new short-sleeve family)
+- `sweatshirt_gildan`
+- `mug_new`
+- `poster_basic`
+- `tote_basic`
+
 ## Catalog exploration workflows
 
 Use the new read-only catalog tooling to discover blueprint/provider ids and bootstrap template entries.
@@ -257,7 +292,8 @@ Template-level optional preprocessing:
 Recommendation:
 - Shirts and mugs should usually use `artwork_fit_mode: contain` unless you intentionally want a full-bleed/cropped look.
 - Current defaults are intentionally split: `hoodie_gildan` front placement enables `allow_upscale: true` with a conservative `max_upscale_factor` cap, while `mug_new` keeps `allow_upscale: false` (conservative/no interpolation by default).
-- `poster_basic` now uses an adaptive poster-safe fallback: it still prefers `cover` when source resolution is eligible, and for undersized sources it keeps `contain` as the base while allowing only a bounded poster-only enhancement (`<= 1.35x` with minimum source-size ratio checks). If limits are exceeded, it stays on plain `contain` without upscale.
+- `poster_basic` now uses a stronger but bounded poster-only fallback: it still prefers `cover` when source resolution is eligible, and for moderately undersized sources it can apply safe bounded enhancement (`poster_safe_max_upscale_factor`, `poster_safe_min_source_ratio`) plus optional poster trim/fill optimization (`poster_trim_fill_optimization`, `poster_fill_target_pct`). If limits are exceeded, it stays on plain `contain` without upscale.
+- `tote_basic` supports deterministic placement controls via `active_placements`, `preferred_primary_placement`, and `publish_only_primary_placement` (default front-primary/front-only publish behavior).
 
 Example commands:
 
@@ -413,6 +449,7 @@ State helpers:
 
 Bulk safety controls:
 - `--max-artworks <n>`: cap input artwork files scanned in this run.
+- `--local-image-batch <n>`: alias for local-image-first runs (first N discovered local images).
 - `--batch-size <n>`: cap processed artwork/template combinations in this run.
 - `--stop-after-failures <n>`: stop when N failures are reached.
 - `--fail-fast`: stop on first failure.
@@ -422,6 +459,9 @@ Reporting exports:
 - `--export-failure-report <path>`: CSV report for failed combinations.
 - `--export-run-report <path>`: CSV report for all processed combinations (success/failure/skipped).
 - Run report now includes `effective_upscale_factor`, `requested_upscale_factor`, `applied_upscale_factor`, and `upscale_capped`.
+- Poster run-report fields now include `poster_cover_eligible`, `poster_enhancement_status`, `poster_requested_upscale_factor`, `poster_applied_upscale_factor`, and `poster_fill_optimization_used`.
+- Tote run-report fields now include `tote_primary_placement` and `tote_active_placements`.
+- Merch routing report fields now include `template_family` and `product_family_label` so long-sleeve and t-shirt labels remain distinct in diagnostics.
 
 Examples:
 

@@ -227,6 +227,13 @@ class ProductTemplate:
     max_upscale_factor: Optional[float] = None
     max_enabled_variants: Optional[int] = None
     enabled_variant_option_filters: Dict[str, List[str]] = field(default_factory=dict)
+    active_placements: List[str] = field(default_factory=list)
+    preferred_primary_placement: Optional[str] = None
+    publish_only_primary_placement: bool = False
+    poster_safe_max_upscale_factor: Optional[float] = None
+    poster_safe_min_source_ratio: Optional[float] = None
+    poster_fill_target_pct: Optional[float] = None
+    poster_trim_fill_optimization: bool = False
 
 
 @dataclass
@@ -309,6 +316,15 @@ class RunReportRow:
     collection_error: str = ""
     routed_asset_family: str = ""
     routed_asset_mode: str = ""
+    template_family: str = ""
+    product_family_label: str = ""
+    tote_primary_placement: str = ""
+    tote_active_placements: str = ""
+    poster_cover_eligible: str = ""
+    poster_enhancement_status: str = ""
+    poster_requested_upscale_factor: str = ""
+    poster_applied_upscale_factor: str = ""
+    poster_fill_optimization_used: bool = False
 
 
 @dataclass
@@ -394,6 +410,11 @@ class PreparedArtwork:
     subject_bounds_after_aggressive_trim: Optional[Tuple[int, int, int, int]] = None
     subject_fill_target: Optional[float] = None
     aggressive_trim_used: bool = False
+    poster_cover_eligible: Optional[bool] = None
+    poster_enhancement_status: str = ""
+    poster_requested_upscale_factor: float = 1.0
+    poster_applied_upscale_factor: float = 1.0
+    poster_fill_optimization_used: bool = False
 
 
 @dataclass
@@ -425,6 +446,11 @@ class ArtworkResolution:
     subject_bounds_after_aggressive_trim: Optional[Tuple[int, int, int, int]] = None
     subject_fill_target: Optional[float] = None
     aggressive_trim_used: bool = False
+    poster_cover_eligible: Optional[bool] = None
+    poster_enhancement_status: str = ""
+    poster_requested_upscale_factor: float = 1.0
+    poster_applied_upscale_factor: float = 1.0
+    poster_fill_optimization_used: bool = False
 
 
 @dataclass
@@ -457,6 +483,7 @@ TRIM_PRESETS: Dict[str, Dict[str, float]] = {
 
 POSTER_SAFE_ENHANCEMENT_MAX_UPSCALE_FACTOR = 1.35
 POSTER_SAFE_ENHANCEMENT_MIN_SOURCE_RATIO = 0.45
+POSTER_FILL_TARGET_PCT_DEFAULT = 0.94
 
 
 LAUNCH_PLAN_OVERRIDE_COLUMNS = [
@@ -2615,10 +2642,46 @@ def _resolve_max_upscale_factor(template: ProductTemplate, placement: PlacementR
     return None
 
 
+def _resolve_template_placements(template: ProductTemplate, *, for_publish: bool = False) -> List[PlacementRequirement]:
+    placements = list(template.placements)
+    if not placements:
+        return placements
+    active = [name.strip().lower() for name in (template.active_placements or []) if str(name).strip()]
+    if active:
+        active_set = set(active)
+        placements = [placement for placement in placements if placement.placement_name.lower() in active_set]
+    primary = (template.preferred_primary_placement or "").strip().lower()
+    if primary:
+        placements = sorted(placements, key=lambda placement: 0 if placement.placement_name.lower() == primary else 1)
+    if for_publish and template.publish_only_primary_placement and primary:
+        placements = [placement for placement in placements if placement.placement_name.lower() == primary]
+    return placements
+
+
+def _resolve_poster_enhancement_settings(template: ProductTemplate) -> Tuple[float, float, float, bool]:
+    max_upscale = (
+        float(template.poster_safe_max_upscale_factor)
+        if template.poster_safe_max_upscale_factor is not None
+        else POSTER_SAFE_ENHANCEMENT_MAX_UPSCALE_FACTOR
+    )
+    min_ratio = (
+        float(template.poster_safe_min_source_ratio)
+        if template.poster_safe_min_source_ratio is not None
+        else POSTER_SAFE_ENHANCEMENT_MIN_SOURCE_RATIO
+    )
+    fill_target_pct = (
+        float(template.poster_fill_target_pct)
+        if template.poster_fill_target_pct is not None
+        else POSTER_FILL_TARGET_PCT_DEFAULT
+    )
+    return max_upscale, min_ratio, fill_target_pct, bool(template.poster_trim_fill_optimization)
+
+
 def resolve_artwork_for_placement(
     artwork: Artwork,
     placement: PlacementRequirement,
     *,
+    template: Optional[ProductTemplate] = None,
     template_key: str = "",
     allow_upscale: bool,
     upscale_method: str,
@@ -2690,9 +2753,18 @@ def resolve_artwork_for_placement(
     poster_requested_upscale_factor = 1.0
     poster_applied_upscale_factor = 1.0
     poster_trim_fill_optimization_applied = False
+    poster_enhancement_status = "not_considered"
     effective_allow_upscale = allow_upscale
     effective_max_upscale_factor = max_upscale_factor
     if template_key == "poster_basic":
+        poster_max_upscale, poster_min_source_ratio, poster_fill_target_pct, poster_trim_fill_optimization = (
+            _resolve_poster_enhancement_settings(template) if template is not None else (
+                POSTER_SAFE_ENHANCEMENT_MAX_UPSCALE_FACTOR,
+                POSTER_SAFE_ENHANCEMENT_MIN_SOURCE_RATIO,
+                POSTER_FILL_TARGET_PCT_DEFAULT,
+                False,
+            )
+        )
         poster_cover_eligible = image.width >= placement.width_px and image.height >= placement.height_px
         logger.info(
             "Poster strategy candidate=cover eligible=%s reason=%s placement=%s source=%sx%s required=%sx%s",
@@ -2707,6 +2779,7 @@ def resolve_artwork_for_placement(
         if poster_cover_eligible:
             fit_mode = "cover"
             poster_strategy_path = "cover"
+            poster_enhancement_status = "cover_eligible"
             logger.info(
                 "Poster strategy selected template=%s placement=%s strategy=cover reason=eligible_resolution",
                 template_key,
@@ -2716,6 +2789,7 @@ def resolve_artwork_for_placement(
             fit_mode = "contain"
             poster_strategy_path = "contain_fallback"
             poster_enhancement_considered = True
+            poster_enhancement_status = "considered"
             logger.warning(
                 "Poster strategy fallback=contain reason=insufficient_resolution placement=%s source=%sx%s required=%sx%s",
                 placement.placement_name,
@@ -2727,19 +2801,24 @@ def resolve_artwork_for_placement(
             poster_requested_scale = min(placement.width_px / image.width, placement.height_px / image.height)
             poster_requested_upscale_factor = poster_requested_scale if poster_requested_scale > 1.0 else 1.0
             min_source_ratio = min(image.width / placement.width_px, image.height / placement.height_px)
+            if poster_trim_fill_optimization and min_source_ratio >= poster_min_source_ratio:
+                poster_trim_fill_optimization_applied = True
+                _ = min(1.0, max(0.5, poster_fill_target_pct))
+
             enhancement_within_limits = (
                 poster_requested_upscale_factor > 1.0
-                and poster_requested_upscale_factor <= POSTER_SAFE_ENHANCEMENT_MAX_UPSCALE_FACTOR
-                and min_source_ratio >= POSTER_SAFE_ENHANCEMENT_MIN_SOURCE_RATIO
+                and poster_requested_upscale_factor <= poster_max_upscale
+                and min_source_ratio >= poster_min_source_ratio
             )
             if enhancement_within_limits:
                 effective_allow_upscale = True
                 effective_max_upscale_factor = (
-                    min(max_upscale_factor, POSTER_SAFE_ENHANCEMENT_MAX_UPSCALE_FACTOR)
+                    min(max_upscale_factor, poster_max_upscale)
                     if max_upscale_factor is not None and max_upscale_factor > 0
-                    else POSTER_SAFE_ENHANCEMENT_MAX_UPSCALE_FACTOR
+                    else poster_max_upscale
                 )
                 poster_enhancement_applied = True
+                poster_enhancement_status = "applied"
                 poster_applied_upscale_factor = min(
                     poster_requested_upscale_factor,
                     effective_max_upscale_factor if effective_max_upscale_factor else poster_requested_upscale_factor,
@@ -2754,13 +2833,14 @@ def resolve_artwork_for_placement(
                 )
             else:
                 effective_allow_upscale = False
+                poster_enhancement_status = "skipped_outside_safe_limits"
                 logger.info(
                     "Poster enhancement skipped placement=%s reason=outside_safe_limits requested_upscale_factor=%.3f max_safe_upscale_factor=%.3f min_source_ratio=%.3f min_required_source_ratio=%.3f trim_fill_optimization_applied=%s",
                     placement.placement_name,
                     poster_requested_upscale_factor,
-                    POSTER_SAFE_ENHANCEMENT_MAX_UPSCALE_FACTOR,
+                    poster_max_upscale,
                     min_source_ratio,
-                    POSTER_SAFE_ENHANCEMENT_MIN_SOURCE_RATIO,
+                    poster_min_source_ratio,
                     poster_trim_fill_optimization_applied,
                 )
 
@@ -2969,6 +3049,11 @@ def resolve_artwork_for_placement(
         subject_bounds_after_aggressive_trim=subject_bounds_after_aggressive_trim,
         subject_fill_target=subject_fill_target,
         aggressive_trim_used=aggressive_trim_used,
+        poster_cover_eligible=poster_cover_eligible if template_key == "poster_basic" else None,
+        poster_enhancement_status=poster_enhancement_status if template_key == "poster_basic" else "",
+        poster_requested_upscale_factor=poster_requested_upscale_factor if template_key == "poster_basic" else 1.0,
+        poster_applied_upscale_factor=applied_upscale_factor if template_key == "poster_basic" else 1.0,
+        poster_fill_optimization_used=poster_trim_fill_optimization_applied if template_key == "poster_basic" else False,
     )
 
 
@@ -3010,6 +3095,7 @@ def prepare_artwork_export(
     resolution = resolve_artwork_for_placement(
         artwork,
         placement,
+        template=template,
         template_key=template.key,
         allow_upscale=options.allow_upscale or placement.allow_upscale,
         upscale_method=options.upscale_method,
@@ -3065,6 +3151,11 @@ def prepare_artwork_export(
         subject_bounds_after_aggressive_trim=resolution.subject_bounds_after_aggressive_trim,
         subject_fill_target=resolution.subject_fill_target,
         aggressive_trim_used=resolution.aggressive_trim_used,
+        poster_cover_eligible=resolution.poster_cover_eligible,
+        poster_enhancement_status=resolution.poster_enhancement_status,
+        poster_requested_upscale_factor=resolution.poster_requested_upscale_factor,
+        poster_applied_upscale_factor=resolution.poster_applied_upscale_factor,
+        poster_fill_optimization_used=resolution.poster_fill_optimization_used,
     )
 
 
@@ -3090,6 +3181,19 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
             raise TemplateValidationError(f"Template[{index}] placement[{pidx}] placement_scale must be > 0")
         if "max_upscale_factor" in placement and placement.get("max_upscale_factor") is not None and float(placement.get("max_upscale_factor", 0)) <= 0:
             raise TemplateValidationError(f"Template[{index}] placement[{pidx}] max_upscale_factor must be > 0 when provided")
+    if row.get("active_placements") is not None and not isinstance(row.get("active_placements"), list):
+        raise TemplateValidationError(f"Template[{index}] active_placements must be a list when provided")
+    if isinstance(row.get("active_placements"), list):
+        declared = {str(p.get("placement_name", "")).strip().lower() for p in row["placements"]}
+        for placement_name in row.get("active_placements", []):
+            if str(placement_name).strip().lower() not in declared:
+                raise TemplateValidationError(
+                    f"Template[{index}] active_placements references unknown placement '{placement_name}'"
+                )
+    if row.get("preferred_primary_placement") is not None and not str(row.get("preferred_primary_placement")).strip():
+        raise TemplateValidationError(f"Template[{index}] preferred_primary_placement cannot be blank when provided")
+    if row.get("publish_only_primary_placement") is not None and not isinstance(row.get("publish_only_primary_placement"), bool):
+        raise TemplateValidationError(f"Template[{index}] publish_only_primary_placement must be boolean when provided")
     if "trim_artwork_bounds" in row and not isinstance(row.get("trim_artwork_bounds"), bool):
         raise TemplateValidationError(f"Template[{index}] trim_artwork_bounds must be a boolean when provided")
     if "trim_artwork_bounds_for_shirts" in row and not isinstance(row.get("trim_artwork_bounds_for_shirts"), bool):
@@ -3126,6 +3230,18 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
         raise TemplateValidationError(f"Template[{index}] max_enabled_variants must be > 0 when provided")
     if row.get("max_upscale_factor") is not None and float(row.get("max_upscale_factor", 0)) <= 0:
         raise TemplateValidationError(f"Template[{index}] max_upscale_factor must be > 0 when provided")
+    if row.get("poster_safe_max_upscale_factor") is not None and float(row.get("poster_safe_max_upscale_factor", 0)) <= 0:
+        raise TemplateValidationError(f"Template[{index}] poster_safe_max_upscale_factor must be > 0 when provided")
+    if row.get("poster_safe_min_source_ratio") is not None:
+        ratio = float(row.get("poster_safe_min_source_ratio", 0))
+        if ratio <= 0 or ratio > 1:
+            raise TemplateValidationError(f"Template[{index}] poster_safe_min_source_ratio must be > 0 and <= 1 when provided")
+    if row.get("poster_fill_target_pct") is not None:
+        target = float(row.get("poster_fill_target_pct", 0))
+        if target <= 0 or target > 1:
+            raise TemplateValidationError(f"Template[{index}] poster_fill_target_pct must be > 0 and <= 1 when provided")
+    if row.get("poster_trim_fill_optimization") is not None and not isinstance(row.get("poster_trim_fill_optimization"), bool):
+        raise TemplateValidationError(f"Template[{index}] poster_trim_fill_optimization must be boolean when provided")
     option_filters = row.get("enabled_variant_option_filters")
     if option_filters is not None and not isinstance(option_filters, dict):
         raise TemplateValidationError(f"Template[{index}] enabled_variant_option_filters must be an object")
@@ -3191,6 +3307,13 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
                 max_upscale_factor=float(row["max_upscale_factor"]) if row.get("max_upscale_factor") is not None else None,
                 max_enabled_variants=int(row["max_enabled_variants"]) if row.get("max_enabled_variants") is not None else None,
                 enabled_variant_option_filters={str(k): [str(v) for v in vals] for k, vals in (row.get("enabled_variant_option_filters") or {}).items()},
+                active_placements=[str(v) for v in row.get("active_placements", [])],
+                preferred_primary_placement=str(row.get("preferred_primary_placement", "")).strip() or None,
+                publish_only_primary_placement=bool(row.get("publish_only_primary_placement", False)),
+                poster_safe_max_upscale_factor=float(row["poster_safe_max_upscale_factor"]) if row.get("poster_safe_max_upscale_factor") is not None else None,
+                poster_safe_min_source_ratio=float(row["poster_safe_min_source_ratio"]) if row.get("poster_safe_min_source_ratio") is not None else None,
+                poster_fill_target_pct=float(row["poster_fill_target_pct"]) if row.get("poster_fill_target_pct") is not None else None,
+                poster_trim_fill_optimization=bool(row.get("poster_trim_fill_optimization", False)),
                 placements=[PlacementRequirement(**p) for p in row.get("placements", [])],
             )
         )
@@ -3448,7 +3571,8 @@ def build_printify_product_payload(artwork: Artwork, template: ProductTemplate, 
         logger.debug("Printify variants sample (normalized): %s", variants_payload[0])
 
     print_areas: List[Dict[str, Any]] = []
-    for placement in template.placements:
+    resolved_placements = _resolve_template_placements(template, for_publish=True) or list(template.placements)
+    for placement in resolved_placements:
         upload_info = upload_map[placement.placement_name]
         transform = compute_placement_transform_for_artwork(placement, artwork, template.key)
         logger.info(
@@ -3794,7 +3918,7 @@ def build_storefront_qa_row(
     product_options, variant_payloads = build_shopify_product_options(template, variant_rows)
     publish_payload = build_printify_publish_payload(template)
     placement_bits: List[str] = []
-    for placement in template.placements:
+    for placement in (_resolve_template_placements(template, for_publish=True) or list(template.placements)):
         transform = compute_placement_transform_for_artwork(placement, artwork, template.key)
         placement_bits.append(
             f"{placement.placement_name}:mode={placement.artwork_fit_mode}:scale={transform.scale:.3f}:xy=({transform.x:.3f},{transform.y:.3f})"
@@ -4389,6 +4513,15 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
         subject_fill_target_report = ""
         aggressive_trim_used_report = False
         orientation_report = _orientation_bucket(artwork.image_width, artwork.image_height)
+        template_family_report = content_engine.infer_product_family(template)
+        family_label_report = content_engine.family_title_suffix(template)
+        tote_primary_placement_report = ""
+        tote_active_placements_report = ""
+        poster_cover_eligible_report = ""
+        poster_enhancement_status_report = ""
+        poster_requested_upscale_factor_report = ""
+        poster_applied_upscale_factor_report = ""
+        poster_fill_optimization_used_report = False
         try:
             resolved_template = template
             if action == "skip":
@@ -4431,6 +4564,15 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                         launch_plan_row_id=launch_plan_row_id,
                         routed_asset_family=routed_asset_family,
                         routed_asset_mode=routed_asset_mode,
+                        template_family=template_family_report,
+                        product_family_label=family_label_report,
+                        tote_primary_placement=tote_primary_placement_report,
+                        tote_active_placements=tote_active_placements_report,
+                        poster_cover_eligible=poster_cover_eligible_report,
+                        poster_enhancement_status=poster_enhancement_status_report,
+                        poster_requested_upscale_factor=poster_requested_upscale_factor_report,
+                        poster_applied_upscale_factor=poster_applied_upscale_factor_report,
+                        poster_fill_optimization_used=poster_fill_optimization_used_report,
                     ))
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=True, result=result, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
@@ -4456,7 +4598,18 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
 
             prepared_assets: List[PreparedArtwork] = []
             skipped_placements: List[str] = []
-            for placement in resolved_template.placements:
+            resolved_placements = _resolve_template_placements(resolved_template, for_publish=True) or list(resolved_template.placements)
+            if resolved_template.key == "tote_basic":
+                tote_primary_placement_report = str(resolved_template.preferred_primary_placement or "")
+                tote_active_placements_report = ",".join([p.placement_name for p in resolved_placements])
+                logger.info(
+                    "Tote placement plan template=%s preferred_primary=%s active=%s publish_only_primary=%s",
+                    resolved_template.key,
+                    tote_primary_placement_report or "-",
+                    tote_active_placements_report or "-",
+                    resolved_template.publish_only_primary_placement,
+                )
+            for placement in resolved_placements:
                 prepared = prepare_artwork_export(artwork, resolved_template, placement, export_dir, artwork_options)
                 if prepared is None:
                     skipped_placements.append(placement.placement_name)
@@ -4486,6 +4639,14 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 if first_prepared.subject_fill_target is not None:
                     subject_fill_target_report = f"{first_prepared.subject_fill_target:.3f}"
                 aggressive_trim_used_report = first_prepared.aggressive_trim_used
+                if resolved_template.key == "poster_basic":
+                    poster_cover_eligible_report = (
+                        "" if first_prepared.poster_cover_eligible is None else str(first_prepared.poster_cover_eligible).lower()
+                    )
+                    poster_enhancement_status_report = first_prepared.poster_enhancement_status
+                    poster_requested_upscale_factor_report = f"{first_prepared.poster_requested_upscale_factor:.3f}"
+                    poster_applied_upscale_factor_report = f"{first_prepared.poster_applied_upscale_factor:.3f}"
+                    poster_fill_optimization_used_report = first_prepared.poster_fill_optimization_used
 
             if skipped_placements:
                 all_templates_successful = False
@@ -4645,6 +4806,15 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     collection_error=str(collection_result.get("collection_error") or ""),
                     routed_asset_family=routed_asset_family,
                     routed_asset_mode=routed_asset_mode,
+                    template_family=template_family_report,
+                    product_family_label=family_label_report,
+                    tote_primary_placement=tote_primary_placement_report,
+                    tote_active_placements=tote_active_placements_report,
+                    poster_cover_eligible=poster_cover_eligible_report,
+                    poster_enhancement_status=poster_enhancement_status_report,
+                    poster_requested_upscale_factor=poster_requested_upscale_factor_report,
+                    poster_applied_upscale_factor=poster_applied_upscale_factor_report,
+                    poster_fill_optimization_used=poster_fill_optimization_used_report,
                 ))
             if summary is not None:
                 printify_action = (result.get("printify", {}) or {}).get("action", action)
@@ -4773,6 +4943,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-level", default="INFO", help="Logging level: DEBUG/INFO/WARNING/ERROR")
     parser.add_argument("--skip-audit", action="store_true", help="Skip Printify catalog/shop preflight audit")
     parser.add_argument("--max-artworks", type=int, default=0, help="Limit number of discovered artworks (0 = no limit)")
+    parser.add_argument("--local-image-batch", type=int, default=0, help="Cheap local-image-first alias for --max-artworks (first N discovered local images)")
     parser.add_argument("--batch-size", type=int, default=0, help="Limit number of artwork/template combinations processed this run (0 = no limit)")
     parser.add_argument("--stop-after-failures", type=int, default=0, help="Stop run after N combination failures (0 = no limit)")
     parser.add_argument("--fail-fast", action="store_true", help="Stop immediately after the first combination failure")
@@ -5546,6 +5717,7 @@ if __name__ == "__main__":
         publish_mode = "publish"
     elif args.skip_publish:
         publish_mode = "skip"
+    effective_max_artworks = args.local_image_batch if args.local_image_batch > 0 else args.max_artworks
     try:
         run(
             pathlib.Path(args.templates),
@@ -5558,7 +5730,7 @@ if __name__ == "__main__":
             export_dir=pathlib.Path(args.export_dir),
             state_path=pathlib.Path(args.state_path),
             skip_audit=args.skip_audit,
-            max_artworks=args.max_artworks,
+            max_artworks=effective_max_artworks,
             batch_size=args.batch_size,
             stop_after_failures=args.stop_after_failures,
             fail_fast=args.fail_fast,
