@@ -177,6 +177,10 @@ class TemplatePreflightReportRow:
     requested_option_filters: str = ""
     filter_counts: str = ""
     zero_selection_reason: str = ""
+    intended_family: str = ""
+    resolved_blueprint_title: str = ""
+    resolved_provider_title: str = ""
+    family_mismatch_reason: str = ""
 
 
 @dataclass
@@ -186,6 +190,13 @@ class VariantFilterDiagnostics:
     requested_option_filters: Dict[str, List[str]] = field(default_factory=dict)
     filter_counts: List[Dict[str, Any]] = field(default_factory=list)
     zero_selection_reason: str = ""
+
+
+@dataclass
+class CatalogFamilyValidationResult:
+    intended_family: str
+    plausible: bool
+    reason: str = ""
 
 
 def classify_failure(exc: Exception) -> str:
@@ -1496,6 +1507,112 @@ def summarize_variant_options(variants: List[Dict[str, Any]]) -> Dict[str, List[
     return {"colors": colors, "sizes": sizes, "placements": sorted(placements)}
 
 
+def _template_intended_family(template: ProductTemplate) -> str:
+    hint = " ".join(
+        [
+            str(template.key or ""),
+            str(template.product_type_label or ""),
+            str(template.shopify_product_type or ""),
+        ]
+    ).lower()
+    if "phone_case" in hint or "phone case" in hint:
+        return "phone_case"
+    if "sticker" in hint:
+        return "sticker"
+    return "other"
+
+
+def _collect_option_names_and_values(variants: List[Dict[str, Any]]) -> Tuple[List[str], Dict[str, List[str]]]:
+    option_names: set[str] = set()
+    option_values: Dict[str, set[str]] = {}
+    for variant in variants:
+        options = variant.get("options", {})
+        if not isinstance(options, dict):
+            continue
+        for option_name, option_value in options.items():
+            name = str(option_name or "").strip()
+            if not name:
+                continue
+            option_names.add(name)
+            normalized_name = name.lower()
+            if normalized_name not in option_values:
+                option_values[normalized_name] = set()
+            value = str(option_value or "").strip()
+            if value:
+                option_values[normalized_name].add(value)
+    sorted_names = sorted(option_names, key=lambda item: item.lower())
+    summarized_values = {key: sorted(values) for key, values in sorted(option_values.items())}
+    return sorted_names, summarized_values
+
+
+def validate_catalog_family_schema(
+    *,
+    template: ProductTemplate,
+    variants: List[Dict[str, Any]],
+    blueprint_title: str = "",
+    provider_title: str = "",
+) -> CatalogFamilyValidationResult:
+    intended_family = _template_intended_family(template)
+    if intended_family == "other":
+        return CatalogFamilyValidationResult(intended_family=intended_family, plausible=True)
+
+    option_names, option_values_summary = _collect_option_names_and_values(variants)
+    option_name_tokens = {name.lower() for name in option_names}
+    all_values = {value.lower() for values in option_values_summary.values() for value in values}
+    title_tokens = f"{blueprint_title} {provider_title}".lower()
+
+    if intended_family == "phone_case":
+        has_model_dimension = any(token in option_name_tokens for token in ("model", "device model", "device", "phone model", "compatibility"))
+        has_title_signal = any(token in title_tokens for token in ("phone case", "iphone", "samsung case", "tough case", "slim case"))
+        apparel_size_values = {"s", "m", "l", "xl", "2xl", "3xl"}
+        mostly_apparel_sizes = bool(all_values.intersection(apparel_size_values))
+        if not (has_model_dimension or has_title_signal):
+            return CatalogFamilyValidationResult(
+                intended_family=intended_family,
+                plausible=False,
+                reason=(
+                    "Phone case schema mismatch: missing model/device-style options and family-title hints; "
+                    f"option_names={option_names}"
+                ),
+            )
+        if mostly_apparel_sizes and not has_model_dimension:
+            return CatalogFamilyValidationResult(
+                intended_family=intended_family,
+                plausible=False,
+                reason="Phone case schema mismatch: variant values look apparel-sized (S/M/L/XL) without device model options.",
+            )
+        return CatalogFamilyValidationResult(intended_family=intended_family, plausible=True)
+
+    if intended_family == "sticker":
+        has_sticker_size = any(token in option_name_tokens for token in ("size", "sticker size", "dimensions"))
+        has_shape = any(token in option_name_tokens for token in ("shape", "cut", "finish"))
+        has_title_signal = "sticker" in title_tokens
+        textile_signals = any("seam thread" in value for value in all_values)
+        apparel_size_values = {"s", "m", "l", "xl", "2xl", "3xl"}
+        mostly_apparel_sizes = bool(all_values.intersection(apparel_size_values))
+        if textile_signals:
+            return CatalogFamilyValidationResult(
+                intended_family=intended_family,
+                plausible=False,
+                reason="Sticker schema mismatch: textile/thread attributes detected in variant options.",
+            )
+        if mostly_apparel_sizes and not has_shape:
+            return CatalogFamilyValidationResult(
+                intended_family=intended_family,
+                plausible=False,
+                reason="Sticker schema mismatch: only apparel-like sizes present without sticker shape/finish dimensions.",
+            )
+        if not (has_sticker_size and (has_shape or has_title_signal)):
+            return CatalogFamilyValidationResult(
+                intended_family=intended_family,
+                plausible=False,
+                reason=f"Sticker schema mismatch: insufficient sticker-like options. option_names={option_names}",
+            )
+        return CatalogFamilyValidationResult(intended_family=intended_family, plausible=True)
+
+    return CatalogFamilyValidationResult(intended_family=intended_family, plausible=True)
+
+
 def filter_providers(providers: List[Dict[str, Any]], query: str) -> List[Dict[str, Any]]:
     needle = query.lower().strip()
     if not needle:
@@ -1550,6 +1667,82 @@ def _provider_is_printify_choice(provider: Dict[str, Any]) -> bool:
     return "printify choice" in title
 
 
+def _discover_family_catalog_mapping(
+    *,
+    printify: PrintifyClient,
+    template: ProductTemplate,
+) -> Optional[Tuple[int, int]]:
+    intended_family = _template_intended_family(template)
+    if intended_family == "other":
+        return None
+    if not all(hasattr(printify, method) for method in ("list_blueprints", "list_print_providers", "list_variants")):
+        return None
+
+    family_queries = {
+        "phone_case": ["phone case", "tough case", "slim case"],
+        "sticker": ["kiss-cut sticker", "sticker", "die-cut sticker"],
+    }
+    queries = family_queries.get(intended_family, [])
+    blueprints = printify.list_blueprints()
+    seen_blueprint_ids: set[int] = set()
+    candidates: List[Dict[str, Any]] = []
+    for query in queries:
+        for blueprint in search_blueprints(blueprints, query):
+            blueprint_id = int(blueprint.get("id") or 0)
+            if blueprint_id <= 0 or blueprint_id in seen_blueprint_ids:
+                continue
+            seen_blueprint_ids.add(blueprint_id)
+            candidates.append(blueprint)
+
+    best_pair: Optional[Tuple[int, int]] = None
+    best_score = -1
+    for blueprint in candidates[:60]:
+        blueprint_id = int(blueprint.get("id") or 0)
+        if blueprint_id <= 0:
+            continue
+        blueprint_title = str(blueprint.get("title") or "")
+        try:
+            providers = printify.list_print_providers(blueprint_id)
+        except Exception:
+            continue
+        for provider in providers:
+            provider_id = int(provider.get("id") or 0)
+            if provider_id <= 0:
+                continue
+            provider_title = str(provider.get("title") or provider.get("name") or "")
+            try:
+                variants = normalize_catalog_variants_response(printify.list_variants(blueprint_id, provider_id))
+            except Exception:
+                continue
+            if not variants:
+                continue
+            validation = validate_catalog_family_schema(
+                template=template,
+                variants=variants,
+                blueprint_title=blueprint_title,
+                provider_title=provider_title,
+            )
+            if not validation.plausible:
+                continue
+            option_names, _ = _collect_option_names_and_values(variants)
+            score = len(variants)
+            if intended_family == "phone_case":
+                if any("model" in name.lower() or "device" in name.lower() for name in option_names):
+                    score += 1000
+            elif intended_family == "sticker":
+                lowered = {name.lower() for name in option_names}
+                if "shape" in lowered:
+                    score += 1000
+                if "size" in lowered:
+                    score += 500
+            if _provider_is_printify_choice(provider):
+                score += 200
+            if score > best_score:
+                best_score = score
+                best_pair = (blueprint_id, provider_id)
+    return best_pair
+
+
 def select_provider_for_template(
     *,
     printify: PrintifyClient,
@@ -1561,6 +1754,10 @@ def select_provider_for_template(
         return template
 
     blueprint_id = int(template.pinned_blueprint_id or template.printify_blueprint_id)
+    discovered_pair = _discover_family_catalog_mapping(printify=printify, template=template)
+    if discovered_pair is not None:
+        blueprint_id, discovered_provider_id = discovered_pair
+        template = replace(template, printify_blueprint_id=blueprint_id, printify_print_provider_id=discovered_provider_id)
     try:
         providers = printify.list_print_providers(blueprint_id)
     except Exception:
@@ -4795,6 +4992,7 @@ def _preflight_template(
     printify: PrintifyClient,
     template: ProductTemplate,
     blueprint_ids: set[int],
+    blueprint_titles: Optional[Dict[int, str]] = None,
 ) -> Tuple[Optional[TemplatePreflightIssue], TemplatePreflightReportRow]:
     resolved_template = select_provider_for_template(printify=printify, template=template)
     blueprint_id = int(resolved_template.printify_blueprint_id)
@@ -4806,6 +5004,8 @@ def _preflight_template(
             return "fix_pricing"
         if classification == "invalid_template_config":
             return "fix_blueprint_mapping" if blueprint_id <= 0 or blueprint_id not in blueprint_ids else "fix_provider_selection"
+        if classification == "wrong_catalog_family":
+            return "fix_blueprint_mapping"
         if classification == "zero_variants_selected":
             return "deactivate_pending_validation"
         return "deactivate_pending_validation"
@@ -4823,6 +5023,10 @@ def _preflight_template(
         failed_variant_reasons: Optional[Dict[int, str]] = None,
         failure_reason_counts: Optional[Dict[str, int]] = None,
         option_diagnostics: Optional[VariantFilterDiagnostics] = None,
+        intended_family: str = "",
+        resolved_blueprint_title: str = "",
+        resolved_provider_title: str = "",
+        family_mismatch_reason: str = "",
     ) -> Tuple[TemplatePreflightIssue, TemplatePreflightReportRow]:
         tote_diag = tote_diag or {}
         apparel_diag = apparel_diag or {}
@@ -4881,6 +5085,10 @@ def _preflight_template(
             requested_option_filters=json.dumps(option_diagnostics.requested_option_filters, sort_keys=True),
             filter_counts=json.dumps(option_diagnostics.filter_counts, sort_keys=True),
             zero_selection_reason=str(option_diagnostics.zero_selection_reason or ""),
+            intended_family=intended_family,
+            resolved_blueprint_title=resolved_blueprint_title,
+            resolved_provider_title=resolved_provider_title,
+            family_mismatch_reason=family_mismatch_reason,
         )
         return issue, row
 
@@ -4888,6 +5096,10 @@ def _preflight_template(
         if blueprint_id not in blueprint_ids:
             return _failure("invalid_template_config", f"Blueprint {blueprint_id} is not available.")
         providers = printify.list_print_providers(blueprint_id)
+        provider_titles = {
+            int(provider.get("id", 0)): str(provider.get("title") or provider.get("name") or "")
+            for provider in providers
+        }
         provider_ids = {int(provider.get("id", 0)) for provider in providers}
         if provider_id not in provider_ids:
             return _failure(
@@ -4895,7 +5107,35 @@ def _preflight_template(
                 f"Provider {provider_id} is not available for blueprint {blueprint_id}.",
             )
         variants = printify.list_variants(blueprint_id, provider_id)
-        selected, option_diagnostics = _analyze_variant_filtering(normalize_catalog_variants_response(variants), resolved_template)
+        normalized_variants = normalize_catalog_variants_response(variants)
+        resolved_blueprint_title = str((blueprint_titles or {}).get(blueprint_id, ""))
+        resolved_provider_title = str(provider_titles.get(provider_id, ""))
+        family_validation = validate_catalog_family_schema(
+            template=resolved_template,
+            variants=normalized_variants,
+            blueprint_title=resolved_blueprint_title,
+            provider_title=resolved_provider_title,
+        )
+        if not family_validation.plausible:
+            option_names, option_values = _collect_option_names_and_values(normalized_variants)
+            return _failure(
+                "wrong_catalog_family",
+                "Resolved catalog schema is inconsistent with intended product family. "
+                f"intended_family={family_validation.intended_family} "
+                f"blueprint_title={resolved_blueprint_title or '-'} provider_title={resolved_provider_title or '-'} "
+                f"available_option_names={option_names} reason={family_validation.reason}",
+                option_diagnostics=VariantFilterDiagnostics(
+                    option_names=option_names,
+                    option_values_summary=option_values,
+                    zero_selection_reason=family_validation.reason,
+                ),
+                intended_family=family_validation.intended_family,
+                resolved_blueprint_title=resolved_blueprint_title,
+                resolved_provider_title=resolved_provider_title,
+                family_mismatch_reason=family_validation.reason,
+            )
+
+        selected, option_diagnostics = _analyze_variant_filtering(normalized_variants, resolved_template)
         if not selected:
             diagnostic_message = (
                 "Curated option filters selected zero variants. "
@@ -4906,7 +5146,14 @@ def _preflight_template(
                 f"filter_counts={option_diagnostics.filter_counts} "
                 f"reason={option_diagnostics.zero_selection_reason or 'no_intersection'}"
             )
-            return _failure("zero_variants_selected", diagnostic_message, option_diagnostics=option_diagnostics)
+            return _failure(
+                "zero_variants_selected",
+                diagnostic_message,
+                option_diagnostics=option_diagnostics,
+                intended_family=family_validation.intended_family,
+                resolved_blueprint_title=resolved_blueprint_title,
+                resolved_provider_title=resolved_provider_title,
+            )
         guarded, report = apply_variant_margin_guardrails(resolved_template, selected)
         tote_diag = (report.get("variant_diagnostics") or [])[0] if template.key == "tote_basic" else {}
         selected_count = int(report.get("selected_count", 0))
@@ -4961,6 +5208,9 @@ def _preflight_template(
                 failed_variant_reasons=failed_variant_reasons,
                 failure_reason_counts=failure_reason_counts,
                 option_diagnostics=option_diagnostics,
+                intended_family=family_validation.intended_family,
+                resolved_blueprint_title=resolved_blueprint_title,
+                resolved_provider_title=resolved_provider_title,
             )
         return None, TemplatePreflightReportRow(
             template_key=template.key,
@@ -5002,6 +5252,9 @@ def _preflight_template(
             requested_option_filters=json.dumps(option_diagnostics.requested_option_filters, sort_keys=True),
             filter_counts=json.dumps(option_diagnostics.filter_counts, sort_keys=True),
             zero_selection_reason=str(option_diagnostics.zero_selection_reason or ""),
+            intended_family=family_validation.intended_family,
+            resolved_blueprint_title=resolved_blueprint_title,
+            resolved_provider_title=resolved_provider_title,
         )
     except TemplateValidationError as exc:
         return _failure("invalid_template_config", str(exc))
@@ -5041,11 +5294,17 @@ def preflight_active_templates(
     explicit = {key.strip() for key in (explicit_template_keys or []) if key.strip()}
     blueprints = printify.list_blueprints()
     blueprint_ids = {int(blueprint.get("id", 0)) for blueprint in blueprints}
+    blueprint_titles = {int(blueprint.get("id", 0)): str(blueprint.get("title") or "") for blueprint in blueprints}
     passed: List[ProductTemplate] = []
     issues: List[TemplatePreflightIssue] = []
     report_rows: List[TemplatePreflightReportRow] = []
     for template in templates:
-        issue, row = _preflight_template(printify=printify, template=template, blueprint_ids=blueprint_ids)
+        issue, row = _preflight_template(
+            printify=printify,
+            template=template,
+            blueprint_ids=blueprint_ids,
+            blueprint_titles=blueprint_titles,
+        )
         row.requested_explicitly = template.key in explicit
         report_rows.append(row)
         if issue is None:
@@ -6221,7 +6480,24 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
             else:
                 resolved_template = select_provider_for_template(printify=printify, template=template)
                 catalog_variants = printify.list_variants(resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id)
-            variant_rows = choose_variants_from_catalog(catalog_variants, resolved_template)
+            normalized_catalog_variants = normalize_catalog_variants_response(catalog_variants)
+            family_validation = validate_catalog_family_schema(template=resolved_template, variants=normalized_catalog_variants)
+            if not family_validation.plausible:
+                all_templates_successful = False
+                if summary is not None:
+                    summary.products_skipped += 1
+                result = {
+                    "status": "catalog_family_mismatch",
+                    "failure_classification": "wrong_catalog_family",
+                    "intended_family": family_validation.intended_family,
+                    "reason": family_validation.reason,
+                }
+                record["products"].append({"template": template.key, "state_key": state_key, "title_source": title_info.title_source, "rendered_title": rendered_title, "result": result})
+                if run_rows is not None:
+                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, "", "", "", "", "", "", "", "", False, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
+                log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action="skip", upload_map=upload_map)
+                continue
+            variant_rows = choose_variants_from_catalog(normalized_catalog_variants, resolved_template)
             if not variant_rows:
                 all_templates_successful = False
                 if summary is not None:

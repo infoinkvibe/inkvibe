@@ -111,6 +111,7 @@ from printify_shopify_sync_pipeline import (
     resolve_family_collection_target,
     select_provider_for_template,
     preflight_active_templates,
+    validate_catalog_family_schema,
 )
 from artwork_metadata_generator import (
     CompositeArtworkMetadataGenerator,
@@ -2005,7 +2006,7 @@ def test_preflight_apparel_nonviable_report_includes_economic_diagnostics_and_re
     assert "Apparel economics:" in row.message
 
 
-def test_preflight_applies_provider_strategy_before_invalid_template_classification():
+def test_preflight_applies_provider_strategy_before_family_mismatch_classification():
     class DummyPrintify:
         def list_blueprints(self):
             return [{"id": 9}]
@@ -2032,10 +2033,10 @@ def test_preflight_applies_provider_strategy_before_invalid_template_classificat
         templates=[template],
         explicit_template_keys=[],
     )
-    assert len(passed) == 1
-    assert issues == []
+    assert passed == []
+    assert issues and issues[0].classification == "wrong_catalog_family"
     assert report_rows[0].provider_id == 2
-    assert report_rows[0].preflight_status == "passed"
+    assert report_rows[0].classification == "wrong_catalog_family"
 
 
 def test_choose_variants_for_apparel_prefers_core_colors_and_common_sizes_when_capped():
@@ -2976,6 +2977,162 @@ def test_preflight_zero_selection_includes_option_filter_diagnostics():
     assert "Shape" in row.option_names
     assert '"finish": ["Glossy"]' in row.requested_option_filters
     assert "not present in provider schema" in row.zero_selection_reason
+
+
+def test_catalog_family_validation_flags_phone_case_mapped_to_apparel_schema():
+    template = ProductTemplate(
+        "phone_case_basic",
+        9,
+        99,
+        "{artwork_title}",
+        "{artwork_title}",
+    )
+    variants = [
+        {"id": 1, "is_available": True, "options": {"color": "Black", "size": "M"}},
+        {"id": 2, "is_available": True, "options": {"color": "Navy", "size": "L"}},
+    ]
+    result = validate_catalog_family_schema(template=template, variants=variants, blueprint_title="Unisex Tee")
+    assert result.plausible is False
+    assert result.intended_family == "phone_case"
+
+
+def test_catalog_family_validation_flags_sticker_mapped_to_textile_schema():
+    template = ProductTemplate(
+        "sticker_kisscut",
+        783,
+        90,
+        "{artwork_title}",
+        "{artwork_title}",
+    )
+    variants = [
+        {
+            "id": 1,
+            "is_available": True,
+            "options": {"size": "M", "color": "White", "material": "Seam thread color automatically matched to design"},
+        }
+    ]
+    result = validate_catalog_family_schema(template=template, variants=variants, blueprint_title="Pillow Cover")
+    assert result.plausible is False
+    assert result.intended_family == "sticker"
+
+
+def test_preflight_classifies_wrong_catalog_family_before_zero_variant_filtering():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [{"id": 9, "title": "Unisex Tee"}]
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 99, "title": "Provider"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [{"id": 1, "is_available": True, "options": {"color": "Black", "size": "M"}}]
+
+    template = ProductTemplate(
+        "phone_case_basic",
+        9,
+        99,
+        "{artwork_title}",
+        "{artwork_title}",
+        enabled_variant_option_filters={"model": ["iPhone 15"]},
+        provider_selection_strategy="pinned_then_printify_choice_then_lowest_cost",
+    )
+    passed, issues, report_rows = preflight_active_templates(printify=DummyPrintify(), templates=[template], explicit_template_keys=[])
+    assert passed == []
+    assert issues and issues[0].classification == "wrong_catalog_family"
+    row = report_rows[0]
+    assert row.classification == "wrong_catalog_family"
+    assert row.intended_family == "phone_case"
+    assert "schema mismatch" in row.family_mismatch_reason.lower()
+
+
+def test_select_provider_for_template_discovers_family_matched_catalog_pair():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [
+                {"id": 9, "title": "Unisex Tee"},
+                {"id": 210, "title": "Tough Phone Cases"},
+            ]
+
+        def list_print_providers(self, blueprint_id):
+            if blueprint_id == 9:
+                return [{"id": 99, "title": "Generic"}]
+            if blueprint_id == 210:
+                return [{"id": 55, "title": "Printify Choice"}]
+            return []
+
+        def list_variants(self, blueprint_id, provider_id):
+            if blueprint_id == 9:
+                return [{"id": 1, "is_available": True, "options": {"color": "Black", "size": "M"}}]
+            if blueprint_id == 210:
+                return [{"id": 2, "is_available": True, "options": {"Device Model": "iPhone 15 Pro", "Finish": "Glossy"}}]
+            return []
+
+    template = ProductTemplate(
+        "phone_case_basic",
+        9,
+        99,
+        "{artwork_title}",
+        "{artwork_title}",
+        provider_selection_strategy="pinned_then_printify_choice_then_lowest_cost",
+    )
+    resolved = select_provider_for_template(printify=DummyPrintify(), template=template)
+    assert resolved.printify_blueprint_id == 210
+    assert resolved.printify_print_provider_id == 55
+
+
+def test_preflight_phone_case_can_recover_with_real_model_variants():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [{"id": 210, "title": "Tough Phone Cases"}]
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 55, "title": "Printify Choice"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [
+                {"id": 1, "is_available": True, "options": {"Device Model": "iPhone 15", "Finish": "Glossy"}, "cost": 1200, "price": 1600},
+                {"id": 2, "is_available": True, "options": {"Device Model": "iPhone 14", "Finish": "Glossy"}, "cost": 1200, "price": 1600},
+            ]
+
+    template = ProductTemplate(
+        "phone_case_basic",
+        210,
+        55,
+        "{artwork_title}",
+        "{artwork_title}",
+        enabled_variant_option_filters={"model": ["iPhone 15"], "finish": ["Glossy"]},
+        provider_selection_strategy="pinned_then_printify_choice_then_lowest_cost",
+    )
+    passed, issues, _ = preflight_active_templates(printify=DummyPrintify(), templates=[template], explicit_template_keys=[])
+    assert issues == []
+    assert len(passed) == 1
+
+
+def test_preflight_sticker_remains_inactive_with_correct_family_when_requested_size_missing():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [{"id": 501, "title": "Kiss-Cut Stickers"}]
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 42, "title": "Sticker Provider"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [{"id": 1, "is_available": True, "options": {"Shape": "Kiss-Cut", "Size": '2" × 2"'}}]
+
+    template = ProductTemplate(
+        "sticker_kisscut",
+        501,
+        42,
+        "{artwork_title}",
+        "{artwork_title}",
+        enabled_variant_option_filters={"size": ['4" × 4"']},
+        provider_selection_strategy="pinned_then_printify_choice_then_lowest_cost",
+    )
+    passed, issues, report_rows = preflight_active_templates(printify=DummyPrintify(), templates=[template], explicit_template_keys=[])
+    assert passed == []
+    assert issues and issues[0].classification == "zero_variants_selected"
+    assert report_rows[0].classification == "zero_variants_selected"
+    assert report_rows[0].intended_family == "sticker"
 
 
 def test_upsert_in_printify_recovers_from_stale_product_id(tmp_path: Path):
