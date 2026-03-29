@@ -2319,6 +2319,134 @@ def test_process_artwork_updates_existing_product_by_default(tmp_path: Path):
     assert latest["action"] == "update"
     assert latest["printify_product_id"] == "existing-1"
 
+
+def test_phone_case_runtime_uses_catalog_titles_and_creates_product_after_preflight_like_selection(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    class PhoneRuntimePrintify:
+        dry_run = False
+
+        def list_blueprints(self):
+            return [{"id": 421, "title": "Tough Phone Cases"}]
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 23, "title": "Phone Provider"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [
+                {"id": 101, "is_available": True, "options": {"surface": "Glossy"}, "price": 1899, "cost": 900},
+                {"id": 102, "is_available": True, "options": {"surface": "Glossy"}, "price": 1899, "cost": 900},
+                {"id": 103, "is_available": True, "options": {"surface": "Glossy"}, "price": 1899, "cost": 900},
+            ]
+
+        def create_product(self, shop_id, payload):
+            return {"id": "phone-created-1"}
+
+    artwork = _create_artwork(tmp_path, 1200, 1200)
+    template = ProductTemplate(
+        key="phone_case_basic",
+        printify_blueprint_id=421,
+        printify_print_provider_id=23,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[PlacementRequirement("front", 1000, 1000)],
+        publish_after_create=False,
+    )
+    state = ensure_state_shape({})
+
+    monkeypatch.setattr(pipeline, "select_provider_for_template", lambda printify, template: template)
+    monkeypatch.setattr(
+        pipeline,
+        "prepare_artwork_export",
+        lambda artwork, template, placement, export_dir, options: PreparedArtwork(
+            artwork=artwork,
+            template=template,
+            placement=placement,
+            export_path=tmp_path / "exports" / f"{artwork.slug}.png",
+            width_px=placement.width_px,
+            height_px=placement.height_px,
+            source_size=(artwork.image_width, artwork.image_height),
+            exported_canvas_size=(placement.width_px, placement.height_px),
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "upload_assets_to_printify",
+        lambda *args, **kwargs: {"front": {"id": "upload-1", "upload_strategy": "direct"}},
+    )
+
+    process_artwork(
+        printify=PhoneRuntimePrintify(),
+        shopify=None,
+        shop_id=999,
+        artwork=artwork,
+        templates=[template],
+        state=state,
+        force=True,
+        export_dir=tmp_path / "exports",
+        state_path=tmp_path / "state.json",
+        artwork_options=ArtworkProcessingOptions(),
+        upload_strategy="auto",
+        r2_config=None,
+    )
+    printify_result = state["processed"]["art"]["products"][-1]["result"]["printify"]
+    assert printify_result["action"] == "create"
+    assert printify_result["printify_product_id"] == "phone-created-1"
+    assert "runtime_skip_reason_code" not in printify_result
+
+
+def test_phone_case_runtime_skip_surfaces_structured_reason(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    class PhoneRuntimePrintify:
+        dry_run = True
+
+        def list_blueprints(self):
+            return [{"id": 421, "title": "Tough Phone Cases"}]
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 23, "title": "Phone Provider"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [{"id": 201, "is_available": True, "options": {"surface": "Glossy"}, "price": 1899, "cost": 900}]
+
+    artwork = _create_artwork(tmp_path, 1200, 1200)
+    template = ProductTemplate(
+        key="phone_case_basic",
+        printify_blueprint_id=421,
+        printify_print_provider_id=23,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_variant_option_filters={"model": ["iPhone 99"]},
+        placements=[PlacementRequirement("front", 1000, 1000)],
+    )
+    state = ensure_state_shape({})
+    monkeypatch.setattr(pipeline, "select_provider_for_template", lambda printify, template: template)
+
+    process_artwork(
+        printify=PhoneRuntimePrintify(),
+        shopify=None,
+        shop_id=999,
+        artwork=artwork,
+        templates=[template],
+        state=state,
+        force=True,
+        export_dir=tmp_path / "exports",
+        state_path=tmp_path / "state.json",
+        artwork_options=ArtworkProcessingOptions(),
+        upload_strategy="auto",
+        r2_config=None,
+    )
+    result = state["processed"]["art"]["products"][-1]["result"]
+    assert result["status"] == "no_matching_variants"
+    assert result["runtime_skip_reason_code"] == "no_matching_variants_runtime"
+    diag = result["runtime_skip_diagnostics"]
+    assert diag["template_key"] == "phone_case_basic"
+    assert diag["provider_id"] == 23
+    assert "model" in diag["resolved_option_dimensions"]
+    assert diag["final_reason_code"] == "no_matching_variants_runtime"
+
+
 def test_no_retry_on_404_catalog_error():
     class DummyResponse:
         status_code = 404
@@ -5484,6 +5612,9 @@ def test_top10_template_keys_exist_and_curated():
     assert by_key["tshirt_gildan"].enabled_colors == ["Black", "White", "Navy", "Sport Grey", "Sand"]
     assert by_key["tshirt_gildan"].enabled_sizes == ["S", "M", "L", "XL", "2XL", "3XL"]
     assert by_key["phone_case_basic"].max_enabled_variants <= 12
+    assert by_key["sticker_kisscut"].printify_blueprint_id == 906
+    assert by_key["sticker_kisscut"].printify_print_provider_id == 36
+    assert by_key["sticker_kisscut"].max_enabled_variants == 4
     assert by_key["poster_basic"].enabled_sizes == ["11″ x 14″ (Vertical)", "12″ x 16″ (Vertical)", "16″ x 20″ (Vertical)"]
 
 

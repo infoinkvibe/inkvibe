@@ -14,7 +14,7 @@ import random
 import re
 import tempfile
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -201,6 +201,23 @@ class VariantFilterDiagnostics:
     requested_model_overlap_count: int = 0
     fallback_model_set_applied: bool = False
     final_selected_models: List[str] = field(default_factory=list)
+
+
+@dataclass
+class RuntimeSkipDiagnostics:
+    template_key: str
+    blueprint_id: int
+    provider_id: int
+    selected_count: int = 0
+    final_enabled_count: int = 0
+    available_placements: List[str] = field(default_factory=list)
+    required_placement_name: str = ""
+    print_area_available: bool = False
+    upload_map: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    payload_build_skip_reason: str = ""
+    resolved_option_dimensions: Dict[str, str] = field(default_factory=dict)
+    resolved_model_list: List[str] = field(default_factory=list)
+    final_reason_code: str = ""
 
 
 @dataclass
@@ -4906,7 +4923,7 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
     return templates
 
 
-def choose_variants_from_catalog(catalog_variants: Any, template: ProductTemplate) -> List[Dict[str, Any]]:
+def choose_variants_from_catalog_with_diagnostics(catalog_variants: Any, template: ProductTemplate) -> Tuple[List[Dict[str, Any]], VariantFilterDiagnostics]:
     catalog_variants = normalize_catalog_variants_response(catalog_variants)
     chosen, diagnostics = _analyze_variant_filtering(catalog_variants, template)
     def _is_apparel_recovery_key(key: str) -> bool:
@@ -4950,6 +4967,11 @@ def choose_variants_from_catalog(catalog_variants: Any, template: ProductTemplat
         diagnostics.zero_selection_reason,
         effective_limit,
     )
+    return chosen, diagnostics
+
+
+def choose_variants_from_catalog(catalog_variants: Any, template: ProductTemplate) -> List[Dict[str, Any]]:
+    chosen, _ = choose_variants_from_catalog_with_diagnostics(catalog_variants, template)
     return chosen
 
 
@@ -6137,6 +6159,25 @@ def summarize_upload_strategy(upload_map: Dict[str, Dict[str, Any]]) -> str:
     return "+".join(strategies) if strategies else "none"
 
 
+def log_runtime_skip_diagnostics(diag: RuntimeSkipDiagnostics) -> None:
+    logger.warning(
+        "Runtime skip diagnostics template=%s blueprint_id=%s provider_id=%s selected_count=%s final_enabled_count=%s available_placements=%s required_placement=%s print_area_available=%s upload_map=%s payload_build_skip_reason=%s resolved_option_dimensions=%s resolved_model_list=%s final_reason_code=%s",
+        diag.template_key,
+        diag.blueprint_id,
+        diag.provider_id,
+        diag.selected_count,
+        diag.final_enabled_count,
+        diag.available_placements,
+        diag.required_placement_name or "-",
+        diag.print_area_available,
+        diag.upload_map,
+        diag.payload_build_skip_reason or "-",
+        diag.resolved_option_dimensions,
+        diag.resolved_model_list,
+        diag.final_reason_code or "-",
+    )
+
+
 def log_template_summary(*, artwork_slug: str, template_key: str, success: bool, result: Dict[str, Any], blueprint_id: int = 0, provider_id: int = 0, action: str = "skip", upload_map: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
     printify_result = result.get("printify", {}) if isinstance(result, dict) else {}
     product_id = printify_result.get("printify_product_id") or "n/a"
@@ -6435,6 +6476,15 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
     }
 
     all_templates_successful = True
+    blueprint_titles_cache: Dict[int, str] = {}
+    try:
+        blueprint_titles_cache = {
+            int(blueprint.get("id", 0)): str(blueprint.get("title") or "")
+            for blueprint in printify.list_blueprints()
+            if int(blueprint.get("id", 0)) > 0
+        }
+    except Exception:
+        logger.warning("Runtime blueprint title lookup failed; family validation will rely on option schema only.")
     for template in templates:
         title_info = resolve_artwork_title(template, artwork)
         artwork.final_title_source = title_info.title_source
@@ -6548,6 +6598,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=True, result=result, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
+            provider_title = ""
             if template.key == "tote_basic":
                 resolved_template, catalog_variants = resolve_tote_template_catalog_mapping(
                     printify=printify,
@@ -6555,10 +6606,44 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 )
             else:
                 resolved_template = select_provider_for_template(printify=printify, template=template)
+                try:
+                    providers = printify.list_print_providers(resolved_template.printify_blueprint_id)
+                    provider_title = next(
+                        (
+                            str(provider.get("title") or provider.get("name") or "")
+                            for provider in providers
+                            if int(provider.get("id", 0)) == resolved_template.printify_print_provider_id
+                        ),
+                        "",
+                    )
+                except Exception:
+                    provider_title = ""
                 catalog_variants = printify.list_variants(resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id)
             normalized_catalog_variants = normalize_catalog_variants_response(catalog_variants)
             family_validation = validate_catalog_family_schema(template=resolved_template, variants=normalized_catalog_variants)
+            resolved_blueprint_title = str(blueprint_titles_cache.get(resolved_template.printify_blueprint_id, ""))
+            if resolved_blueprint_title or provider_title:
+                family_validation = validate_catalog_family_schema(
+                    template=resolved_template,
+                    variants=normalized_catalog_variants,
+                    blueprint_title=resolved_blueprint_title,
+                    provider_title=provider_title,
+                )
             if not family_validation.plausible:
+                runtime_diag = RuntimeSkipDiagnostics(
+                    template_key=template.key,
+                    blueprint_id=resolved_template.printify_blueprint_id,
+                    provider_id=resolved_template.printify_print_provider_id,
+                    available_placements=summarize_variant_options(normalized_catalog_variants).get("placements", []),
+                    required_placement_name=str((resolved_template.preferred_primary_placement or (resolved_template.placements[0].placement_name if resolved_template.placements else ""))),
+                    final_reason_code="catalog_family_mismatch_runtime",
+                    payload_build_skip_reason=family_validation.reason,
+                )
+                runtime_diag.print_area_available = bool(
+                    runtime_diag.required_placement_name
+                    and runtime_diag.required_placement_name in set(runtime_diag.available_placements)
+                )
+                log_runtime_skip_diagnostics(runtime_diag)
                 all_templates_successful = False
                 if summary is not None:
                     summary.products_skipped += 1
@@ -6567,18 +6652,43 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     "failure_classification": "wrong_catalog_family",
                     "intended_family": family_validation.intended_family,
                     "reason": family_validation.reason,
+                    "runtime_skip_reason_code": runtime_diag.final_reason_code,
+                    "runtime_skip_diagnostics": asdict(runtime_diag),
                 }
                 record["products"].append({"template": template.key, "state_key": state_key, "title_source": title_info.title_source, "rendered_title": rendered_title, "result": result})
                 if run_rows is not None:
                     run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, "", "", "", "", "", "", "", "", False, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
-            variant_rows = choose_variants_from_catalog(normalized_catalog_variants, resolved_template)
+            variant_rows, variant_diagnostics = choose_variants_from_catalog_with_diagnostics(normalized_catalog_variants, resolved_template)
             if not variant_rows:
+                runtime_diag = RuntimeSkipDiagnostics(
+                    template_key=template.key,
+                    blueprint_id=resolved_template.printify_blueprint_id,
+                    provider_id=resolved_template.printify_print_provider_id,
+                    selected_count=0,
+                    final_enabled_count=0,
+                    available_placements=summarize_variant_options(normalized_catalog_variants).get("placements", []),
+                    required_placement_name=str((resolved_template.preferred_primary_placement or (resolved_template.placements[0].placement_name if resolved_template.placements else ""))),
+                    final_reason_code="no_matching_variants_runtime",
+                    payload_build_skip_reason=variant_diagnostics.zero_selection_reason or "no_matching_variants",
+                    resolved_option_dimensions={"model": variant_diagnostics.resolved_model_dimension},
+                    resolved_model_list=list(variant_diagnostics.final_selected_models),
+                )
+                runtime_diag.print_area_available = bool(
+                    runtime_diag.required_placement_name
+                    and runtime_diag.required_placement_name in set(runtime_diag.available_placements)
+                )
+                log_runtime_skip_diagnostics(runtime_diag)
                 all_templates_successful = False
                 if summary is not None:
                     summary.products_skipped += 1
-                result = {"status": "no_matching_variants", "failure_classification": "zero_variants_selected"}
+                result = {
+                    "status": "no_matching_variants",
+                    "failure_classification": "zero_variants_selected",
+                    "runtime_skip_reason_code": runtime_diag.final_reason_code,
+                    "runtime_skip_diagnostics": asdict(runtime_diag),
+                }
                 record["products"].append({"template": template.key, "state_key": state_key, "title_source": title_info.title_source, "rendered_title": rendered_title, "result": result})
                 if run_rows is not None:
                     run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, "", "", "", "", "", "", "", "", False, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
@@ -6640,10 +6750,30 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     poster_fill_optimization_used_report = first_prepared.poster_fill_optimization_used
 
             if skipped_placements:
+                runtime_diag = RuntimeSkipDiagnostics(
+                    template_key=template.key,
+                    blueprint_id=resolved_template.printify_blueprint_id,
+                    provider_id=resolved_template.printify_print_provider_id,
+                    selected_count=len(variant_rows),
+                    final_enabled_count=len(variant_rows),
+                    available_placements=[p.placement_name for p in resolved_placements],
+                    required_placement_name=skipped_placements[0] if skipped_placements else "",
+                    final_reason_code="placement_artwork_resolution_skipped",
+                    payload_build_skip_reason="placement_prepare_artwork_returned_none",
+                    resolved_option_dimensions={"model": variant_diagnostics.resolved_model_dimension},
+                    resolved_model_list=list(variant_diagnostics.final_selected_models),
+                )
+                runtime_diag.print_area_available = bool(runtime_diag.required_placement_name)
+                log_runtime_skip_diagnostics(runtime_diag)
                 all_templates_successful = False
                 if summary is not None:
                     summary.products_skipped += 1
-                result = {"status": "skipped_undersized", "placements": skipped_placements}
+                result = {
+                    "status": "skipped_undersized",
+                    "placements": skipped_placements,
+                    "runtime_skip_reason_code": runtime_diag.final_reason_code,
+                    "runtime_skip_diagnostics": asdict(runtime_diag),
+                }
                 record["products"].append({
                     "template": template.key,
                     "state_key": state_key,
@@ -6678,6 +6808,27 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 verify_publish=verify_publish,
                 auto_rebuild_on_incompatible_update=auto_rebuild_on_incompatible_update,
             ) if (resolved_template.push_via_printify and shop_id is not None) else {"status": "prepared_only", "action": action, "publish_attempted": False, "publish_verified": False}
+            printify_result_for_skip = result.get("printify", {}) if isinstance(result.get("printify"), dict) else {}
+            if str(printify_result_for_skip.get("action") or "") == "skip":
+                guardrail_report = printify_result_for_skip.get("guardrail_report", {}) if isinstance(printify_result_for_skip.get("guardrail_report"), dict) else {}
+                runtime_diag = RuntimeSkipDiagnostics(
+                    template_key=template.key,
+                    blueprint_id=resolved_template.printify_blueprint_id,
+                    provider_id=resolved_template.printify_print_provider_id,
+                    selected_count=int(guardrail_report.get("selected_count", len(variant_rows))),
+                    final_enabled_count=int(guardrail_report.get("final_enabled_count", 0)),
+                    available_placements=[p.placement_name for p in resolved_placements],
+                    required_placement_name=str((resolved_template.preferred_primary_placement or (resolved_placements[0].placement_name if resolved_placements else ""))),
+                    print_area_available=bool(resolved_placements),
+                    upload_map=upload_map,
+                    payload_build_skip_reason=str(printify_result_for_skip.get("reason") or ""),
+                    resolved_option_dimensions={"model": variant_diagnostics.resolved_model_dimension},
+                    resolved_model_list=list(variant_diagnostics.final_selected_models),
+                    final_reason_code="payload_build_guardrail_skip",
+                )
+                printify_result_for_skip["runtime_skip_reason_code"] = runtime_diag.final_reason_code
+                printify_result_for_skip["runtime_skip_diagnostics"] = asdict(runtime_diag)
+                log_runtime_skip_diagnostics(runtime_diag)
             if template.publish_to_shopify and shopify is not None:
                 result["shopify"] = create_in_shopify_only(shopify, artwork, template, variant_rows)
 
