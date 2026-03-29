@@ -89,10 +89,10 @@
     "shipping_basis_for_margin": "cost",
     "disable_variants_below_margin_floor": true,
     "reprice_variants_to_margin_floor": true,
-    "mark_template_nonviable_if_needed": false,
+    "mark_template_nonviable_if_needed": true,
     "provider_selection_strategy": "prefer_printify_choice_then_ranked",
     "fallback_provider_allowed": true,
-    "active": true,
+    "active": false,
     "default_price": "24.99",
     "compare_at_price": "29.99"
   },
@@ -272,10 +272,10 @@
     "shipping_basis_for_margin": "cost",
     "disable_variants_below_margin_floor": true,
     "reprice_variants_to_margin_floor": true,
-    "mark_template_nonviable_if_needed": false,
+    "mark_template_nonviable_if_needed": true,
     "provider_selection_strategy": "prefer_printify_choice_then_ranked",
     "fallback_provider_allowed": true,
-    "active": true
+    "active": false
   },
   {
     "key": "mug_new",
@@ -461,7 +461,12 @@
     "fallback_provider_allowed": true,
     "active": true,
     "default_price": "24.99",
-    "compare_at_price": "29.99"
+    "compare_at_price": "29.99",
+    "min_margin_after_shipping": "3.00",
+    "target_margin_after_shipping": "5.00",
+    "shipping_basis_for_margin": "cost",
+    "disable_variants_below_margin_floor": true,
+    "reprice_variants_to_margin_floor": true
   },
   {
     "key": "canvas_basic",
@@ -469,7 +474,7 @@
     "printify_print_provider_id": 1,
     "provider_selection_strategy": "prefer_printify_choice_then_ranked",
     "fallback_provider_allowed": true,
-    "active": true,
+    "active": false,
     "title_pattern": "{artwork_title} Canvas Print",
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],
@@ -531,7 +536,7 @@
     "printify_print_provider_id": 1,
     "provider_selection_strategy": "prefer_printify_choice_then_ranked",
     "fallback_provider_allowed": true,
-    "active": true,
+    "active": false,
     "title_pattern": "{artwork_title} Phone Case",
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [
@@ -599,7 +604,7 @@
     "printify_print_provider_id": 1,
     "provider_selection_strategy": "prefer_printify_choice_then_ranked",
     "fallback_provider_allowed": true,
-    "active": true,
+    "active": false,
     "title_pattern": "{artwork_title} Kiss-Cut Sticker",
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [
@@ -661,7 +666,7 @@
     "printify_print_provider_id": 1,
     "provider_selection_strategy": "prefer_printify_choice_then_ranked",
     "fallback_provider_allowed": true,
-    "active": true,
+    "active": false,
     "title_pattern": "{artwork_title} Blanket",
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],

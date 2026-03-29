@@ -46,6 +46,11 @@
       "front"
     ],
     "preferred_primary_placement": "front",
-    "publish_only_primary_placement": true
+    "publish_only_primary_placement": true,
+    "min_margin_after_shipping": "3.00",
+    "target_margin_after_shipping": "5.00",
+    "shipping_basis_for_margin": "cost",
+    "disable_variants_below_margin_floor": true,
+    "reprice_variants_to_margin_floor": true
   }
 ]

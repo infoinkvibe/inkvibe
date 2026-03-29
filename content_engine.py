@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+import hashlib
 from typing import Any, Dict, List
 
 
@@ -239,7 +240,26 @@ def build_branded_description(*, artwork_title: str, short_description: str, tem
     family = infer_product_family(template)
     closing = str(_FAMILY_CONFIG.get(family, _FAMILY_CONFIG["default"])["description_closing"]).strip()
     lead = short_description.strip() if short_description.strip() else f"{artwork_title} brings a fresh visual mood with signature InkVibe character."
+    gift_openers = [
+        "A strong gift pick for birthdays, holidays, and just-because moments.",
+        "An easy gift-ready choice for anyone who loves expressive design.",
+        "Built to feel special enough for gifting while staying practical for daily use.",
+    ]
+    use_case_by_family = {
+        "hoodie": "Ideal for cool evenings, travel days, and laid-back weekend fits.",
+        "sweatshirt": "Great for layering at home, coffee runs, and everyday streetwear.",
+        "long_sleeve": "Easy to pair with denim or joggers when you want a light extra layer.",
+        "tshirt": "Designed for everyday rotation, casual hangs, and weekend plans.",
+        "tote": "Perfect for books, errands, market runs, and daily carry.",
+        "poster": "Works beautifully in offices, bedrooms, studios, and gallery-style walls.",
+        "mug": "Made for coffee rituals, tea breaks, and desk-side personality.",
+        "default": "Made for everyday use with bold visual personality.",
+    }
+    idx = int(hashlib.sha256(f"{family}:{artwork_title}".encode("utf-8")).hexdigest()[:2], 16) % len(gift_openers)
+    gift_line = gift_openers[idx]
+    use_case = use_case_by_family.get(family, use_case_by_family["default"])
     return (
         f"<p><strong>{artwork_title}</strong> by InkVibe. {lead}</p>"
+        f"<p>{gift_line} {use_case}</p>"
         f"<p>{closing}</p>"
     )
