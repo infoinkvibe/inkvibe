@@ -1329,6 +1329,42 @@ def test_variant_margin_guardrails_reprice_disable_and_longsleeve_behavior():
     assert report_long["viable"] is False
     assert report_long["final_enabled_count"] == 0
 
+
+def test_tote_guardrails_report_economics_and_ceiling_failure_reason():
+    tote = ProductTemplate(
+        key="tote_basic",
+        printify_blueprint_id=609,
+        printify_print_provider_id=74,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        base_price="24.99",
+        markup_type="fixed",
+        markup_value="5.00",
+        min_margin_after_shipping="3.00",
+        target_margin_after_shipping="5.00",
+        max_allowed_price="29.99",
+        reprice_variants_to_margin_floor=True,
+        disable_variants_below_margin_floor=True,
+    )
+    adjusted, report = apply_variant_margin_guardrails(
+        tote,
+        [{"id": 21, "price": 2200, "cost": 2600, "shipping": 600, "is_available": True}],
+    )
+    assert adjusted == []
+    assert report["viable"] is False
+    assert report["failed_variant_reasons"][21] == "required_price_exceeds_max_allowed_price"
+    diag = report["variant_diagnostics"][0]
+    assert diag["original_sale_price_minor"] == 2999
+    assert diag["repriced_sale_price_minor"] == 2999
+    assert diag["printify_cost_minor"] == 2600
+    assert diag["shipping_basis_used"] == "cost"
+    assert diag["target_margin_after_shipping_minor"] == 500
+    assert diag["min_margin_after_shipping_minor"] == 300
+    assert diag["after_shipping_margin_before_reprice_minor"] == -201
+    assert diag["after_shipping_margin_after_reprice_minor"] == -201
+    assert diag["max_allowed_price_minor"] == 2999
+    assert diag["failure_reason"] == "required_price_exceeds_max_allowed_price"
+
 def test_uuid_noisy_filename_detection():
     assert filename_title_quality_reason("8f6f45d4-c95f-4f68-9cf9-f022f5197a18") == "uuid_like"
     assert filename_title_quality_reason("2fd4e1c67a2d28fced849ee1bb76e7391b93eb12") == "hex_like"
@@ -1839,6 +1875,59 @@ def test_preflight_classifies_invalid_zero_selected_and_guardrail_failures():
     assert issue_map["zero_selected"] == "zero_variants_selected"
     assert issue_map["guardrail_zero"] == "zero_enabled_after_guardrails"
     assert len(report_rows) == 3
+
+
+def test_preflight_tote_nonviable_report_includes_economic_diagnostics():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [{"id": 609}]
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 74, "title": "Tote Provider"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [
+                {"id": 21, "is_available": True, "options": {"color": "Natural", "size": "One size"}, "cost": 2600, "shipping": 600},
+            ]
+
+    tote = ProductTemplate(
+        "tote_basic",
+        609,
+        74,
+        "{artwork_title}",
+        "{artwork_title}",
+        active=True,
+        enabled_colors=["Natural"],
+        enabled_sizes=["One size"],
+        base_price="24.99",
+        markup_type="fixed",
+        markup_value="5.00",
+        min_margin_after_shipping="3.00",
+        target_margin_after_shipping="5.00",
+        max_allowed_price="29.99",
+        reprice_variants_to_margin_floor=True,
+        disable_variants_below_margin_floor=True,
+    )
+    passed, issues, report_rows = preflight_active_templates(
+        printify=DummyPrintify(),
+        templates=[tote],
+        explicit_template_keys=[],
+    )
+    assert passed == []
+    assert issues and issues[0].classification == "zero_enabled_after_guardrails"
+    row = report_rows[0]
+    assert row.classification == "zero_enabled_after_guardrails"
+    assert row.tote_original_sale_price_minor == 2999
+    assert row.tote_repriced_sale_price_minor == 2999
+    assert row.tote_printify_cost_minor == 2600
+    assert row.tote_shipping_basis_used == "cost"
+    assert row.tote_target_margin_after_shipping_minor == 500
+    assert row.tote_min_margin_after_shipping_minor == 300
+    assert row.tote_margin_before_reprice_minor == -201
+    assert row.tote_margin_after_reprice_minor == -201
+    assert row.tote_max_allowed_price_minor == 2999
+    assert row.tote_failure_reason == "required_price_exceeds_max_allowed_price"
+    assert "reason=required_price_exceeds_max_allowed_price" in row.message
 
 
 def test_preflight_applies_provider_strategy_before_invalid_template_classification():
@@ -2881,6 +2970,15 @@ def test_tote_template_file_stays_in_sync_with_product_templates():
     tote_standalone = next(t for t in tote_templates if t.key == "tote_basic")
     assert tote_primary.printify_blueprint_id == tote_standalone.printify_blueprint_id == 609
     assert tote_primary.printify_print_provider_id == tote_standalone.printify_print_provider_id == 74
+
+
+def test_tote_front_primary_and_publish_only_primary_behavior_preserved():
+    templates = load_templates(Path("product_templates.json"))
+    tote = next(t for t in templates if t.key == "tote_basic")
+    assert tote.preferred_primary_placement == "front"
+    assert tote.active_placements == ["front"]
+    assert tote.publish_only_primary_placement is True
+    assert tote.placements and tote.placements[0].placement_name == "front"
 
 
 def test_non_poster_family_mappings_remain_unchanged():
