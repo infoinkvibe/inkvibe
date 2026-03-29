@@ -548,9 +548,29 @@ Supported sidecar JSON fields:
 
 Behavior:
 - If sidecar metadata exists, listing copy prefers metadata values.
-- If metadata is missing, filename-based behavior remains in place.
+- During normal local-image create/publish runs, missing or weak metadata now triggers inline metadata generation before listing copy is rendered.
+- Inline generator strategy defaults to `auto` (`openai` -> local `vision` -> `heuristic` fallback).
+- Generated inline metadata is used immediately in the same run (no second publish run required).
+- Inline-generated metadata sidecars are written by default for missing/weak cases, without overwriting existing sidecars unless explicitly enabled.
 - Low-quality filename stems (UUID/hash/noisy strings) now trigger safer fallback titles.
 - Launch-plan row overrides still take precedence over sidecar metadata during listing rendering.
+
+Inline metadata controls for normal publish/create runs:
+- `--auto-generate-missing-metadata / --no-auto-generate-missing-metadata`
+- `--auto-write-generated-sidecars / --no-auto-write-generated-sidecars`
+- `--metadata-inline-generator auto|openai|vision|heuristic`
+- `--metadata-inline-only-when-weak / --no-metadata-inline-only-when-weak`
+- `--metadata-inline-overwrite-weak-sidecars` (default off)
+
+Recommended local-image publish command:
+
+```bash
+python printify_shopify_sync_pipeline.py \
+  --local-image-batch 7 \
+  --publish \
+  --verify-publish \
+  --metadata-inline-generator auto
+```
 
 Example sidecar files:
 - `examples/tee-artwork.sidecar.example.json`
