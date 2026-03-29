@@ -1,16 +1,14 @@
 {
   "key": "sticker_kisscut",
-  "printify_blueprint_id": 783,
-  "printify_print_provider_id": 90,
+  "printify_blueprint_id": 501,
+  "printify_print_provider_id": 42,
   "provider_selection_strategy": "prefer_printify_choice_then_ranked",
   "fallback_provider_allowed": true,
   "active": false,
   "title_pattern": "{artwork_title} Kiss-Cut Sticker",
   "description_pattern": "<p>{generated_description}</p>",
   "enabled_colors": [],
-  "enabled_sizes": [
-    "3\" \u00d7 3\""
-  ],
+  "enabled_sizes": [],
   "max_enabled_variants": 4,
   "tags": [
     "sticker",

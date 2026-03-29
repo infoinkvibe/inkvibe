@@ -1,7 +1,7 @@
 {
   "key": "phone_case_basic",
-  "printify_blueprint_id": 9,
-  "printify_print_provider_id": 99,
+  "printify_blueprint_id": 210,
+  "printify_print_provider_id": 55,
   "provider_selection_strategy": "prefer_printify_choice_then_ranked",
   "fallback_provider_allowed": true,
   "active": false,
