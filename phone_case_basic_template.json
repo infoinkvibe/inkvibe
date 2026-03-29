@@ -1,15 +1,13 @@
 {
   "key": "phone_case_basic",
   "printify_blueprint_id": 9,
-  "printify_print_provider_id": 1,
+  "printify_print_provider_id": 99,
   "provider_selection_strategy": "prefer_printify_choice_then_ranked",
   "fallback_provider_allowed": true,
   "active": false,
   "title_pattern": "{artwork_title} Phone Case",
   "description_pattern": "<p>{generated_description}</p>",
-  "enabled_colors": [
-    "Glossy"
-  ],
+  "enabled_colors": [],
   "enabled_sizes": [],
   "enabled_variant_option_filters": {
     "model": [
@@ -17,6 +15,9 @@
       "iPhone 15 Pro",
       "iPhone 14",
       "Samsung Galaxy S24"
+    ],
+    "finish": [
+      "Glossy"
     ]
   },
   "max_enabled_variants": 12,

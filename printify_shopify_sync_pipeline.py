@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from collections import Counter
 import csv
 import hashlib
 import json
@@ -171,6 +172,20 @@ class TemplatePreflightReportRow:
     apparel_max_allowed_price_minor: int = 0
     apparel_failed_variant_reasons: str = ""
     apparel_failure_reason_counts: str = ""
+    option_names: str = ""
+    option_values_summary: str = ""
+    requested_option_filters: str = ""
+    filter_counts: str = ""
+    zero_selection_reason: str = ""
+
+
+@dataclass
+class VariantFilterDiagnostics:
+    option_names: List[str] = field(default_factory=list)
+    option_values_summary: Dict[str, List[str]] = field(default_factory=dict)
+    requested_option_filters: Dict[str, List[str]] = field(default_factory=dict)
+    filter_counts: List[Dict[str, Any]] = field(default_factory=list)
+    zero_selection_reason: str = ""
 
 
 def classify_failure(exc: Exception) -> str:
@@ -3055,6 +3070,157 @@ def _variant_option_value(variant: Dict[str, Any], key: str) -> str:
     return str(variant.get(key, "")).strip()
 
 
+def _canonical_option_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _canonical_variant_options(variant: Dict[str, Any]) -> Dict[str, str]:
+    options = variant.get("options") or {}
+    normalized: Dict[str, str] = {}
+    if isinstance(options, dict):
+        source_items = options.items()
+    else:
+        source_items = []
+    for key, value in source_items:
+        key_name = str(key or "").strip()
+        if not key_name:
+            continue
+        canonical = _canonical_option_token(key_name)
+        if not canonical:
+            continue
+        normalized[canonical] = str(value or "").strip()
+    return normalized
+
+
+def _analyze_variant_filtering(catalog_variants: List[Dict[str, Any]], template: ProductTemplate) -> Tuple[List[Dict[str, Any]], VariantFilterDiagnostics]:
+    alias_hints = {
+        "color": ["color", "colour", "casecolor", "finish", "surface"],
+        "size": ["size", "sizes", "dimension", "dimensions", "format"],
+        "model": ["model", "device", "phonemodel", "devicemodel", "compatibility"],
+    }
+    schema_names: Dict[str, str] = {}
+    schema_values: Dict[str, Counter[str]] = {}
+    canonical_rows: List[Tuple[Dict[str, Any], Dict[str, str]]] = []
+    for variant in catalog_variants:
+        canonical_options = _canonical_variant_options(variant)
+        canonical_rows.append((variant, canonical_options))
+        for canonical_key, value in canonical_options.items():
+            schema_names.setdefault(canonical_key, str(next((k for k, v in (variant.get("options") or {}).items() if _canonical_option_token(str(k)) == canonical_key), canonical_key)))
+            schema_values.setdefault(canonical_key, Counter())[str(value or "").strip()] += 1
+
+    effective_filters: Dict[str, List[str]] = {}
+    if template.enabled_colors:
+        effective_filters["color"] = [str(v).strip() for v in template.enabled_colors if str(v).strip()]
+    if template.enabled_sizes:
+        effective_filters["size"] = [str(v).strip() for v in template.enabled_sizes if str(v).strip()]
+    for key, values in (template.enabled_variant_option_filters or {}).items():
+        vals = [str(v).strip() for v in values if str(v).strip()]
+        if vals:
+            effective_filters[str(key).strip()] = vals
+
+    diagnostics = VariantFilterDiagnostics(
+        option_names=sorted({schema_names[k] for k in schema_names}),
+        option_values_summary={
+            schema_names.get(key, key): [item[0] for item in schema_values.get(key, Counter()).most_common(12)]
+            for key in sorted(schema_values)
+        },
+        requested_option_filters={k: list(v) for k, v in effective_filters.items()},
+    )
+
+    def _resolve_schema_key(requested_key: str) -> Optional[str]:
+        canonical_requested = _canonical_option_token(requested_key)
+        if canonical_requested in schema_names:
+            return canonical_requested
+        for hint in alias_hints.get(canonical_requested, []):
+            canonical_hint = _canonical_option_token(hint)
+            if canonical_hint in schema_names:
+                return canonical_hint
+        for canonical_key in schema_names:
+            if canonical_requested and (canonical_requested in canonical_key or canonical_key in canonical_requested):
+                return canonical_key
+        return None
+
+    filtered_rows = list(canonical_rows)
+    before_available_count = sum(1 for variant, _ in canonical_rows if variant.get("is_available", True))
+    diagnostics.filter_counts.append({"dimension": "__available__", "before": len(canonical_rows), "after": before_available_count, "matched_values": []})
+    filtered_rows = [(variant, opts) for variant, opts in filtered_rows if variant.get("is_available", True)]
+
+    for requested_key, requested_values in effective_filters.items():
+        before_count = len(filtered_rows)
+        resolved_schema_key = _resolve_schema_key(requested_key)
+        if not resolved_schema_key:
+            canonical_requested = _canonical_option_token(requested_key)
+            if canonical_requested in {"color", "size"}:
+                logger.warning(
+                    "Template %s specifies %s, but blueprint %s/provider %s exposes no matching option dimension; ignoring %s filter.",
+                    template.key,
+                    f"enabled_{canonical_requested}s",
+                    template.printify_blueprint_id,
+                    template.printify_print_provider_id,
+                    canonical_requested,
+                )
+                diagnostics.filter_counts.append(
+                    {
+                        "dimension": requested_key,
+                        "resolved_dimension": "",
+                        "before": before_count,
+                        "after": before_count,
+                        "matched_values": [],
+                        "missing_dimension_ignored": True,
+                    }
+                )
+                continue
+            diagnostics.filter_counts.append(
+                {"dimension": requested_key, "resolved_dimension": "", "before": before_count, "after": 0, "matched_values": [], "missing_dimension": True}
+            )
+            diagnostics.zero_selection_reason = (
+                f"Requested filter dimension '{requested_key}' not present in provider schema."
+            )
+            filtered_rows = []
+            break
+
+        available_value_map = {
+            _canonical_option_token(value): value
+            for value in schema_values.get(resolved_schema_key, Counter()).keys()
+            if str(value).strip()
+        }
+        resolved_values: List[str] = []
+        missing_values: List[str] = []
+        for requested_value in requested_values:
+            canonical_value = _canonical_option_token(requested_value)
+            matched_value = available_value_map.get(canonical_value)
+            if matched_value:
+                resolved_values.append(matched_value)
+            else:
+                missing_values.append(requested_value)
+        resolved_set = set(resolved_values)
+        filtered_rows = [(variant, opts) for variant, opts in filtered_rows if str(opts.get(resolved_schema_key, "")).strip() in resolved_set]
+        diagnostics.filter_counts.append(
+            {
+                "dimension": requested_key,
+                "resolved_dimension": schema_names.get(resolved_schema_key, resolved_schema_key),
+                "before": before_count,
+                "after": len(filtered_rows),
+                "matched_values": sorted(resolved_set),
+                "missing_values": missing_values,
+            }
+        )
+        if before_count > 0 and len(filtered_rows) == 0 and not diagnostics.zero_selection_reason:
+            if missing_values and not resolved_set:
+                diagnostics.zero_selection_reason = (
+                    f"No requested values for '{requested_key}' matched provider values."
+                )
+            else:
+                diagnostics.zero_selection_reason = (
+                    f"Resolved values for '{requested_key}' produced zero intersections across dimensions."
+                )
+
+    if not filtered_rows and not diagnostics.zero_selection_reason:
+        diagnostics.zero_selection_reason = "No available variants remained after filters."
+
+    return [variant for variant, _ in filtered_rows], diagnostics
+
+
 def _shopify_money_string_from_minor(minor_units: int) -> str:
     return f"{Decimal(minor_units) / Decimal('100'):.2f}"
 
@@ -4489,44 +4655,7 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
 
 def choose_variants_from_catalog(catalog_variants: Any, template: ProductTemplate) -> List[Dict[str, Any]]:
     catalog_variants = normalize_catalog_variants_response(catalog_variants)
-    chosen: List[Dict[str, Any]] = []
-    option_filters = {str(k).lower().strip(): {str(v).strip() for v in values} for k, values in (template.enabled_variant_option_filters or {}).items() if values}
-    color_option_exists = any(_variant_option_value(variant, "color") for variant in catalog_variants)
-    size_option_exists = any(_variant_option_value(variant, "size") for variant in catalog_variants)
-
-    should_filter_colors = bool(template.enabled_colors) and color_option_exists
-    should_filter_sizes = bool(template.enabled_sizes) and size_option_exists
-
-    if template.enabled_colors and not color_option_exists:
-        logger.warning(
-            "Template %s specifies enabled_colors, but blueprint %s/provider %s exposes no color option; ignoring color filter.",
-            template.key,
-            template.printify_blueprint_id,
-            template.printify_print_provider_id,
-        )
-    if template.enabled_sizes and not size_option_exists:
-        logger.warning(
-            "Template %s specifies enabled_sizes, but blueprint %s/provider %s exposes no size option; ignoring size filter.",
-            template.key,
-            template.printify_blueprint_id,
-            template.printify_print_provider_id,
-        )
-
-    for variant in catalog_variants:
-        color = _variant_option_value(variant, "color")
-        size = _variant_option_value(variant, "size")
-        is_available = variant.get("is_available", True)
-        option_filter_ok = True
-        for option_key, allowed_values in option_filters.items():
-            if _variant_option_value(variant, option_key) not in allowed_values:
-                option_filter_ok = False
-                break
-
-        color_ok = (not should_filter_colors) or color in template.enabled_colors
-        size_ok = (not should_filter_sizes) or size in template.enabled_sizes
-
-        if color_ok and size_ok and option_filter_ok and is_available:
-            chosen.append(variant)
+    chosen, diagnostics = _analyze_variant_filtering(catalog_variants, template)
     def _is_apparel_recovery_key(key: str) -> bool:
         return key in {"tshirt_gildan", "hoodie_gildan"}
 
@@ -4557,13 +4686,15 @@ def choose_variants_from_catalog(catalog_variants: Any, template: ProductTemplat
         )
         chosen = chosen[:effective_limit]
     logger.info(
-        "Variant selection template=%s selected=%s available=%s colors=%s sizes=%s option_filters=%s max_enabled_variants=%s",
+        "Variant selection template=%s selected=%s available=%s option_names=%s option_values=%s requested_filters=%s filter_counts=%s zero_reason=%s max_enabled_variants=%s",
         template.key,
         len(chosen),
         len(catalog_variants),
-        template.enabled_colors or "*",
-        template.enabled_sizes or "*",
-        template.enabled_variant_option_filters or {},
+        diagnostics.option_names,
+        diagnostics.option_values_summary,
+        diagnostics.requested_option_filters,
+        diagnostics.filter_counts,
+        diagnostics.zero_selection_reason,
         effective_limit,
     )
     return chosen
@@ -4691,11 +4822,13 @@ def _preflight_template(
         apparel_diag: Optional[Dict[str, Any]] = None,
         failed_variant_reasons: Optional[Dict[int, str]] = None,
         failure_reason_counts: Optional[Dict[str, int]] = None,
+        option_diagnostics: Optional[VariantFilterDiagnostics] = None,
     ) -> Tuple[TemplatePreflightIssue, TemplatePreflightReportRow]:
         tote_diag = tote_diag or {}
         apparel_diag = apparel_diag or {}
         failed_variant_reasons = failed_variant_reasons or {}
         failure_reason_counts = failure_reason_counts or {}
+        option_diagnostics = option_diagnostics or VariantFilterDiagnostics()
         issue = TemplatePreflightIssue(
             template_key=template.key,
             classification=classification,
@@ -4743,6 +4876,11 @@ def _preflight_template(
             apparel_max_allowed_price_minor=int(apparel_diag.get("max_allowed_price_minor", 0)),
             apparel_failed_variant_reasons=json.dumps(failed_variant_reasons, sort_keys=True),
             apparel_failure_reason_counts=json.dumps(failure_reason_counts, sort_keys=True),
+            option_names=json.dumps(option_diagnostics.option_names, sort_keys=True),
+            option_values_summary=json.dumps(option_diagnostics.option_values_summary, sort_keys=True),
+            requested_option_filters=json.dumps(option_diagnostics.requested_option_filters, sort_keys=True),
+            filter_counts=json.dumps(option_diagnostics.filter_counts, sort_keys=True),
+            zero_selection_reason=str(option_diagnostics.zero_selection_reason or ""),
         )
         return issue, row
 
@@ -4757,9 +4895,18 @@ def _preflight_template(
                 f"Provider {provider_id} is not available for blueprint {blueprint_id}.",
             )
         variants = printify.list_variants(blueprint_id, provider_id)
-        selected = choose_variants_from_catalog(variants, resolved_template)
+        selected, option_diagnostics = _analyze_variant_filtering(normalize_catalog_variants_response(variants), resolved_template)
         if not selected:
-            return _failure("zero_variants_selected", "Curated option filters selected zero variants.")
+            diagnostic_message = (
+                "Curated option filters selected zero variants. "
+                f"blueprint_id={blueprint_id} provider_id={provider_id} "
+                f"available_option_names={option_diagnostics.option_names} "
+                f"available_option_values={option_diagnostics.option_values_summary} "
+                f"requested_filters={option_diagnostics.requested_option_filters} "
+                f"filter_counts={option_diagnostics.filter_counts} "
+                f"reason={option_diagnostics.zero_selection_reason or 'no_intersection'}"
+            )
+            return _failure("zero_variants_selected", diagnostic_message, option_diagnostics=option_diagnostics)
         guarded, report = apply_variant_margin_guardrails(resolved_template, selected)
         tote_diag = (report.get("variant_diagnostics") or [])[0] if template.key == "tote_basic" else {}
         selected_count = int(report.get("selected_count", 0))
@@ -4813,6 +4960,7 @@ def _preflight_template(
                 apparel_diag=apparel_diag,
                 failed_variant_reasons=failed_variant_reasons,
                 failure_reason_counts=failure_reason_counts,
+                option_diagnostics=option_diagnostics,
             )
         return None, TemplatePreflightReportRow(
             template_key=template.key,
@@ -4849,6 +4997,11 @@ def _preflight_template(
             apparel_max_allowed_price_minor=int(apparel_diag.get("max_allowed_price_minor", 0)),
             apparel_failed_variant_reasons=json.dumps(failed_variant_reasons, sort_keys=True),
             apparel_failure_reason_counts=json.dumps(failure_reason_counts, sort_keys=True),
+            option_names=json.dumps(option_diagnostics.option_names, sort_keys=True),
+            option_values_summary=json.dumps(option_diagnostics.option_values_summary, sort_keys=True),
+            requested_option_filters=json.dumps(option_diagnostics.requested_option_filters, sort_keys=True),
+            filter_counts=json.dumps(option_diagnostics.filter_counts, sort_keys=True),
+            zero_selection_reason=str(option_diagnostics.zero_selection_reason or ""),
         )
     except TemplateValidationError as exc:
         return _failure("invalid_template_config", str(exc))

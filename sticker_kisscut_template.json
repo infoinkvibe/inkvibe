@@ -1,15 +1,13 @@
 {
   "key": "sticker_kisscut",
   "printify_blueprint_id": 783,
-  "printify_print_provider_id": 1,
+  "printify_print_provider_id": 90,
   "provider_selection_strategy": "prefer_printify_choice_then_ranked",
   "fallback_provider_allowed": true,
   "active": false,
   "title_pattern": "{artwork_title} Kiss-Cut Sticker",
   "description_pattern": "<p>{generated_description}</p>",
-  "enabled_colors": [
-    "White"
-  ],
+  "enabled_colors": [],
   "enabled_sizes": [
     "3\" \u00d7 3\""
   ],
@@ -58,5 +56,11 @@
   "shipping_basis_for_margin": "cost",
   "disable_variants_below_margin_floor": true,
   "reprice_variants_to_margin_floor": true,
-  "mark_template_nonviable_if_needed": true
+  "mark_template_nonviable_if_needed": true,
+  "enabled_variant_option_filters": {
+    "size": [
+      "3\" \u00d7 3\"",
+      "4\" \u00d7 4\""
+    ]
+  }
 }

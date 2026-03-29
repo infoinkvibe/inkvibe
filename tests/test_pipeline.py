@@ -1856,8 +1856,8 @@ def test_template_filtering_defaults_to_active_only():
 def test_default_product_templates_only_include_proven_active_set():
     templates = load_templates(Path("product_templates.json"))
     active_keys = {template.key for template in templates if template.active}
-    assert active_keys == {"mug_new", "poster_basic", "sweatshirt_gildan"}
-    for key in {"canvas_basic", "blanket_basic", "phone_case_basic", "sticker_kisscut", "tshirt_gildan", "hoodie_gildan", "tote_basic"}:
+    assert active_keys == {"mug_new", "poster_basic", "sweatshirt_gildan", "tshirt_gildan", "hoodie_gildan"}
+    for key in {"canvas_basic", "blanket_basic", "phone_case_basic", "sticker_kisscut", "tote_basic"}:
         assert key not in active_keys
 
 
@@ -2922,6 +2922,60 @@ def test_choose_variants_from_catalog_applies_option_filters_and_cap():
     ]
     chosen = choose_variants_from_catalog(variants, template)
     assert [row["id"] for row in chosen] == [1]
+
+
+def test_choose_variants_from_catalog_resolves_provider_option_aliases():
+    template = ProductTemplate(
+        key="phone_case_basic",
+        printify_blueprint_id=9,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_colors=["Glossy"],
+        enabled_variant_option_filters={"model": ["iPhone 15 Pro"]},
+    )
+    variants = [
+        {"id": 1, "is_available": True, "options": {"Device Model": "iPhone 15 Pro", "Finish": "Glossy"}},
+        {"id": 2, "is_available": True, "options": {"Device Model": "iPhone 14", "Finish": "Glossy"}},
+        {"id": 3, "is_available": True, "options": {"Device Model": "iPhone 15 Pro", "Finish": "Matte"}},
+    ]
+    chosen = choose_variants_from_catalog(variants, template)
+    assert [row["id"] for row in chosen] == [1]
+
+
+def test_preflight_zero_selection_includes_option_filter_diagnostics():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [{"id": 783}]
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 90, "title": "Sticker Provider"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [
+                {"id": 101, "is_available": True, "options": {"Shape": "Die-Cut", "Size": '3" × 3"'}},
+                {"id": 102, "is_available": True, "options": {"Shape": "Die-Cut", "Size": '4" × 4"'}},
+            ]
+
+    sticker = ProductTemplate(
+        "sticker_kisscut",
+        783,
+        90,
+        "{artwork_title}",
+        "{artwork_title}",
+        active=True,
+        enabled_variant_option_filters={"finish": ["Glossy"]},
+    )
+    passed, issues, report_rows = preflight_active_templates(printify=DummyPrintify(), templates=[sticker], explicit_template_keys=[])
+    assert passed == []
+    assert issues and issues[0].classification == "zero_variants_selected"
+    assert "available_option_names" in issues[0].message
+    assert "requested_filters" in issues[0].message
+    row = report_rows[0]
+    assert row.classification == "zero_variants_selected"
+    assert "Shape" in row.option_names
+    assert '"finish": ["Glossy"]' in row.requested_option_filters
+    assert "not present in provider schema" in row.zero_selection_reason
 
 
 def test_upsert_in_printify_recovers_from_stale_product_id(tmp_path: Path):
