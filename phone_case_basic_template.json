@@ -1,0 +1,68 @@
+{
+  "key": "phone_case_basic",
+  "printify_blueprint_id": 9,
+  "printify_print_provider_id": 1,
+  "provider_selection_strategy": "prefer_printify_choice_then_ranked",
+  "fallback_provider_allowed": true,
+  "active": true,
+  "title_pattern": "{artwork_title} Phone Case",
+  "description_pattern": "<p>{generated_description}</p>",
+  "enabled_colors": [
+    "Glossy"
+  ],
+  "enabled_sizes": [],
+  "enabled_variant_option_filters": {
+    "model": [
+      "iPhone 15",
+      "iPhone 15 Pro",
+      "iPhone 14",
+      "Samsung Galaxy S24"
+    ]
+  },
+  "max_enabled_variants": 12,
+  "tags": [
+    "phone case",
+    "tech accessory"
+  ],
+  "seo_keywords": [
+    "protective phone case",
+    "giftable phone accessory"
+  ],
+  "audience": "everyday phone users",
+  "product_type_label": "Phone Case",
+  "style_keywords": [
+    "durable",
+    "minimal"
+  ],
+  "shopify_product_type": "Accessories",
+  "publish_to_shopify": false,
+  "push_via_printify": true,
+  "publish_after_create": true,
+  "publish_title": true,
+  "publish_description": true,
+  "publish_images": true,
+  "publish_variants": true,
+  "publish_tags": true,
+  "default_price": "24.99",
+  "base_price": "18.99",
+  "markup_type": "fixed",
+  "markup_value": "6.00",
+  "rounding_mode": "x_99",
+  "compare_at_price": "29.99",
+  "placements": [
+    {
+      "placement_name": "front",
+      "width_px": 2700,
+      "height_px": 5400,
+      "file_type": "png",
+      "allow_upscale": false,
+      "artwork_fit_mode": "contain"
+    }
+  ],
+  "min_margin_after_shipping": "4.00",
+  "target_margin_after_shipping": "6.00",
+  "shipping_basis_for_margin": "cost",
+  "disable_variants_below_margin_floor": true,
+  "reprice_variants_to_margin_floor": true,
+  "mark_template_nonviable_if_needed": true
+}

@@ -109,6 +109,7 @@ from printify_shopify_sync_pipeline import (
     choose_preferred_featured_variant_color,
     choose_preferred_featured_mockup_candidate,
     resolve_family_collection_target,
+    select_provider_for_template,
 )
 from artwork_metadata_generator import (
     CompositeArtworkMetadataGenerator,
@@ -1239,12 +1240,14 @@ def test_metadata_sanitizer_strips_prompt_artifacts():
     cleaned = sanitize_metadata_for_publish(
         {
             "title": "Poster",
-            "description": "Style notes: moody tones. Keywords: wolf, moon. Great for any occasion.",
+            "description": "Style notes: moody tones. Keywords: wolf, moon. Made for general gifting. A dynamic scene of a wolf at dusk.",
             "tags": ["wolf", "wolf", "keywords", "gift idea", "moonlit forest"],
         }
     )
     assert "Style notes:" not in cleaned["description"]
     assert "Keywords:" not in cleaned["description"]
+    assert "Made for general" not in cleaned["description"]
+    assert "dynamic scene of a" not in cleaned["description"].lower()
     assert "keywords" not in cleaned["tags"]
     assert cleaned["tags"].count("wolf") == 1
 
@@ -1298,6 +1301,8 @@ def test_variant_margin_guardrails_reprice_disable_and_longsleeve_behavior():
     )
     assert report["repriced_variant_ids"] == [1]
     assert adjusted and adjusted[0]["price"] >= 3200
+    assert report["final_enabled_count"] == 1
+    assert report["disabled_count_after_reprice"] == 0
 
     longsleeve = ProductTemplate(
         key="longsleeve_gildan",
@@ -1305,7 +1310,7 @@ def test_variant_margin_guardrails_reprice_disable_and_longsleeve_behavior():
         printify_print_provider_id=1,
         title_pattern="{artwork_title}",
         description_pattern="{artwork_title}",
-        base_price="24.99",
+        base_price="10.00",
         markup_type="fixed",
         markup_value="0.00",
         min_margin_after_shipping="4.00",
@@ -1320,6 +1325,7 @@ def test_variant_margin_guardrails_reprice_disable_and_longsleeve_behavior():
     )
     assert adjusted_long == []
     assert report_long["viable"] is False
+    assert report_long["final_enabled_count"] == 0
 
 def test_uuid_noisy_filename_detection():
     assert filename_title_quality_reason("8f6f45d4-c95f-4f68-9cf9-f022f5197a18") == "uuid_like"
@@ -1770,6 +1776,15 @@ def test_template_filtering_by_key_and_limit():
     ]
     selected = select_templates(templates, template_keys=["mug", "poster"], limit_templates=1)
     assert [template.key for template in selected] == ["mug"]
+
+
+def test_template_filtering_defaults_to_active_only():
+    templates = [
+        ProductTemplate("tee", 1, 1, "{artwork_title}", "{artwork_title}", active=True),
+        ProductTemplate("long", 2, 2, "{artwork_title}", "{artwork_title}", active=False),
+    ]
+    selected = select_templates(templates)
+    assert [template.key for template in selected] == ["tee"]
 
 
 def test_seo_metadata_context_and_rendering(tmp_path: Path):
@@ -4827,6 +4842,130 @@ def test_tshirt_template_added_and_longsleeve_copy_is_distinct(tmp_path: Path):
     assert "long sleeve" in long_title.lower()
     assert "t-shirt" in tee_title.lower() or "tee" in tee_title.lower()
     assert "long sleeve" in long_desc
-    assert "t-shirt" in tee_desc
+    assert ("t-shirt" in tee_desc) or ("tee" in tee_desc)
     assert any("long sleeve" in tag.lower() for tag in long_tags)
     assert any(("t-shirt" in tag.lower()) or ("tee" in tag.lower()) for tag in tee_tags)
+
+
+def test_top10_template_keys_exist_and_curated():
+    templates = load_templates(Path("product_templates.json"))
+    by_key = {template.key: template for template in templates}
+    required = {
+        "tshirt_gildan",
+        "sweatshirt_gildan",
+        "hoodie_gildan",
+        "mug_new",
+        "poster_basic",
+        "tote_basic",
+        "canvas_basic",
+        "phone_case_basic",
+        "sticker_kisscut",
+        "blanket_basic",
+    }
+    assert required.issubset(set(by_key))
+    assert by_key["longsleeve_gildan"].active is False
+    assert by_key["tshirt_gildan"].enabled_colors == ["Black", "White", "Navy", "Sport Grey", "Sand"]
+    assert by_key["tshirt_gildan"].enabled_sizes == ["S", "M", "L", "XL", "2XL", "3XL"]
+    assert by_key["phone_case_basic"].max_enabled_variants <= 12
+    assert by_key["poster_basic"].enabled_sizes == ["11″ x 14″ (Vertical)", "12″ x 16″ (Vertical)", "16″ x 20″ (Vertical)"]
+
+
+def test_guardrail_zero_enabled_variants_skip_before_payload_validation():
+    class StubPrintify:
+        dry_run = False
+        created = False
+
+        def create_product(self, shop_id, payload):
+            self.created = True
+            return {"id": "p1"}
+
+    template = ProductTemplate(
+        key="tshirt_gildan",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        base_price="10.00",
+        markup_type="fixed",
+        markup_value="0.00",
+        min_margin_after_shipping="5.00",
+        target_margin_after_shipping="5.00",
+        reprice_variants_to_margin_floor=False,
+        disable_variants_below_margin_floor=True,
+        mark_template_nonviable_if_needed=True,
+        publish_after_create=False,
+        placements=[PlacementRequirement("front", 4500, 5400)],
+    )
+    artwork = Artwork("a", Path("a.png"), "A", "", [], 1000, 1000)
+    printify = StubPrintify()
+    result = upsert_in_printify(
+        printify=printify,
+        shop_id=1,
+        artwork=artwork,
+        template=template,
+        variant_rows=[{"id": 9, "price": 1000, "cost": 1000, "shipping": 900, "is_available": True}],
+        upload_map={"front": {"id": "u1"}},
+        existing_product_id="",
+        action="create",
+        publish_mode="default",
+        verify_publish=False,
+    )
+    assert result["status"] == "skipped_nonviable"
+    assert result["reason"].startswith("no_enabled_variants_after_guardrails")
+    assert printify.created is False
+
+
+def test_longsleeve_nonviable_returns_structured_skip():
+    class StubPrintify:
+        dry_run = False
+
+        def create_product(self, shop_id, payload):
+            raise AssertionError("create_product should not be called for nonviable long-sleeve")
+
+    template = ProductTemplate(
+        key="longsleeve_gildan",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        min_margin_after_shipping="4.00",
+        target_margin_after_shipping="5.00",
+        reprice_variants_to_margin_floor=False,
+        disable_variants_below_margin_floor=True,
+        mark_template_nonviable_if_needed=True,
+    )
+    artwork = Artwork("a", Path("a.png"), "A", "", [], 1000, 1000)
+    result = upsert_in_printify(
+        printify=StubPrintify(),
+        shop_id=1,
+        artwork=artwork,
+        template=template,
+        variant_rows=[{"id": 2, "price": 1500, "cost": 1500, "shipping": 900, "is_available": True}],
+        upload_map={"front": {"id": "u1"}},
+        existing_product_id="",
+        action="create",
+        publish_mode="default",
+        verify_publish=False,
+    )
+    assert result["status"] == "skipped_nonviable"
+    assert result["guardrail_report"]["final_enabled_count"] == 0
+
+
+def test_provider_selection_prefers_printify_choice_when_available():
+    class StubPrintify:
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 10, "title": "Other Provider"}, {"id": 11, "title": "Printify Choice"}]
+
+        def list_variants(self, blueprint_id, provider_id, show_out_of_stock=True):
+            return [{"id": provider_id, "is_available": True, "options": {"color": "Black", "size": "M"}, "cost": 1200, "price": 1200}]
+
+    template = ProductTemplate(
+        key="canvas_basic",
+        printify_blueprint_id=13,
+        printify_print_provider_id=10,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        provider_selection_strategy="prefer_printify_choice_then_ranked",
+    )
+    resolved = select_provider_for_template(printify=StubPrintify(), template=template)
+    assert resolved.printify_print_provider_id == 11

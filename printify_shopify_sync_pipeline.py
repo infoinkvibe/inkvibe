@@ -112,6 +112,14 @@ class CatalogCliUsageError(RuntimeError):
     pass
 
 
+class TemplateSkipGuardrail(RuntimeError):
+    def __init__(self, status: str, reason: str, margin_report: Optional[Dict[str, Any]] = None):
+        super().__init__(reason)
+        self.status = status
+        self.reason = reason
+        self.margin_report = margin_report or {}
+
+
 @dataclass
 class Artwork:
     slug: str
@@ -251,6 +259,12 @@ class ProductTemplate:
     disable_variants_below_margin_floor: bool = False
     reprice_variants_to_margin_floor: bool = True
     mark_template_nonviable_if_needed: bool = False
+    active: bool = True
+    provider_selection_strategy: str = "pinned_then_printify_choice_then_lowest_cost"
+    pinned_provider_id: Optional[int] = None
+    pinned_blueprint_id: Optional[int] = None
+    provider_preference_order: List[int] = field(default_factory=list)
+    fallback_provider_allowed: bool = True
 
 
 @dataclass
@@ -1167,6 +1181,8 @@ def sanitize_description_text(value: str) -> str:
     for pattern in PROMPT_RESIDUE_PATTERNS:
         text = pattern.sub(" ", text)
     text = re.sub(r"\b(great for any occasion|perfect for any occasion)\b", "", text, flags=re.I)
+    text = re.sub(r"\bmade for general\b", "", text, flags=re.I)
+    text = re.sub(r"\ba dynamic scene of a\b", "", text, flags=re.I)
     text = re.sub(r"\b(style mood:)\b", "", text, flags=re.I)
     return _normalize_whitespace(text)
 
@@ -1448,6 +1464,92 @@ def score_provider_for_template(
         "sizes": summary["sizes"],
         "placements": summary["placements"],
     }
+
+
+def _provider_is_printify_choice(provider: Dict[str, Any]) -> bool:
+    title = str(provider.get("title") or provider.get("name") or "").strip().lower()
+    return "printify choice" in title
+
+
+def select_provider_for_template(
+    *,
+    printify: PrintifyClient,
+    template: ProductTemplate,
+) -> ProductTemplate:
+    if template.key == "tote_basic":
+        return template
+    if not hasattr(printify, "list_print_providers") or not hasattr(printify, "list_variants"):
+        return template
+
+    blueprint_id = int(template.pinned_blueprint_id or template.printify_blueprint_id)
+    try:
+        providers = printify.list_print_providers(blueprint_id)
+    except Exception:
+        return template
+    if not providers:
+        return template
+
+    providers_by_id = {int(provider.get("id") or 0): provider for provider in providers}
+    provider_candidates: List[int] = []
+    pinned_provider = int(template.pinned_provider_id or 0)
+    if pinned_provider > 0:
+        provider_candidates.append(pinned_provider)
+    provider_candidates.extend([int(pid) for pid in (template.provider_preference_order or []) if int(pid) > 0])
+    if template.provider_selection_strategy.startswith("prefer_printify_choice"):
+        for provider in providers:
+            pid = int(provider.get("id") or 0)
+            if pid > 0 and _provider_is_printify_choice(provider):
+                provider_candidates.insert(0, pid)
+    if pinned_provider <= 0 and int(template.printify_print_provider_id or 0) > 0:
+        provider_candidates.append(int(template.printify_print_provider_id))
+
+    seen: set[int] = set()
+    ordered_candidates: List[int] = []
+    for pid in provider_candidates:
+        if pid > 0 and pid in providers_by_id and pid not in seen:
+            seen.add(pid)
+            ordered_candidates.append(pid)
+
+    best_scored: Optional[Tuple[int, float]] = None
+    for provider in providers:
+        pid = int(provider.get("id") or 0)
+        if pid <= 0:
+            continue
+        try:
+            variants = printify.list_variants(blueprint_id, pid)
+        except Exception:
+            continue
+        if not variants:
+            continue
+        score = score_provider_for_template(provider, variants, template)
+        cost_samples = [
+            normalize_printify_price(v.get("cost") if v.get("cost") is not None else v.get("price"))
+            for v in variants[:12]
+            if (v.get("cost") is not None or v.get("price") is not None)
+        ]
+        avg_cost = float(sum(cost_samples) / len(cost_samples)) if cost_samples else 10_000.0
+        composite = float(score["score"]) - (avg_cost / 10_000.0)
+        if best_scored is None or composite > best_scored[1]:
+            best_scored = (pid, composite)
+        if pid not in seen:
+            ordered_candidates.append(pid)
+            seen.add(pid)
+
+    if not template.fallback_provider_allowed and ordered_candidates:
+        ordered_candidates = ordered_candidates[:1]
+
+    selected_provider_id = ordered_candidates[0] if ordered_candidates else int(template.printify_print_provider_id)
+    if selected_provider_id != int(template.printify_print_provider_id) or blueprint_id != int(template.printify_blueprint_id):
+        logger.info(
+            "Provider selection template=%s strategy=%s selected_blueprint_id=%s selected_provider_id=%s previous_blueprint_id=%s previous_provider_id=%s",
+            template.key,
+            template.provider_selection_strategy,
+            blueprint_id,
+            selected_provider_id,
+            template.printify_blueprint_id,
+            template.printify_print_provider_id,
+        )
+    return replace(template, printify_blueprint_id=blueprint_id, printify_print_provider_id=selected_provider_id)
 
 
 def generate_template_snippet(
@@ -1742,6 +1844,8 @@ def render_product_description(template: ProductTemplate, artwork: Artwork) -> s
         cleaned = html
         cleaned = re.sub(r"(?is)<p>\s*(Style notes?|Keywords?)\s*:.*?</p>", "", cleaned)
         cleaned = re.sub(r"(?i)\b(Style notes?|Keywords?)\s*:\s*", "", cleaned)
+        cleaned = re.sub(r"(?i)\bMade for general\b", "", cleaned)
+        cleaned = re.sub(r"(?i)\ba dynamic scene of a\b", "", cleaned)
         cleaned = re.sub(r"\s{2,}", " ", cleaned)
         return cleaned.strip()
 
@@ -1925,30 +2029,50 @@ def apply_variant_margin_guardrails(template: ProductTemplate, variant_rows: Lis
     adjusted: List[Dict[str, Any]] = []
     disabled: List[int] = []
     repriced: List[int] = []
+    selected_count = len(variant_rows)
     for variant in variant_rows:
         variant_copy = dict(variant)
         sale_minor = compute_sale_price_minor(template, variant_copy)
         margin_minor = _variant_margin_after_shipping_minor(template, variant_copy, sale_minor)
-        if margin_minor < min_margin_minor:
-            if template.reprice_variants_to_margin_floor:
-                cost_source = variant_copy.get("cost") if variant_copy.get("cost") is not None else variant_copy.get("price")
-                cost_minor = normalize_printify_price(cost_source if cost_source is not None else template.default_price)
-                repriced_minor = cost_minor + _shipping_minor_for_variant(variant_copy, template) + target_margin_minor
-                if repriced_minor > sale_minor:
-                    variant_copy["price"] = repriced_minor
-                    repriced.append(int(variant_copy.get("id", 0)))
-                    sale_minor = repriced_minor
-                    margin_minor = _variant_margin_after_shipping_minor(template, variant_copy, sale_minor)
-            if margin_minor < min_margin_minor and template.disable_variants_below_margin_floor:
-                disabled.append(int(variant_copy.get("id", 0)))
-                continue
+        if margin_minor < min_margin_minor and template.reprice_variants_to_margin_floor:
+            cost_source = variant_copy.get("cost") if variant_copy.get("cost") is not None else variant_copy.get("price")
+            cost_minor = normalize_printify_price(cost_source if cost_source is not None else template.default_price)
+            repriced_minor = cost_minor + _shipping_minor_for_variant(variant_copy, template) + target_margin_minor
+            if repriced_minor > sale_minor:
+                variant_copy["price"] = repriced_minor
+                repriced.append(int(variant_copy.get("id", 0)))
+                sale_minor = repriced_minor
+            margin_minor = _variant_margin_after_shipping_minor(template, variant_copy, sale_minor)
+
+        if margin_minor < min_margin_minor and template.disable_variants_below_margin_floor:
+            disabled.append(int(variant_copy.get("id", 0)))
+            continue
         if margin_minor < 0:
             if template.disable_variants_below_margin_floor:
                 disabled.append(int(variant_copy.get("id", 0)))
                 continue
         adjusted.append(variant_copy)
     viable = bool(adjusted)
-    return adjusted, {"disabled_variant_ids": disabled, "repriced_variant_ids": repriced, "viable": viable}
+    report = {
+        "disabled_variant_ids": disabled,
+        "repriced_variant_ids": repriced,
+        "viable": viable,
+        "selected_count": selected_count,
+        "repriced_count": len(repriced),
+        "disabled_count_after_reprice": len(disabled),
+        "final_enabled_count": len(adjusted),
+        "skip_reason": "" if viable else "disabled_by_guardrails_after_reprice",
+    }
+    logger.info(
+        "Variant guardrails template=%s selected_count=%s repriced_count=%s disabled_count_after_reprice=%s final_enabled_count=%s skip_reason=%s",
+        template.key,
+        report["selected_count"],
+        report["repriced_count"],
+        report["disabled_count_after_reprice"],
+        report["final_enabled_count"],
+        report["skip_reason"] or "-",
+    )
+    return adjusted, report
 
 
 def file_fingerprint(path: pathlib.Path) -> str:
@@ -4061,6 +4185,21 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
     for bool_field in ("disable_variants_below_margin_floor", "reprice_variants_to_margin_floor", "mark_template_nonviable_if_needed"):
         if row.get(bool_field) is not None and not isinstance(row.get(bool_field), bool):
             raise TemplateValidationError(f"Template[{index}] {bool_field} must be boolean when provided")
+    for bool_field in ("active", "fallback_provider_allowed"):
+        if row.get(bool_field) is not None and not isinstance(row.get(bool_field), bool):
+            raise TemplateValidationError(f"Template[{index}] {bool_field} must be boolean when provided")
+    if row.get("provider_selection_strategy") is not None:
+        strategy = str(row.get("provider_selection_strategy", "")).strip().lower()
+        if strategy not in {"pinned_then_printify_choice_then_lowest_cost", "prefer_printify_choice_then_ranked"}:
+            raise TemplateValidationError(
+                f"Template[{index}] provider_selection_strategy must be pinned_then_printify_choice_then_lowest_cost|prefer_printify_choice_then_ranked"
+            )
+    for int_field in ("pinned_provider_id", "pinned_blueprint_id"):
+        if row.get(int_field) is not None and int(row.get(int_field)) <= 0:
+            raise TemplateValidationError(f"Template[{index}] {int_field} must be > 0 when provided")
+    if row.get("provider_preference_order") is not None:
+        if not isinstance(row.get("provider_preference_order"), list):
+            raise TemplateValidationError(f"Template[{index}] provider_preference_order must be a list when provided")
     if row.get("max_upscale_factor") is not None and float(row.get("max_upscale_factor", 0)) <= 0:
         raise TemplateValidationError(f"Template[{index}] max_upscale_factor must be > 0 when provided")
     if row.get("poster_safe_max_upscale_factor") is not None and float(row.get("poster_safe_max_upscale_factor", 0)) <= 0:
@@ -4165,6 +4304,14 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
                 disable_variants_below_margin_floor=bool(row.get("disable_variants_below_margin_floor", False)),
                 reprice_variants_to_margin_floor=bool(row.get("reprice_variants_to_margin_floor", True)),
                 mark_template_nonviable_if_needed=bool(row.get("mark_template_nonviable_if_needed", False)),
+                active=bool(row.get("active", True)),
+                provider_selection_strategy=str(
+                    row.get("provider_selection_strategy", "pinned_then_printify_choice_then_lowest_cost")
+                ).strip().lower() or "pinned_then_printify_choice_then_lowest_cost",
+                pinned_provider_id=int(row["pinned_provider_id"]) if row.get("pinned_provider_id") is not None else None,
+                pinned_blueprint_id=int(row["pinned_blueprint_id"]) if row.get("pinned_blueprint_id") is not None else None,
+                provider_preference_order=[int(v) for v in row.get("provider_preference_order", [])],
+                fallback_provider_allowed=bool(row.get("fallback_provider_allowed", True)),
                 placements=[PlacementRequirement(**p) for p in row.get("placements", [])],
             )
         )
@@ -4418,11 +4565,20 @@ def build_printify_product_payload(artwork: Artwork, template: ProductTemplate, 
             template.key,
             margin_report["disabled_variant_ids"],
         )
-    if template.key == "longsleeve_gildan" and not margin_report["viable"]:
-        logger.warning("Long-sleeve template nonviable after shipping guardrails template=%s", template.key)
-        raise ValueError("longsleeve_nonviable_after_shipping")
-    if template.mark_template_nonviable_if_needed and not margin_report["viable"]:
-        raise ValueError(f"template_nonviable_after_shipping:{template.key}")
+    if not guarded_variants:
+        skip_status = "skipped_nonviable" if template.mark_template_nonviable_if_needed else "disabled_by_guardrails"
+        skip_reason = "longsleeve_nonviable_after_shipping" if template.key == "longsleeve_gildan" else f"no_enabled_variants_after_guardrails:{template.key}"
+        logger.warning(
+            "Skipping payload build template=%s status=%s reason=%s selected_count=%s repriced_count=%s disabled_count_after_reprice=%s final_enabled_count=%s",
+            template.key,
+            skip_status,
+            skip_reason,
+            margin_report.get("selected_count", 0),
+            margin_report.get("repriced_count", 0),
+            margin_report.get("disabled_count_after_reprice", 0),
+            margin_report.get("final_enabled_count", 0),
+        )
+        raise TemplateSkipGuardrail(skip_status, skip_reason, margin_report)
 
     variants_payload: List[Dict[str, Any]] = []
     enabled_variant_ids: List[int] = []
@@ -5196,7 +5352,16 @@ def upsert_in_printify(
         new_product_id = str(created_resp.get("id") or created_resp.get("data", {}).get("id") or "")
         return new_product_id, {"action": "create", "printify_product_id": new_product_id, "created": created_resp}
 
-    payload = build_printify_product_payload(artwork, template, variant_rows, upload_map)
+    try:
+        payload = build_printify_product_payload(artwork, template, variant_rows, upload_map)
+    except TemplateSkipGuardrail as exc:
+        return {
+            "status": exc.status,
+            "action": "skip",
+            "reason": exc.reason,
+            "guardrail_report": exc.margin_report,
+            "printify_product_id": existing_product_id or "",
+        }
     payload_stats = validate_printify_payload_consistency(payload)
     enforce_variant_safety_limit(template=template, enabled_variant_count=payload_stats["enabled_variant_count"])
     logger.info("Mockup/image publish behavior template=%s publish_images=%s publish_mockups_override=%s", template.key, template.publish_images, template.publish_mockups)
@@ -5462,7 +5627,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     template=template,
                 )
             else:
-                catalog_variants = printify.list_variants(template.printify_blueprint_id, template.printify_print_provider_id)
+                resolved_template = select_provider_for_template(printify=printify, template=template)
+                catalog_variants = printify.list_variants(resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id)
             variant_rows = choose_variants_from_catalog(catalog_variants, resolved_template)
             if not variant_rows:
                 all_templates_successful = False
@@ -6030,6 +6196,8 @@ def select_templates(
     if template_keys:
         wanted = {key.strip() for key in template_keys if key.strip()}
         selected = [template for template in templates if template.key in wanted]
+    else:
+        selected = [template for template in templates if template.active]
     if limit_templates > 0:
         selected = selected[:limit_templates]
     return selected
