@@ -123,6 +123,11 @@ class Artwork:
     image_height: int
     dpi_hint: Optional[int] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata_resolution_source: str = "fallback"
+    metadata_generated_inline: bool = False
+    metadata_sidecar_written: bool = False
+    weak_metadata_detected: List[str] = field(default_factory=list)
+    final_title_source: str = ""
 
 
 @dataclass
@@ -338,6 +343,11 @@ class RunReportRow:
     collection_sort_strategy: str = ""
     preferred_featured_variant_color: str = ""
     selected_featured_mockup_color: str = ""
+    metadata_resolution_source: str = ""
+    metadata_generated_inline: bool = False
+    metadata_sidecar_written: bool = False
+    weak_metadata_detected: str = ""
+    final_title_source: str = ""
     featured_image_strategy: str = ""
     featured_image_source: str = ""
     tote_scale_strategy: str = ""
@@ -1047,6 +1057,82 @@ def resolve_artwork_metadata_with_source(
 def resolve_artwork_metadata_for_path(path: pathlib.Path, metadata_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     metadata, _ = resolve_artwork_metadata_with_source(path, metadata_map)
     return metadata
+
+
+def title_is_sluglike_or_generic(title: str, *, artwork_path: Optional[pathlib.Path] = None) -> Tuple[bool, List[str]]:
+    normalized = re.sub(r"\s+", " ", str(title or "").strip())
+    lowered = normalized.lower()
+    reasons: List[str] = []
+    if not normalized:
+        return True, ["title_missing"]
+    if lowered in {"untitled", "untitled design", "signature", "signature product", "product", "design", "artwork"}:
+        reasons.append("title_generic_phrase")
+    if re.fullmatch(r"[a-f0-9]{24,64}", lowered):
+        reasons.append("title_hash_like")
+    if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", lowered):
+        reasons.append("title_uuid_like")
+    slug_or_name = ""
+    if artwork_path is not None:
+        slug_or_name = filename_slug_to_title(artwork_path.stem)
+    if slug_or_name and lowered == slug_or_name.lower():
+        quality_reason = filename_title_quality_reason(artwork_path.stem)
+        if quality_reason in {"uuid_like", "hex_like", "long_numeric", "hashy_slug"}:
+            reasons.append("title_slug_fallback_noisy")
+    if re.search(r"\b(ai generated|generated image|stock photo)\b", lowered):
+        reasons.append("title_generic_generator_phrase")
+    if re.search(r"\d{5,}", lowered):
+        reasons.append("title_long_numeric_suffix")
+    if re.fullmatch(r"[a-z0-9\-_,. ]{18,}", lowered):
+        reasons.append("title_slug_like")
+    return bool(reasons), sorted(set(reasons))
+
+
+def description_is_weak_fallback(description: str) -> Tuple[bool, List[str]]:
+    plain = _normalize_whitespace(re.sub(r"<[^>]+>", " ", str(description or "")))
+    lowered = plain.lower()
+    reasons: List[str] = []
+    if not plain:
+        reasons.append("description_missing")
+    if len(plain.split()) < 8:
+        reasons.append("description_too_short")
+    generic_phrases = {
+        "perfect for any occasion",
+        "great gift idea",
+        "adds an easy style upgrade",
+        "versatile piece",
+        "print on demand",
+    }
+    if any(phrase in lowered for phrase in generic_phrases):
+        reasons.append("description_generic_phrase")
+    return bool(reasons), sorted(set(reasons))
+
+
+def metadata_is_missing_or_weak(
+    metadata: Dict[str, Any],
+    *,
+    artwork_path: pathlib.Path,
+    metadata_source: str = "",
+    only_when_weak: bool = True,
+) -> Tuple[bool, List[str]]:
+    if not metadata:
+        return True, ["metadata_missing"]
+    reasons: List[str] = []
+    title = str(metadata.get("title") or "").strip()
+    if not title:
+        reasons.append("title_missing")
+    else:
+        weak_title, title_reasons = title_is_sluglike_or_generic(title, artwork_path=artwork_path)
+        if weak_title:
+            reasons.extend(title_reasons)
+    weak_description, desc_reasons = description_is_weak_fallback(str(metadata.get("description") or ""))
+    if weak_description:
+        reasons.extend(desc_reasons)
+    if metadata_source == "sidecar":
+        # Keep concise sidecars intact unless signals are clearly weak.
+        reasons = [reason for reason in reasons if reason not in {"description_too_short"}]
+    if not only_when_weak:
+        return True, reasons or ["metadata_refresh_requested"]
+    return bool(reasons), sorted(set(reasons))
 
 
 def filename_title_quality_reason(value: str) -> str:
@@ -2588,11 +2674,101 @@ def create_in_shopify_only(
 # -----------------------------
 
 
+def _apply_inline_metadata_generation(
+    *,
+    artwork: Artwork,
+    metadata_source: str,
+    metadata_match_key: str,
+    auto_generate_missing_metadata: bool,
+    metadata_inline_only_when_weak: bool,
+    auto_write_generated_sidecars: bool,
+    metadata_inline_overwrite_weak_sidecars: bool,
+    metadata_inline_generator: str,
+    metadata_openai_model: str,
+    metadata_openai_timeout: float,
+) -> Artwork:
+    artwork.metadata_resolution_source = metadata_source
+    should_generate, weak_reasons = metadata_is_missing_or_weak(
+        artwork.metadata,
+        artwork_path=artwork.src_path,
+        metadata_source=metadata_source,
+        only_when_weak=metadata_inline_only_when_weak,
+    )
+    artwork.weak_metadata_detected = weak_reasons
+    if not auto_generate_missing_metadata or not should_generate:
+        if weak_reasons:
+            logger.info(
+                "Weak metadata detected artwork=%s source=%s reasons=%s inline_generation=%s",
+                artwork.src_path.name,
+                metadata_source,
+                ",".join(weak_reasons),
+                "disabled" if not auto_generate_missing_metadata else "not_required",
+            )
+        return artwork
+
+    logger.info(
+        "Inline metadata generation requested artwork=%s source=%s key=%s reasons=%s generator=%s",
+        artwork.src_path.name,
+        metadata_source,
+        metadata_match_key,
+        ",".join(weak_reasons) or "metadata_missing",
+        metadata_inline_generator,
+    )
+    try:
+        generator = select_artwork_metadata_generator(
+            mode=metadata_inline_generator,
+            openai_model=metadata_openai_model,
+            openai_timeout_seconds=metadata_openai_timeout,
+        )
+        candidate = generator.generate_metadata_for_artwork(artwork.src_path)
+    except Exception as exc:
+        logger.warning("Inline metadata generation failed artwork=%s error=%s", artwork.src_path.name, exc)
+        return artwork
+    generated_payload = candidate.metadata.as_sidecar_dict()
+    artwork.metadata = generated_payload
+    artwork.title = str(generated_payload.get("title") or artwork.title).strip() or artwork.title
+    artwork.metadata_generated_inline = True
+    if "openai" in candidate.generator:
+        artwork.metadata_resolution_source = "inline_openai"
+    elif "vision" in candidate.generator:
+        artwork.metadata_resolution_source = "inline_vision"
+    else:
+        artwork.metadata_resolution_source = "inline_heuristic"
+
+    sidecar_exists = artwork.src_path.with_suffix(".json").exists()
+    should_attempt_write = auto_write_generated_sidecars and (not sidecar_exists or metadata_inline_overwrite_weak_sidecars)
+    wrote_sidecar = False
+    if should_attempt_write:
+        if should_write_sidecar(
+            artwork.src_path.with_suffix(".json"),
+            overwrite_sidecars=metadata_inline_overwrite_weak_sidecars,
+            only_missing=not metadata_inline_overwrite_weak_sidecars,
+        ):
+            write_artwork_sidecar(candidate=candidate)
+            wrote_sidecar = True
+    artwork.metadata_sidecar_written = wrote_sidecar
+    logger.info(
+        "Inline metadata generated artwork=%s generator=%s title=%s sidecar_written=%s",
+        artwork.src_path.name,
+        candidate.generator,
+        artwork.title,
+        wrote_sidecar,
+    )
+    return artwork
+
+
 def discover_artworks(
     image_dir: pathlib.Path,
     *,
     candidate_paths: Optional[List[pathlib.Path]] = None,
     source_hygiene: Optional[SourceHygieneOptions] = None,
+    auto_generate_missing_metadata: bool = True,
+    auto_write_generated_sidecars: bool = True,
+    metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value,
+    metadata_inline_only_when_weak: bool = True,
+    metadata_inline_overwrite_weak_sidecars: bool = False,
+    metadata_openai_model: str = "",
+    metadata_openai_timeout: float = 30.0,
 ) -> List[Artwork]:
     supported = {".png", ".jpg", ".jpeg", ".webp"}
     artworks: List[Artwork] = []
@@ -2629,18 +2805,29 @@ def discover_artworks(
             match_info.get("key", ""),
         )
         title = str(metadata.get("title", "")).strip() or filename_slug_to_title(path.stem)
-        artworks.append(
-            Artwork(
-                slug=slug,
-                src_path=path,
-                title=title,
-                description_html=f"<p>{title}</p>",
-                tags=[],
-                image_width=width,
-                image_height=height,
-                metadata=metadata,
-            )
+        artwork = Artwork(
+            slug=slug,
+            src_path=path,
+            title=title,
+            description_html=f"<p>{title}</p>",
+            tags=[],
+            image_width=width,
+            image_height=height,
+            metadata=metadata,
         )
+        artwork = _apply_inline_metadata_generation(
+            artwork=artwork,
+            metadata_source=match_info.get("source", "fallback"),
+            metadata_match_key=match_info.get("key", ""),
+            auto_generate_missing_metadata=auto_generate_missing_metadata,
+            metadata_inline_only_when_weak=metadata_inline_only_when_weak,
+            auto_write_generated_sidecars=auto_write_generated_sidecars,
+            metadata_inline_overwrite_weak_sidecars=metadata_inline_overwrite_weak_sidecars,
+            metadata_inline_generator=metadata_inline_generator,
+            metadata_openai_model=metadata_openai_model,
+            metadata_openai_timeout=metadata_openai_timeout,
+        )
+        artworks.append(artwork)
 
     return artworks
 
@@ -4949,6 +5136,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
     all_templates_successful = True
     for template in templates:
         title_info = resolve_artwork_title(template, artwork)
+        artwork.final_title_source = title_info.title_source
         rendered_title = render_product_title(template, artwork)
         state_key = f"{artwork.slug}:{template.key}"
         matching_rows = [row for row in record["products"] if isinstance(row, dict) and row.get("state_key") == state_key]
@@ -5050,6 +5238,11 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                         poster_requested_upscale_factor=poster_requested_upscale_factor_report,
                         poster_applied_upscale_factor=poster_applied_upscale_factor_report,
                         poster_fill_optimization_used=poster_fill_optimization_used_report,
+                        metadata_resolution_source=artwork.metadata_resolution_source,
+                        metadata_generated_inline=artwork.metadata_generated_inline,
+                        metadata_sidecar_written=artwork.metadata_sidecar_written,
+                        weak_metadata_detected="|".join(artwork.weak_metadata_detected),
+                        final_title_source=title_info.title_source,
                     ))
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=True, result=result, blueprint_id=template.printify_blueprint_id, provider_id=template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
@@ -5336,6 +5529,11 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     featured_image_strategy=resolved_template.preferred_featured_image_strategy,
                     featured_image_source="verified_product_image_preference" if preferred_featured_candidate.get("selected_featured_mockup_src") else "printify_mockup_recommendation",
                     tote_scale_strategy="front_fill_boost_orientation_tuned" if resolved_template.key == "tote_basic" else "",
+                    metadata_resolution_source=artwork.metadata_resolution_source,
+                    metadata_generated_inline=artwork.metadata_generated_inline,
+                    metadata_sidecar_written=artwork.metadata_sidecar_written,
+                    weak_metadata_detected="|".join(artwork.weak_metadata_detected),
+                    final_title_source=title_info.title_source,
                 ))
             if summary is not None:
                 printify_action = (result.get("printify", {}) or {}).get("action", action)
@@ -5531,6 +5729,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metadata-review-json", default="", help="Optional JSON path for metadata review queue export")
     parser.add_argument("--metadata-write-auto-approved-only", action="store_true", help="When writing sidecars, write only auto-approved metadata candidates")
     parser.add_argument("--metadata-allow-review-writes", action="store_true", help="Allow writes for needs_review metadata candidates (off by default)")
+    parser.add_argument(
+        "--auto-generate-missing-metadata",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Inline during normal create/publish runs: auto-generate metadata when missing/weak (default on)",
+    )
+    parser.add_argument(
+        "--auto-write-generated-sidecars",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When inline metadata is generated, write sidecars immediately (default on)",
+    )
+    parser.add_argument(
+        "--metadata-inline-generator",
+        choices=[mode.value for mode in MetadataGeneratorMode],
+        default=MetadataGeneratorMode.AUTO.value,
+        help="Inline metadata generator strategy for normal runs (auto=openai->vision->heuristic)",
+    )
+    parser.add_argument(
+        "--metadata-inline-only-when-weak",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Only run inline generation when metadata is missing/weak (default on)",
+    )
+    parser.add_argument(
+        "--metadata-inline-overwrite-weak-sidecars",
+        action="store_true",
+        help="Allow inline-generated metadata to overwrite existing weak sidecars (default off)",
+    )
     parser.add_argument("--generate-artwork-from-prompt", action="store_true", help="Generate artwork source image(s) from a text prompt before normal pipeline processing")
     parser.add_argument("--art-prompt", default="", help="Prompt used for artwork generation mode")
     parser.add_argument("--art-count", type=int, default=1, help="Number of concept sets to generate")
@@ -5775,7 +6002,7 @@ def run_catalog_cli(
     return False
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "") -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "") -> None:
     if publish_mode not in {"default", "publish", "skip"}:
         raise RuntimeError(f"Unsupported publish mode: {publish_mode}")
 
@@ -5928,7 +6155,18 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         logger.info("Launch-plan CSV exported from images path=%s rows=%s", export_launch_plan_from_images_path, exported_count)
         return
     try:
-        artworks = discover_artworks(image_dir, candidate_paths=generated_paths, source_hygiene=source_hygiene)
+        artworks = discover_artworks(
+            image_dir,
+            candidate_paths=generated_paths,
+            source_hygiene=source_hygiene,
+            auto_generate_missing_metadata=auto_generate_missing_metadata,
+            auto_write_generated_sidecars=auto_write_generated_sidecars,
+            metadata_inline_generator=metadata_inline_generator,
+            metadata_inline_only_when_weak=metadata_inline_only_when_weak,
+            metadata_inline_overwrite_weak_sidecars=metadata_inline_overwrite_weak_sidecars,
+            metadata_openai_model=metadata_openai_model,
+            metadata_openai_timeout=metadata_openai_timeout,
+        )
     except TypeError:
         artworks = discover_artworks(image_dir)
     if max_artworks > 0:
@@ -6060,6 +6298,18 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                     image_width=width,
                     image_height=height,
                     metadata=metadata,
+                )
+                artwork = _apply_inline_metadata_generation(
+                    artwork=artwork,
+                    metadata_source=match_info.get("source", "fallback"),
+                    metadata_match_key=match_info.get("key", ""),
+                    auto_generate_missing_metadata=auto_generate_missing_metadata,
+                    metadata_inline_only_when_weak=metadata_inline_only_when_weak,
+                    auto_write_generated_sidecars=auto_write_generated_sidecars,
+                    metadata_inline_overwrite_weak_sidecars=metadata_inline_overwrite_weak_sidecars,
+                    metadata_inline_generator=metadata_inline_generator,
+                    metadata_openai_model=metadata_openai_model,
+                    metadata_openai_timeout=metadata_openai_timeout,
                 )
             template = build_resolved_template(template_by_key[launch_row.template_key], launch_row.overrides)
             if resume and is_state_key_successful(state, f"{artwork.slug}:{template.key}"):
@@ -6319,6 +6569,11 @@ if __name__ == "__main__":
             metadata_review_json=args.metadata_review_json,
             metadata_write_auto_approved_only=args.metadata_write_auto_approved_only,
             metadata_allow_review_writes=args.metadata_allow_review_writes,
+            auto_generate_missing_metadata=args.auto_generate_missing_metadata,
+            auto_write_generated_sidecars=args.auto_write_generated_sidecars,
+            metadata_inline_generator=args.metadata_inline_generator,
+            metadata_inline_only_when_weak=args.metadata_inline_only_when_weak,
+            metadata_inline_overwrite_weak_sidecars=args.metadata_inline_overwrite_weak_sidecars,
             generate_artwork_from_prompt=args.generate_artwork_from_prompt,
             art_prompt=args.art_prompt,
             art_count=args.art_count,

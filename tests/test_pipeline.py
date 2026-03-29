@@ -58,8 +58,12 @@ from printify_shopify_sync_pipeline import (
     load_artwork_metadata_map,
     resolve_artwork_metadata_for_path,
     resolve_artwork_metadata_with_source,
+    metadata_is_missing_or_weak,
+    title_is_sluglike_or_generic,
+    description_is_weak_fallback,
     filename_title_quality_reason,
     resolve_artwork_title,
+    discover_artworks,
     _render_listing_tags,
     preview_listing_copy,
     title_semantically_includes_product_label,
@@ -1089,6 +1093,129 @@ def test_sidecar_still_wins_over_alias_match(tmp_path: Path):
     assert resolved["title"] == "Sidecar Wolf"
     assert match["source"] == "sidecar"
 
+
+def test_inline_metadata_helpers_detect_sluglike_and_generic_fallbacks(tmp_path: Path):
+    image = tmp_path / "ai-generated-9228632.png"
+    Image.new("RGBA", (900, 900), (80, 80, 80, 255)).save(image)
+
+    weak_title, title_reasons = title_is_sluglike_or_generic("Ai Generated 9228632", artwork_path=image)
+    assert weak_title is True
+    assert "title_long_numeric_suffix" in title_reasons
+
+    weak_description, description_reasons = description_is_weak_fallback("Great gift idea.")
+    assert weak_description is True
+    assert "description_too_short" in description_reasons
+
+    is_weak, weak_reasons = metadata_is_missing_or_weak(
+        {"title": "Chicken 6600568", "description": "Great gift idea."},
+        artwork_path=image,
+        metadata_source="fallback",
+    )
+    assert is_weak is True
+    assert "title_long_numeric_suffix" in weak_reasons
+
+
+def test_inline_generation_skips_strong_sidecar_metadata(tmp_path: Path, monkeypatch):
+    image = tmp_path / "lion.png"
+    Image.new("RGBA", (1000, 1000), (0, 0, 0, 255)).save(image)
+    sidecar = image.with_suffix(".json")
+    sidecar.write_text(json.dumps({"title": "Majestic Lion Portrait", "description": "A detailed lion portrait with bold contrast."}), encoding="utf-8")
+
+    class FailIfUsed:
+        def generate_metadata_for_artwork(self, image_path: Path):
+            raise AssertionError("inline generator should not run for strong sidecar")
+
+    monkeypatch.setattr("printify_shopify_sync_pipeline.select_artwork_metadata_generator", lambda **kwargs: FailIfUsed())
+    artworks = discover_artworks(tmp_path)
+    assert artworks[0].metadata["title"] == "Majestic Lion Portrait"
+    assert artworks[0].metadata_generated_inline is False
+    assert artworks[0].metadata_resolution_source == "sidecar"
+
+
+def test_inline_generation_uses_generated_metadata_and_writes_sidecar(tmp_path: Path, monkeypatch):
+    image = tmp_path / "ai-generated-9228632.png"
+    Image.new("RGBA", (1000, 1000), (0, 0, 0, 255)).save(image)
+
+    class StubInlineGenerator:
+        name = "stub_inline"
+
+        def generate_metadata_for_artwork(self, image_path: Path):
+            return GeneratedArtworkMetadataCandidate(
+                image_path=image_path,
+                sidecar_path=image_path.with_suffix(".json"),
+                metadata=GeneratedArtworkMetadata(
+                    title="Fierce Monster Truck Jump",
+                    description="A monster truck launches over fire ramps in a dramatic stadium night scene.",
+                    tags=["monster truck", "racing"],
+                ),
+                generator="openai:openai_subject",
+                source_signals=["openai_vision_subject"],
+            )
+
+    monkeypatch.setattr("printify_shopify_sync_pipeline.select_artwork_metadata_generator", lambda **kwargs: StubInlineGenerator())
+    artworks = discover_artworks(tmp_path, metadata_inline_generator=MetadataGeneratorMode.AUTO.value)
+    assert artworks[0].title == "Fierce Monster Truck Jump"
+    assert artworks[0].metadata_generated_inline is True
+    assert artworks[0].metadata_resolution_source == "inline_openai"
+    assert artworks[0].metadata_sidecar_written is True
+    payload = json.loads(image.with_suffix(".json").read_text(encoding="utf-8"))
+    assert payload["title"] == "Fierce Monster Truck Jump"
+
+
+def test_inline_generation_does_not_overwrite_existing_sidecar_by_default(tmp_path: Path, monkeypatch):
+    image = tmp_path / "chicken-6600568.png"
+    Image.new("RGBA", (1000, 1000), (0, 0, 0, 255)).save(image)
+    sidecar = image.with_suffix(".json")
+    sidecar.write_text(json.dumps({"title": "Chicken 6600568", "description": "Great gift idea."}), encoding="utf-8")
+
+    class StubInlineGenerator:
+        name = "stub_inline"
+
+        def generate_metadata_for_artwork(self, image_path: Path):
+            return GeneratedArtworkMetadataCandidate(
+                image_path=image_path,
+                sidecar_path=image_path.with_suffix(".json"),
+                metadata=GeneratedArtworkMetadata(
+                    title="Vintage Country Chicken Portrait",
+                    description="A rustic chicken portrait with warm farm tones and playful retro character.",
+                ),
+                generator="vision:vision_subject",
+            )
+
+    monkeypatch.setattr("printify_shopify_sync_pipeline.select_artwork_metadata_generator", lambda **kwargs: StubInlineGenerator())
+    artworks = discover_artworks(tmp_path, metadata_inline_generator=MetadataGeneratorMode.AUTO.value)
+    assert artworks[0].metadata_generated_inline is True
+    assert artworks[0].metadata_sidecar_written is False
+    persisted = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert persisted["title"] == "Chicken 6600568"
+
+
+def test_inline_generation_uses_auto_generator_mode_by_default(tmp_path: Path, monkeypatch):
+    image = tmp_path / "wolf-forest.png"
+    Image.new("RGBA", (1000, 1000), (0, 0, 0, 255)).save(image)
+    captured = {}
+
+    class StubInlineGenerator:
+        def generate_metadata_for_artwork(self, image_path: Path):
+            return GeneratedArtworkMetadataCandidate(
+                image_path=image_path,
+                sidecar_path=image_path.with_suffix(".json"),
+                metadata=GeneratedArtworkMetadata(
+                    title="Golden Trail Wolf",
+                    description="A lone wolf crossing a glowing forest trail at dusk.",
+                ),
+                generator="auto:openai:vision_subject",
+            )
+
+    def _select(**kwargs):
+        captured["mode"] = kwargs.get("mode")
+        return StubInlineGenerator()
+
+    monkeypatch.setattr("printify_shopify_sync_pipeline.select_artwork_metadata_generator", _select)
+    artworks = discover_artworks(tmp_path)
+    assert artworks[0].metadata_generated_inline is True
+    assert artworks[0].title == "Golden Trail Wolf"
+    assert captured["mode"] == MetadataGeneratorMode.AUTO.value
 
 def test_uuid_noisy_filename_detection():
     assert filename_title_quality_reason("8f6f45d4-c95f-4f68-9cf9-f022f5197a18") == "uuid_like"
