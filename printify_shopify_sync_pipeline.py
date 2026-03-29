@@ -616,6 +616,70 @@ def choose_preferred_featured_variant_color(*, template: ProductTemplate, varian
     return available_colors[0]
 
 
+def choose_preferred_featured_mockup_candidate(
+    *,
+    template: ProductTemplate,
+    variant_rows: List[Dict[str, Any]],
+    product_images: List[Dict[str, Any]],
+) -> Dict[str, str]:
+    preferred_color = choose_preferred_featured_variant_color(template=template, variant_rows=variant_rows)
+    preferred_types = [_normalize_color_name(v) for v in (template.preferred_mockup_types or []) if str(v).strip()]
+    preferred_position = _normalize_color_name(template.preferred_mockup_position or "")
+    variant_id_to_color: Dict[str, str] = {}
+    for variant in variant_rows:
+        vid = str(variant.get("id") or "").strip()
+        color = _variant_option_value(variant, "color")
+        if vid and color:
+            variant_id_to_color[vid] = color
+
+    scored_rows: List[Tuple[Tuple[int, int, int, int, int], Dict[str, str]]] = []
+    for idx, image in enumerate(product_images):
+        if not isinstance(image, dict):
+            continue
+        image_type = str(image.get("type") or image.get("image_type") or image.get("mockup_type") or "").strip()
+        image_position = str(image.get("position_name") or image.get("position") or image.get("view") or "").strip()
+        src = str(image.get("src") or image.get("preview_url") or image.get("url") or "").strip()
+        image_variant_ids = image.get("variant_ids") if isinstance(image.get("variant_ids"), list) else []
+        color = ""
+        for vid in image_variant_ids:
+            resolved = variant_id_to_color.get(str(vid))
+            if resolved:
+                color = resolved
+                break
+        type_rank = preferred_types.index(_normalize_color_name(image_type)) if _normalize_color_name(image_type) in preferred_types else len(preferred_types)
+        color_rank = 1
+        if preferred_color and color and _normalize_color_name(color) == _normalize_color_name(preferred_color):
+            color_rank = 0
+        if not preferred_color:
+            color_rank = 0
+        position_rank = 1
+        if preferred_position and image_position and _normalize_color_name(image_position) == preferred_position:
+            position_rank = 0
+        default_rank = 0 if bool(image.get("is_default")) else 1
+        score = (color_rank, type_rank, position_rank, default_rank, idx)
+        scored_rows.append(
+            (
+                score,
+                {
+                    "selected_featured_mockup_color": color,
+                    "selected_featured_mockup_type": image_type,
+                    "selected_featured_mockup_position": image_position,
+                    "selected_featured_mockup_src": src,
+                },
+            )
+        )
+
+    if not scored_rows:
+        return {
+            "selected_featured_mockup_color": "",
+            "selected_featured_mockup_type": "",
+            "selected_featured_mockup_position": "",
+            "selected_featured_mockup_src": "",
+        }
+    scored_rows.sort(key=lambda row: row[0])
+    return scored_rows[0][1]
+
+
 def _semantic_product_tokens(value: str) -> set[str]:
     normalized = re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
     words = [w for w in normalized.split() if w]
@@ -1291,10 +1355,10 @@ def template_blueprint_type_warning(*, template: ProductTemplate, blueprint_titl
         lowered = text.lower()
         if any(token in lowered for token in ("mug", "cup")):
             return "mug"
-        if any(token in lowered for token in ("tee", "t-shirt", "shirt")):
-            return "shirt"
         if any(token in lowered for token in ("hoodie", "sweatshirt", "crewneck")):
             return "sweatshirt"
+        if any(token in lowered for token in ("tee", "t-shirt", "shirt")):
+            return "shirt"
         return None
 
     template_hint = " ".join(
@@ -1847,13 +1911,13 @@ def compute_placement_transform_for_artwork(
         )
     elif template_key == "tote_basic":
         tote_orientation_scale = {
-            "portrait": 0.82,
-            "square": 0.8,
-            "landscape": 0.78,
+            "portrait": 0.84,
+            "square": 0.82,
+            "landscape": 0.79,
         }
         scale = max(scale, tote_orientation_scale.get(orientation, scale))
         logger.info(
-            "Tote transform strategy template=%s placement=%s orientation=%s strategy=front_fill_boost scale=%.3f",
+            "Tote transform strategy template=%s placement=%s orientation=%s strategy=front_fill_boost_orientation_tuned scale=%.3f",
             template_key,
             placement.placement_name,
             orientation,
@@ -5112,6 +5176,21 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
             chosen_collection_handle = collection_handle.strip() or family_collection_handle
             chosen_collection_title = collection_title.strip() or family_collection_title
             preferred_featured_variant_color = choose_preferred_featured_variant_color(template=resolved_template, variant_rows=variant_rows)
+            verified_product = printify_result.get("verified_product", {}) if isinstance(printify_result.get("verified_product"), dict) else {}
+            preferred_featured_candidate = choose_preferred_featured_mockup_candidate(
+                template=resolved_template,
+                variant_rows=variant_rows,
+                product_images=verified_product.get("images", []) if isinstance(verified_product.get("images"), list) else [],
+            )
+            logger.info(
+                "Featured mockup preference template=%s preferred_color=%s selected_color=%s selected_type=%s selected_position=%s source=%s",
+                resolved_template.key,
+                preferred_featured_variant_color or "-",
+                preferred_featured_candidate.get("selected_featured_mockup_color", "") or "-",
+                preferred_featured_candidate.get("selected_featured_mockup_type", "") or "-",
+                preferred_featured_candidate.get("selected_featured_mockup_position", "") or "-",
+                "verified_product_image_preference" if preferred_featured_candidate.get("selected_featured_mockup_src") else "fallback_recommendation",
+            )
             collection_result = {
                 "collection_sync_attempted": False,
                 "collection_sync_status": "skipped_disabled",
@@ -5147,14 +5226,6 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     allowed_family_collection_handles=[cfg.get("handle", "") for cfg in FAMILY_COLLECTION_RULES.values()],
                     collection_sort_order=collection_sort_order,
                     collection_image_src=collection_image_src,
-                )
-            elif chosen_collection_handle.strip() or chosen_collection_title.strip():
-                collection_result["collection_warning"] = "Collection sync disabled (use --sync-collections)"
-                logger.info(
-                    "Collection sync skipped by CLI setting artwork=%s template=%s row_id=%s",
-                    artwork.slug,
-                    template.key,
-                    launch_plan_row_id or "-",
                 )
             result["collection"] = collection_result
             verification = printify_result.get("verification", {}) if isinstance(printify_result.get("verification"), dict) else {}
@@ -5192,10 +5263,10 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 "collection_image_source": str(collection_result.get("collection_image_source") or collection_image_src),
                 "collection_sort_strategy": str(collection_result.get("collection_sort_strategy") or collection_sort_order),
                 "preferred_featured_variant_color": preferred_featured_variant_color,
-                "selected_featured_mockup_color": preferred_featured_variant_color,
+                "selected_featured_mockup_color": preferred_featured_candidate.get("selected_featured_mockup_color", ""),
                 "featured_image_strategy": resolved_template.preferred_featured_image_strategy,
-                "featured_image_source": "printify_mockup_recommendation",
-                "tote_scale_strategy": "tuned_fill_0.82" if resolved_template.key == "tote_basic" else "",
+                "featured_image_source": "verified_product_image_preference" if preferred_featured_candidate.get("selected_featured_mockup_src") else "printify_mockup_recommendation",
+                "tote_scale_strategy": "front_fill_boost_orientation_tuned" if resolved_template.key == "tote_basic" else "",
                 "result": result,
                 "dry_run": bool(printify.dry_run),
                 "completion_status": "dry-run-only" if printify.dry_run else "real-completed",
@@ -5261,10 +5332,10 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     collection_image_source=str(collection_result.get("collection_image_source") or collection_image_src),
                     collection_sort_strategy=str(collection_result.get("collection_sort_strategy") or collection_sort_order),
                     preferred_featured_variant_color=preferred_featured_variant_color,
-                    selected_featured_mockup_color=preferred_featured_variant_color,
+                    selected_featured_mockup_color=preferred_featured_candidate.get("selected_featured_mockup_color", ""),
                     featured_image_strategy=resolved_template.preferred_featured_image_strategy,
-                    featured_image_source="printify_mockup_recommendation",
-                    tote_scale_strategy="tuned_fill_0.82" if resolved_template.key == "tote_basic" else "",
+                    featured_image_source="verified_product_image_preference" if preferred_featured_candidate.get("selected_featured_mockup_src") else "printify_mockup_recommendation",
+                    tote_scale_strategy="front_fill_boost_orientation_tuned" if resolved_template.key == "tote_basic" else "",
                 ))
             if summary is not None:
                 printify_action = (result.get("printify", {}) or {}).get("action", action)

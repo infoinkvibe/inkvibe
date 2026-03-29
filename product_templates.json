@@ -77,6 +77,7 @@
       "Dark Heather",
       "Black",
       "Navy",
+      "Charcoal",
       "Sport Grey",
       "White"
     ],
@@ -303,7 +304,8 @@
     ],
     "preferred_default_variant_color": "White",
     "preferred_mockup_types": [
-      "studio"
+      "studio",
+      "lifestyle"
     ],
     "preferred_featured_image_strategy": "variant_color_then_mockup_type"
   },
@@ -354,9 +356,10 @@
     "preferred_mockup_colors": [],
     "preferred_mockup_types": [
       "lifestyle",
-      "wall-art"
+      "wall-art",
+      "front"
     ],
-    "preferred_featured_image_strategy": "variant_color_then_mockup_type"
+    "preferred_featured_image_strategy": "mockup_type_then_variant_color"
   },
   {
     "key": "sweatshirt_gildan",
@@ -492,8 +495,9 @@
     ],
     "preferred_default_variant_color": "Natural",
     "preferred_mockup_types": [
-      "lifestyle",
-      "product"
+      "front",
+      "product",
+      "lifestyle"
     ],
     "preferred_featured_image_strategy": "variant_color_then_mockup_type",
     "preferred_mockup_position": "front"
