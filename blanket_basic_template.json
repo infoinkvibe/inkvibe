@@ -1,0 +1,61 @@
+{
+  "key": "blanket_basic",
+  "printify_blueprint_id": 50,
+  "printify_print_provider_id": 1,
+  "provider_selection_strategy": "prefer_printify_choice_then_ranked",
+  "fallback_provider_allowed": true,
+  "active": true,
+  "title_pattern": "{artwork_title} Blanket",
+  "description_pattern": "<p>{generated_description}</p>",
+  "enabled_colors": [],
+  "enabled_sizes": [
+    "50\" \u00d7 60\"",
+    "60\" \u00d7 80\""
+  ],
+  "max_enabled_variants": 6,
+  "tags": [
+    "blanket",
+    "home comfort"
+  ],
+  "seo_keywords": [
+    "throw blanket",
+    "cozy home gift"
+  ],
+  "audience": "home decor shoppers",
+  "product_type_label": "Blanket",
+  "style_keywords": [
+    "cozy",
+    "giftable"
+  ],
+  "shopify_product_type": "Home Decor",
+  "publish_to_shopify": false,
+  "push_via_printify": true,
+  "publish_after_create": true,
+  "publish_title": true,
+  "publish_description": true,
+  "publish_images": true,
+  "publish_variants": true,
+  "publish_tags": true,
+  "default_price": "44.99",
+  "base_price": "35.99",
+  "markup_type": "fixed",
+  "markup_value": "9.00",
+  "rounding_mode": "x_99",
+  "compare_at_price": "59.99",
+  "placements": [
+    {
+      "placement_name": "front",
+      "width_px": 6000,
+      "height_px": 4800,
+      "file_type": "png",
+      "allow_upscale": false,
+      "artwork_fit_mode": "cover"
+    }
+  ],
+  "min_margin_after_shipping": "6.00",
+  "target_margin_after_shipping": "9.00",
+  "shipping_basis_for_margin": "cost",
+  "disable_variants_below_margin_floor": true,
+  "reprice_variants_to_margin_floor": true,
+  "mark_template_nonviable_if_needed": true
+}

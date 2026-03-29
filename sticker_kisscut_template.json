@@ -1,0 +1,62 @@
+{
+  "key": "sticker_kisscut",
+  "printify_blueprint_id": 783,
+  "printify_print_provider_id": 1,
+  "provider_selection_strategy": "prefer_printify_choice_then_ranked",
+  "fallback_provider_allowed": true,
+  "active": true,
+  "title_pattern": "{artwork_title} Kiss-Cut Sticker",
+  "description_pattern": "<p>{generated_description}</p>",
+  "enabled_colors": [
+    "White"
+  ],
+  "enabled_sizes": [
+    "3\" \u00d7 3\""
+  ],
+  "max_enabled_variants": 4,
+  "tags": [
+    "sticker",
+    "kiss-cut"
+  ],
+  "seo_keywords": [
+    "vinyl sticker",
+    "laptop sticker"
+  ],
+  "audience": "sticker collectors",
+  "product_type_label": "Kiss-Cut Sticker",
+  "style_keywords": [
+    "bold",
+    "giftable"
+  ],
+  "shopify_product_type": "Accessories",
+  "publish_to_shopify": false,
+  "push_via_printify": true,
+  "publish_after_create": true,
+  "publish_title": true,
+  "publish_description": true,
+  "publish_images": true,
+  "publish_variants": true,
+  "publish_tags": true,
+  "default_price": "5.99",
+  "base_price": "2.99",
+  "markup_type": "fixed",
+  "markup_value": "3.00",
+  "rounding_mode": "x_99",
+  "compare_at_price": "7.99",
+  "placements": [
+    {
+      "placement_name": "front",
+      "width_px": 3000,
+      "height_px": 3000,
+      "file_type": "png",
+      "allow_upscale": false,
+      "artwork_fit_mode": "contain"
+    }
+  ],
+  "min_margin_after_shipping": "2.00",
+  "target_margin_after_shipping": "3.00",
+  "shipping_basis_for_margin": "cost",
+  "disable_variants_below_margin_floor": true,
+  "reprice_variants_to_margin_floor": true,
+  "mark_template_nonviable_if_needed": true
+}
