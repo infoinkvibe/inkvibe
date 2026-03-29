@@ -100,6 +100,7 @@ from printify_shopify_sync_pipeline import (
     extract_theme_signal_candidates,
     choose_best_theme_signal,
     choose_preferred_featured_variant_color,
+    choose_preferred_featured_mockup_candidate,
     resolve_family_collection_target,
 )
 from artwork_metadata_generator import (
@@ -3793,6 +3794,94 @@ def test_preferred_mockup_color_selection_falls_back_when_preferred_missing():
     )
     variants = [{"options": {"color": "White"}}]
     assert choose_preferred_featured_variant_color(template=template, variant_rows=variants) == "White"
+
+
+def test_preferred_featured_mockup_candidate_uses_preferred_color_and_type_when_available():
+    template = ProductTemplate(
+        key="hoodie_gildan",
+        printify_blueprint_id=77,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="<p>{artwork_title}</p>",
+        placements=[PlacementRequirement("front", 100, 100)],
+        preferred_mockup_colors=["Dark Heather", "White"],
+        preferred_default_variant_color="Dark Heather",
+        preferred_mockup_types=["lifestyle", "flat"],
+    )
+    variants = [
+        {"id": 101, "options": {"color": "White"}},
+        {"id": 202, "options": {"color": "Dark Heather"}},
+    ]
+    candidate = choose_preferred_featured_mockup_candidate(
+        template=template,
+        variant_rows=variants,
+        product_images=[
+            {"src": "https://example.com/white-flat.png", "type": "flat", "variant_ids": [101]},
+            {"src": "https://example.com/heather-life.png", "type": "lifestyle", "variant_ids": [202]},
+        ],
+    )
+    assert candidate["selected_featured_mockup_color"] == "Dark Heather"
+    assert candidate["selected_featured_mockup_type"] == "lifestyle"
+
+
+def test_preferred_featured_mockup_candidate_falls_back_when_preferred_color_missing():
+    template = ProductTemplate(
+        key="tshirt_gildan",
+        printify_blueprint_id=6,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="<p>{artwork_title}</p>",
+        placements=[PlacementRequirement("front", 100, 100)],
+        preferred_mockup_colors=["Black"],
+        preferred_mockup_types=["lifestyle", "flat"],
+    )
+    variants = [{"id": 101, "options": {"color": "White"}}]
+    candidate = choose_preferred_featured_mockup_candidate(
+        template=template,
+        variant_rows=variants,
+        product_images=[
+            {"src": "https://example.com/white-flat.png", "type": "flat", "variant_ids": [101]},
+        ],
+    )
+    assert candidate["selected_featured_mockup_color"] == "White"
+    assert candidate["selected_featured_mockup_type"] == "flat"
+
+
+def test_tote_orientation_tuning_is_conservative_and_front_safe(tmp_path: Path):
+    artwork_portrait = _create_artwork(tmp_path, 1200, 1800)
+    artwork_square = _create_artwork(tmp_path, 1400, 1400)
+    placement = PlacementRequirement("front", 1000, 1000, placement_scale=0.78)
+    portrait = compute_placement_transform_for_artwork(placement, artwork_portrait, "tote_basic")
+    square = compute_placement_transform_for_artwork(placement, artwork_square, "tote_basic")
+    assert portrait.scale == pytest.approx(0.84)
+    assert square.scale == pytest.approx(0.82)
+    assert portrait.scale <= 1.0 and square.scale <= 1.0
+
+
+def test_template_blueprint_type_warning_does_not_false_positive_hoodie_with_shirt_word():
+    template = ProductTemplate(
+        key="hoodie_gildan",
+        printify_blueprint_id=77,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        product_type_label="Hoodie",
+    )
+    warning = template_blueprint_type_warning(template=template, blueprint_title="Unisex Hoodie Shirt")
+    assert warning is None
+
+
+def test_readme_default_recommended_command_omits_collection_sync_flags():
+    readme = Path("README.md").read_text()
+    marker = "Run a 3-image all-family batch (recommended default path):"
+    assert marker in readme
+    section = readme.split(marker, 1)[1].split("Current supported template families include:", 1)[0]
+    assert "--local-image-batch 3" in section
+    assert "--publish" in section
+    assert "--verify-publish" in section
+    assert "--sync-collections" not in section
+    assert "--verify-collections" not in section
+    assert "--enforce-family-collection-membership" not in section
 
 
 def test_process_artwork_collection_sync_fields_in_run_report(tmp_path: Path, monkeypatch):

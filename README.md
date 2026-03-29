@@ -111,16 +111,13 @@ Run storefront QA from local images only:
 python printify_shopify_sync_pipeline.py --local-image-batch 3 --storefront-qa --export-storefront-qa-report ./exports/storefront_qa_local.csv
 ```
 
-Run a 3-image all-family batch with collection sync + family enforcement:
+Run a 3-image all-family batch (recommended default path):
 
 ```bash
 python printify_shopify_sync_pipeline.py \
   --local-image-batch 3 \
   --publish \
   --verify-publish \
-  --sync-collections \
-  --enforce-family-collection-membership \
-  --collection-removal-mode conservative \
   --export-run-report ./exports/run_report_local3.csv
 ```
 
@@ -135,10 +132,12 @@ Current supported template families include:
 
 ### Storefront merchandising controls
 
-- **Strict family collections:** family routing is deterministic (`tshirt_gildan -> t-shirts`, `sweatshirt_gildan -> sweatshirts`, etc.) and can be enforced via `--enforce-family-collection-membership`.
+- **Smart collections by tags (default):** normal runs assume Shopify smart collections are managed from product tags (for example `tshirt`, `hoodie`, `poster`) rather than API-managed collection membership.
+- **Optional advanced collection sync:** API collection sync remains available via `--sync-collections` when explicitly requested for manual/custom collection workflows.
 - **Collection visuals:** launch-plan rows can now include `collection_image_src` and `collection_sort_order` so collection tiles/sorting are intentionally merchandised.
-- **Default mockup diversity:** templates now support `preferred_mockup_colors`, `preferred_default_variant_color`, `preferred_mockup_types`, and `preferred_featured_image_strategy` to avoid white-dominant defaults when alternatives exist.
-- **Tote merchandising:** tote front remains primary/front-only while a modest tote front fill boost is applied for stronger collection-card presence.
+- **Default mockup diversity:** templates support deterministic `preferred_mockup_colors`, `preferred_default_variant_color`, `preferred_mockup_types`, and `preferred_featured_image_strategy` so non-white apparel mockups are favored when available.
+- **Tote merchandising:** tote front remains primary/front-only with conservative orientation-aware fill tuning (portrait/square/landscape) for stronger card presentation without clipping.
+- **Poster merchandising:** poster safety tiers remain bounded while featured mockup preference favors stronger centered/lifestyle poster views when available.
 
 ## Catalog exploration workflows
 
@@ -689,7 +688,7 @@ python printify_ui_automation.py \
 
 Run report rows now include launch-plan row context (`launch_plan_row`, `launch_plan_row_id`) for successful rows and can also carry optional collection metadata columns (`collection_handle`, `collection_title`, `collection_description`, `launch_name`, `campaign`, `merch_theme`) when provided in launch-plan CSV mode.
 
-Collection sync is optional and explicit:
+Collection sync is optional and explicit (advanced/manual path):
 
 - `--sync-collections`: enable Shopify custom/manual collection resolve/create/update + product membership attach for launch-plan rows that include collection metadata.
 - `--skip-collections`: explicitly disable collection sync even if `--sync-collections` is present.
@@ -697,7 +696,13 @@ Collection sync is optional and explicit:
 
 Collection behavior is idempotent by design: handle-first resolution (title fallback), reuse existing collections on reruns, and no-op membership checks before creating a collect row.
 
-Example:
+Default recommended workflow (no collection sync):
+
+```bash
+python printify_shopify_sync_pipeline.py --local-image-batch 3 --publish --verify-publish
+```
+
+Optional collection-sync example:
 
 ```bash
 python printify_shopify_sync_pipeline.py \
