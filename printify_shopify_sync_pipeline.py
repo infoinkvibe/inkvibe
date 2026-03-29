@@ -122,6 +122,27 @@ class NonRetryableRequestError(RuntimeError):
     pass
 
 
+class InsufficientArtworkResolutionError(ValueError):
+    def __init__(
+        self,
+        *,
+        template_key: str,
+        placement_name: str,
+        source_size: Tuple[int, int],
+        required_size: Tuple[int, int],
+        fit_mode: str,
+    ):
+        super().__init__(
+            f"image too small ({source_size[0]}x{source_size[1]}) for "
+            f"placement {placement_name} ({required_size[0]}x{required_size[1]})"
+        )
+        self.template_key = template_key
+        self.placement_name = placement_name
+        self.source_size = source_size
+        self.required_size = required_size
+        self.fit_mode = fit_mode
+
+
 class RetryLimitExceededError(RuntimeError):
     def __init__(self, *, method: str, path: str, policy_bucket: str, status_code: int, attempts: int, reason_code: str):
         super().__init__(
@@ -276,6 +297,8 @@ class CatalogFamilyValidationResult:
 def classify_failure(exc: Exception) -> str:
     if isinstance(exc, RetryLimitExceededError):
         return exc.reason_code
+    if isinstance(exc, InsufficientArtworkResolutionError):
+        return "insufficient_artwork_resolution"
     if isinstance(exc, TemplateValidationError):
         return "invalid_template_config"
     if isinstance(exc, TemplateSkipGuardrail):
@@ -3682,6 +3705,32 @@ def _choose_phone_model_fallback_values(available_values: List[str], *, limit: i
     return pool[: max(1, min(limit, len(pool)))]
 
 
+def _extract_size_tokens(value: str) -> List[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+    normalized = raw.lower()
+    normalized = normalized.replace("″", '"').replace("“", '"').replace("”", '"').replace("′", "'")
+    normalized = normalized.replace("×", "x")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    tokens: List[str] = []
+    fallback = _canonical_option_token(normalized)
+    if fallback:
+        tokens.append(fallback)
+    match = re.search(r"(\d{1,3}(?:\.\d+)?)\s*(?:\"|in|inch|inches)?\s*x\s*(\d{1,3}(?:\.\d+)?)", normalized)
+    if not match:
+        return tokens
+    width = match.group(1).rstrip("0").rstrip(".")
+    height = match.group(2).rstrip("0").rstrip(".")
+    orientation_match = re.search(r"\((vertical|horizontal)\)", normalized)
+    orientation = orientation_match.group(1) if orientation_match else ""
+    base = f"{width}x{height}"
+    tokens.append(base)
+    if orientation:
+        tokens.append(f"{base}:{orientation}")
+    return list(dict.fromkeys(tokens))
+
+
 def _canonical_variant_options(variant: Dict[str, Any]) -> Dict[str, str]:
     options = variant.get("options") or {}
     normalized: Dict[str, str] = {}
@@ -3793,6 +3842,10 @@ def _analyze_variant_filtering(catalog_variants: List[Dict[str, Any]], template:
             if str(value).strip()
         ]
         available_value_map = {_canonical_option_token(value): value for value in available_values}
+        if _canonical_option_token(requested_key) == "size":
+            for value in available_values:
+                for token in _extract_size_tokens(value):
+                    available_value_map.setdefault(token, value)
         if _canonical_option_token(requested_key) == "model":
             diagnostics.resolved_model_dimension = schema_names.get(resolved_schema_key, resolved_schema_key)
             for value in available_values:
@@ -3803,7 +3856,10 @@ def _analyze_variant_filtering(catalog_variants: List[Dict[str, Any]], template:
         missing_values: List[str] = []
         for requested_value in requested_values:
             canonical_value = _canonical_option_token(requested_value)
-            matched_value = available_value_map.get(canonical_value)
+            candidate_tokens = [canonical_value]
+            if _canonical_option_token(requested_key) == "size":
+                candidate_tokens = _extract_size_tokens(requested_value) or [canonical_value]
+            matched_value = next((available_value_map.get(token) for token in candidate_tokens if token), None)
             if matched_value is None and _canonical_option_token(requested_key) == "model":
                 matched_value = available_value_map.get(_canonical_phone_model_token(requested_value))
             if matched_value:
@@ -3843,6 +3899,23 @@ def _analyze_variant_filtering(catalog_variants: List[Dict[str, Any]], template:
         diagnostics.zero_selection_reason = "No available variants remained after filters."
 
     return [variant for variant, _ in filtered_rows], diagnostics
+
+
+def _classify_zero_selection(template: ProductTemplate, diagnostics: VariantFilterDiagnostics, *, intended_family: str = "") -> str:
+    family = intended_family or _template_intended_family(template)
+    if family != "canvas":
+        return "zero_variants_selected"
+    for row in diagnostics.filter_counts:
+        dimension = _canonical_option_token(str(row.get("dimension", "")))
+        if dimension != "size":
+            continue
+        before = int(row.get("before", 0) or 0)
+        after = int(row.get("after", 0) or 0)
+        matched = row.get("matched_values") or []
+        missing = row.get("missing_values") or []
+        if before > 0 and after == 0 and missing and not matched:
+            return "canvas_size_filter_mismatch"
+    return "zero_variants_selected"
 
 
 def _shopify_money_string_from_minor(minor_units: int) -> str:
@@ -4818,9 +4891,12 @@ def resolve_artwork_for_placement(
             required_size[0],
             required_size[1],
         )
-        raise ValueError(
-            f"image too small ({original_size[0]}x{original_size[1]}) for "
-            f"placement {placement.placement_name} ({required_size[0]}x{required_size[1]})"
+        raise InsufficientArtworkResolutionError(
+            template_key=template_key,
+            placement_name=placement.placement_name,
+            source_size=original_size,
+            required_size=required_size,
+            fit_mode=fit_mode,
         )
 
     if fit_mode == "cover":
@@ -5450,6 +5526,8 @@ def _preflight_template(
             return "fix_blueprint_mapping"
         if classification == "zero_variants_selected":
             return "deactivate_pending_validation"
+        if classification == "canvas_size_filter_mismatch":
+            return "adjust_size_curation"
         return "deactivate_pending_validation"
 
     def _failure(
@@ -5591,6 +5669,11 @@ def _preflight_template(
 
         selected, option_diagnostics = _analyze_variant_filtering(normalized_variants, resolved_template)
         if not selected:
+            zero_classification = _classify_zero_selection(
+                resolved_template,
+                option_diagnostics,
+                intended_family=family_validation.intended_family,
+            )
             diagnostic_message = (
                 "Curated option filters selected zero variants. "
                 f"blueprint_id={blueprint_id} provider_id={provider_id} "
@@ -5601,7 +5684,7 @@ def _preflight_template(
                 f"reason={option_diagnostics.zero_selection_reason or 'no_intersection'}"
             )
             return _failure(
-                "zero_variants_selected",
+                zero_classification,
                 diagnostic_message,
                 option_diagnostics=option_diagnostics,
                 intended_family=family_validation.intended_family,
@@ -7046,6 +7129,11 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 continue
             variant_rows, variant_diagnostics = choose_variants_from_catalog_with_diagnostics(normalized_catalog_variants, resolved_template)
             if not variant_rows:
+                zero_classification = _classify_zero_selection(
+                    resolved_template,
+                    variant_diagnostics,
+                    intended_family=family_validation.intended_family,
+                )
                 runtime_diag = RuntimeSkipDiagnostics(
                     template_key=template.key,
                     blueprint_id=resolved_template.printify_blueprint_id,
@@ -7069,7 +7157,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     summary.products_skipped += 1
                 result = {
                     "status": "no_matching_variants",
-                    "failure_classification": "zero_variants_selected",
+                    "failure_classification": zero_classification,
                     "runtime_skip_reason_code": runtime_diag.final_reason_code,
                     "runtime_skip_diagnostics": asdict(runtime_diag),
                 }
@@ -7081,6 +7169,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
 
             prepared_assets: List[PreparedArtwork] = []
             skipped_placements: List[str] = []
+            insufficient_artwork_error: Optional[InsufficientArtworkResolutionError] = None
             resolved_placements = _resolve_template_placements(resolved_template, for_publish=True) or list(resolved_template.placements)
             if resolved_template.key == "tote_basic":
                 tote_primary_placement_report = str(resolved_template.preferred_primary_placement or "")
@@ -7093,11 +7182,64 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     resolved_template.publish_only_primary_placement,
                 )
             for placement in resolved_placements:
-                prepared = prepare_artwork_export(artwork, resolved_template, placement, export_dir, artwork_options)
+                try:
+                    prepared = prepare_artwork_export(artwork, resolved_template, placement, export_dir, artwork_options)
+                except InsufficientArtworkResolutionError as exc:
+                    insufficient_artwork_error = exc
+                    break
                 if prepared is None:
                     skipped_placements.append(placement.placement_name)
                     continue
                 prepared_assets.append(prepared)
+
+            if insufficient_artwork_error is not None:
+                runtime_diag = RuntimeSkipDiagnostics(
+                    template_key=template.key,
+                    blueprint_id=resolved_template.printify_blueprint_id,
+                    provider_id=resolved_template.printify_print_provider_id,
+                    selected_count=len(variant_rows),
+                    final_enabled_count=len(variant_rows),
+                    available_placements=[p.placement_name for p in resolved_placements],
+                    required_placement_name=insufficient_artwork_error.placement_name,
+                    final_reason_code="insufficient_artwork_resolution",
+                    payload_build_skip_reason=(
+                        f"source={insufficient_artwork_error.source_size[0]}x{insufficient_artwork_error.source_size[1]} "
+                        f"required={insufficient_artwork_error.required_size[0]}x{insufficient_artwork_error.required_size[1]} "
+                        f"fit_mode={insufficient_artwork_error.fit_mode}"
+                    ),
+                    resolved_option_dimensions={"model": variant_diagnostics.resolved_model_dimension},
+                    resolved_model_list=list(variant_diagnostics.final_selected_models),
+                )
+                runtime_diag.print_area_available = bool(runtime_diag.required_placement_name)
+                log_runtime_skip_diagnostics(runtime_diag)
+                all_templates_successful = False
+                if summary is not None:
+                    summary.products_skipped += 1
+                result = {
+                    "status": "insufficient_artwork_resolution",
+                    "failure_classification": "insufficient_artwork_resolution",
+                    "runtime_skip_reason_code": runtime_diag.final_reason_code,
+                    "runtime_skip_diagnostics": asdict(runtime_diag),
+                    "required_size": f"{insufficient_artwork_error.required_size[0]}x{insufficient_artwork_error.required_size[1]}",
+                    "source_size": f"{insufficient_artwork_error.source_size[0]}x{insufficient_artwork_error.source_size[1]}",
+                }
+                record["products"].append({
+                    "template": template.key,
+                    "state_key": state_key,
+                    "last_action": "skip",
+                    "publish_attempted": False,
+                    "publish_verified": False,
+                    "last_verified_at": None,
+                    "verified_title": None,
+                    "verified_variant_count": None,
+                    "title_source": title_info.title_source,
+                    "rendered_title": rendered_title,
+                    "result": result,
+                })
+                if run_rows is not None:
+                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, f"{insufficient_artwork_error.source_size[0]}x{insufficient_artwork_error.source_size[1]}", "", "", "", "", "", "", "", False, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
+                log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action="skip", upload_map=upload_map)
+                continue
 
             if prepared_assets:
                 first_prepared = prepared_assets[0]
