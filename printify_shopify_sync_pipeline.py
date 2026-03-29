@@ -126,6 +126,29 @@ class TemplatePreflightIssue:
     classification: str
     message: str
     requested_explicitly: bool = False
+    blueprint_id: int = 0
+    provider_id: int = 0
+    selected_count: int = 0
+    repriced_count: int = 0
+    disabled_count_after_reprice: int = 0
+    final_enabled_count: int = 0
+    recommended_action: str = "deactivate_pending_validation"
+
+
+@dataclass
+class TemplatePreflightReportRow:
+    template_key: str
+    requested_explicitly: bool
+    preflight_status: str
+    classification: str
+    message: str
+    blueprint_id: int
+    provider_id: int
+    selected_count: int
+    repriced_count: int
+    disabled_count_after_reprice: int
+    final_enabled_count: int
+    recommended_action: str
 
 
 def classify_failure(exc: Exception) -> str:
@@ -2168,6 +2191,10 @@ def write_csv_report(path: pathlib.Path, rows: List[Dict[str, Any]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=headers)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def export_preflight_report(path: pathlib.Path, rows: List[TemplatePreflightReportRow]) -> None:
+    write_csv_report(path, [row.__dict__ for row in rows])
 
 
 def _is_truthy_csv(value: str) -> bool:
@@ -4498,51 +4525,107 @@ def _preflight_template(
     printify: PrintifyClient,
     template: ProductTemplate,
     blueprint_ids: set[int],
-) -> Optional[TemplatePreflightIssue]:
+) -> Tuple[Optional[TemplatePreflightIssue], TemplatePreflightReportRow]:
+    resolved_template = select_provider_for_template(printify=printify, template=template)
+    blueprint_id = int(resolved_template.printify_blueprint_id)
+    provider_id = int(resolved_template.printify_print_provider_id)
+
+    def _recommended_action_for(classification: str) -> str:
+        if classification == "zero_enabled_after_guardrails":
+            return "fix_pricing"
+        if classification == "invalid_template_config":
+            return "fix_blueprint_mapping" if blueprint_id <= 0 or blueprint_id not in blueprint_ids else "fix_provider_selection"
+        if classification == "zero_variants_selected":
+            return "deactivate_pending_validation"
+        return "deactivate_pending_validation"
+
+    def _failure(
+        classification: str,
+        message: str,
+        *,
+        selected_count: int = 0,
+        repriced_count: int = 0,
+        disabled_count_after_reprice: int = 0,
+        final_enabled_count: int = 0,
+    ) -> Tuple[TemplatePreflightIssue, TemplatePreflightReportRow]:
+        issue = TemplatePreflightIssue(
+            template_key=template.key,
+            classification=classification,
+            message=message,
+            blueprint_id=blueprint_id,
+            provider_id=provider_id,
+            selected_count=selected_count,
+            repriced_count=repriced_count,
+            disabled_count_after_reprice=disabled_count_after_reprice,
+            final_enabled_count=final_enabled_count,
+            recommended_action=_recommended_action_for(classification),
+        )
+        row = TemplatePreflightReportRow(
+            template_key=template.key,
+            requested_explicitly=False,
+            preflight_status="failed",
+            classification=classification,
+            message=message,
+            blueprint_id=blueprint_id,
+            provider_id=provider_id,
+            selected_count=selected_count,
+            repriced_count=repriced_count,
+            disabled_count_after_reprice=disabled_count_after_reprice,
+            final_enabled_count=final_enabled_count,
+            recommended_action=issue.recommended_action,
+        )
+        return issue, row
+
     try:
-        if template.printify_blueprint_id not in blueprint_ids:
-            return TemplatePreflightIssue(
-                template_key=template.key,
-                classification="invalid_template_config",
-                message=f"Blueprint {template.printify_blueprint_id} is not available.",
-            )
-        providers = printify.list_print_providers(template.printify_blueprint_id)
+        if blueprint_id not in blueprint_ids:
+            return _failure("invalid_template_config", f"Blueprint {blueprint_id} is not available.")
+        providers = printify.list_print_providers(blueprint_id)
         provider_ids = {int(provider.get("id", 0)) for provider in providers}
-        if int(template.printify_print_provider_id) not in provider_ids:
-            return TemplatePreflightIssue(
-                template_key=template.key,
-                classification="invalid_template_config",
-                message=(
-                    f"Provider {template.printify_print_provider_id} is not available for blueprint "
-                    f"{template.printify_blueprint_id}."
-                ),
+        if provider_id not in provider_ids:
+            return _failure(
+                "invalid_template_config",
+                f"Provider {provider_id} is not available for blueprint {blueprint_id}.",
             )
-        variants = printify.list_variants(template.printify_blueprint_id, template.printify_print_provider_id)
-        selected = choose_variants_from_catalog(variants, template)
+        variants = printify.list_variants(blueprint_id, provider_id)
+        selected = choose_variants_from_catalog(variants, resolved_template)
         if not selected:
-            return TemplatePreflightIssue(
-                template_key=template.key,
-                classification="zero_variants_selected",
-                message="Curated option filters selected zero variants.",
-            )
-        guarded, report = apply_variant_margin_guardrails(template, selected)
+            return _failure("zero_variants_selected", "Curated option filters selected zero variants.")
+        guarded, report = apply_variant_margin_guardrails(resolved_template, selected)
+        selected_count = int(report.get("selected_count", 0))
+        repriced_count = int(report.get("repriced_count", 0))
+        disabled_count = int(report.get("disabled_count_after_reprice", 0))
+        final_enabled_count = len(guarded)
         if not guarded:
-            return TemplatePreflightIssue(
-                template_key=template.key,
-                classification="zero_enabled_after_guardrails",
-                message=(
-                    "All selected variants were disabled after pricing guardrails "
-                    f"(selected={report.get('selected_count', 0)} repriced={report.get('repriced_count', 0)})."
-                ),
+            return _failure(
+                "zero_enabled_after_guardrails",
+                "All selected variants were disabled after pricing guardrails "
+                f"(selected={selected_count} repriced={repriced_count}).",
+                selected_count=selected_count,
+                repriced_count=repriced_count,
+                disabled_count_after_reprice=disabled_count,
+                final_enabled_count=final_enabled_count,
             )
-        return None
+        return None, TemplatePreflightReportRow(
+            template_key=template.key,
+            requested_explicitly=False,
+            preflight_status="passed",
+            classification="",
+            message="Template preflight passed.",
+            blueprint_id=blueprint_id,
+            provider_id=provider_id,
+            selected_count=selected_count,
+            repriced_count=repriced_count,
+            disabled_count_after_reprice=disabled_count,
+            final_enabled_count=final_enabled_count,
+            recommended_action="keep_active",
+        )
     except TemplateValidationError as exc:
-        return TemplatePreflightIssue(template.key, "invalid_template_config", str(exc))
+        return _failure("invalid_template_config", str(exc))
     except NonRetryableRequestError as exc:
         classification = "invalid_template_config" if "HTTP 404" in str(exc) else "runtime_api_failure"
-        return TemplatePreflightIssue(template.key, classification, str(exc))
+        return _failure(classification, str(exc))
     except Exception as exc:
-        return TemplatePreflightIssue(template.key, "runtime_api_failure", str(exc))
+        return _failure("runtime_api_failure", str(exc))
 
 
 def preflight_active_templates(
@@ -4550,17 +4633,37 @@ def preflight_active_templates(
     printify: PrintifyClient,
     templates: List[ProductTemplate],
     explicit_template_keys: Optional[List[str]] = None,
-) -> Tuple[List[ProductTemplate], List[TemplatePreflightIssue]]:
+) -> Tuple[List[ProductTemplate], List[TemplatePreflightIssue], List[TemplatePreflightReportRow]]:
     if not all(hasattr(printify, method) for method in ("list_blueprints", "list_print_providers", "list_variants")):
         logger.warning("Template preflight skipped because Printify client does not expose catalog inspection methods.")
-        return templates, []
+        rows = [
+            TemplatePreflightReportRow(
+                template_key=template.key,
+                requested_explicitly=False,
+                preflight_status="skipped",
+                classification="preflight_skipped",
+                message="Printify client does not expose catalog inspection methods.",
+                blueprint_id=template.printify_blueprint_id,
+                provider_id=template.printify_print_provider_id,
+                selected_count=0,
+                repriced_count=0,
+                disabled_count_after_reprice=0,
+                final_enabled_count=0,
+                recommended_action="deactivate_pending_validation",
+            )
+            for template in templates
+        ]
+        return templates, [], rows
     explicit = {key.strip() for key in (explicit_template_keys or []) if key.strip()}
     blueprints = printify.list_blueprints()
     blueprint_ids = {int(blueprint.get("id", 0)) for blueprint in blueprints}
     passed: List[ProductTemplate] = []
     issues: List[TemplatePreflightIssue] = []
+    report_rows: List[TemplatePreflightReportRow] = []
     for template in templates:
-        issue = _preflight_template(printify=printify, template=template, blueprint_ids=blueprint_ids)
+        issue, row = _preflight_template(printify=printify, template=template, blueprint_ids=blueprint_ids)
+        row.requested_explicitly = template.key in explicit
+        report_rows.append(row)
         if issue is None:
             passed.append(template)
             continue
@@ -4573,7 +4676,7 @@ def preflight_active_templates(
             issue.requested_explicitly,
             issue.message,
         )
-    return passed, issues
+    return passed, issues, report_rows
 
 
 def resolve_tote_template_catalog_mapping(
@@ -6178,6 +6281,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--list-pending", action="store_true", help="List combinations not yet successful and exit")
     parser.add_argument("--export-failure-report", default="", help="Optional CSV export path for failed combinations")
     parser.add_argument("--export-run-report", default="", help="Optional CSV export path for all processed combinations")
+    parser.add_argument("--export-preflight-report", default="", help="Optional CSV export path for template preflight report rows")
+    parser.add_argument("--allow-preflight-failures", "--audit-all-templates", dest="allow_preflight_failures", action="store_true", help="Audit mode: continue run even when explicitly requested templates fail preflight")
     parser.add_argument("--preview-listing-copy", action="store_true", help="Render listing title/description/tags previews without creating/updating products")
     parser.add_argument("--generate-artwork-metadata", action="store_true", help="Generate reviewable artwork sidecar metadata from local image analysis")
     parser.add_argument("--metadata-preview", action="store_true", help="Preview generated artwork metadata in stdout")
@@ -6484,7 +6589,7 @@ def run_catalog_cli(
     return False
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "") -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", export_preflight_report_path: str = "", allow_preflight_failures: bool = False, preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "") -> None:
     if publish_mode not in {"default", "publish", "skip"}:
         raise RuntimeError(f"Unsupported publish mode: {publish_mode}")
 
@@ -6692,18 +6797,27 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
     ):
         return
 
-    templates, preflight_issues = preflight_active_templates(
+    templates, preflight_issues, preflight_rows = preflight_active_templates(
         printify=printify,
         templates=templates,
         explicit_template_keys=template_keys,
     )
+    preflight_report_path = pathlib.Path(export_preflight_report_path) if export_preflight_report_path else None
+    if allow_preflight_failures and preflight_report_path is None:
+        preflight_report_path = export_dir / "preflight_report.csv"
+    if preflight_report_path is not None:
+        export_preflight_report(preflight_report_path, preflight_rows)
+        logger.info("Preflight report exported path=%s rows=%s", preflight_report_path, len(preflight_rows))
     explicit_failures = [issue for issue in preflight_issues if issue.requested_explicitly]
-    if explicit_failures:
+    if explicit_failures and not allow_preflight_failures:
         rendered = "; ".join(
             f"{issue.template_key}:{issue.classification}:{issue.message}" for issue in explicit_failures
         )
         raise RuntimeError(f"Template preflight failed for explicitly requested template(s): {rendered}")
     if not template_keys and not templates:
+        if allow_preflight_failures:
+            logger.warning("No runnable active templates after preflight validation; audit mode continuing with report-only completion.")
+            return
         raise RuntimeError("No runnable active templates after preflight validation.")
 
     shop_id = resolve_shop_id(printify, PRINTIFY_SHOP_ID)
@@ -7048,6 +7162,8 @@ if __name__ == "__main__":
             list_pending_only=args.list_pending,
             export_failure_report=args.export_failure_report,
             export_run_report=args.export_run_report,
+            export_preflight_report_path=args.export_preflight_report,
+            allow_preflight_failures=args.allow_preflight_failures,
             preview_listing_copy_only=args.preview_listing_copy,
             generate_artwork_metadata=args.generate_artwork_metadata,
             metadata_preview=args.metadata_preview,
