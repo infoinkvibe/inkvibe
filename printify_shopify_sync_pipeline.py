@@ -245,6 +245,12 @@ class ProductTemplate:
     preferred_featured_image_strategy: str = "variant_color_then_mockup_type"
     preferred_mockup_position: Optional[str] = None
     secondary_collection_handles: List[str] = field(default_factory=list)
+    min_margin_after_shipping: Optional[str] = None
+    target_margin_after_shipping: Optional[str] = None
+    shipping_basis_for_margin: str = "cost"
+    disable_variants_below_margin_floor: bool = False
+    reprice_variants_to_margin_floor: bool = True
+    mark_template_nonviable_if_needed: bool = False
 
 
 @dataclass
@@ -926,10 +932,14 @@ def load_artwork_metadata(sidecar_path: pathlib.Path) -> Dict[str, Any]:
         "color_story": "",
         "occasion": "",
         "artist_note": "",
+        "metadata_provenance": "",
+        "inline_upgrade_fingerprint": "",
+        "inline_upgrade_timestamp": "",
+        "inline_upgrade_reasons": [],
     }
     for field_name in fields:
         value = payload.get(field_name)
-        if field_name in {"tags", "seo_keywords", "style_keywords"}:
+        if field_name in {"tags", "seo_keywords", "style_keywords", "inline_upgrade_reasons"}:
             fields[field_name] = _split_keywords(value)
         elif isinstance(value, str):
             fields[field_name] = value.strip()
@@ -1117,6 +1127,8 @@ def metadata_is_missing_or_weak(
     if not metadata:
         return True, ["metadata_missing"]
     reasons: List[str] = []
+    provenance = str(metadata.get("metadata_provenance") or "").strip().lower()
+    upgrade_fingerprint = str(metadata.get("inline_upgrade_fingerprint") or "").strip()
     title = str(metadata.get("title") or "").strip()
     if not title:
         reasons.append("title_missing")
@@ -1127,12 +1139,112 @@ def metadata_is_missing_or_weak(
     weak_description, desc_reasons = description_is_weak_fallback(str(metadata.get("description") or ""))
     if weak_description:
         reasons.extend(desc_reasons)
+    tags = [normalize_theme_tag(tag) for tag in _split_keywords(metadata.get("tags"))]
+    tags = [tag for tag in tags if tag and tag not in TAG_GENERIC_TOKENS]
+    if len(tags) < 2:
+        reasons.append("tags_sparse")
+    if "title_slug_like" in reasons and metadata_source == "sidecar":
+        if str(metadata.get("description") or "").strip() and len(tags) >= 2:
+            reasons = [reason for reason in reasons if reason != "title_slug_like"]
+            reasons.append("title_slug_like_curated_ok")
+    if provenance in {"inline_openai", "inline_vision", "inline_heuristic"} and upgrade_fingerprint:
+        reasons = [reason for reason in reasons if reason not in {"title_slug_like", "description_too_short"}]
     if metadata_source == "sidecar":
         # Keep concise sidecars intact unless signals are clearly weak.
-        reasons = [reason for reason in reasons if reason not in {"description_too_short"}]
+        reasons = [reason for reason in reasons if reason not in {"description_too_short", "title_slug_like_curated_ok"}]
     if not only_when_weak:
         return True, reasons or ["metadata_refresh_requested"]
     return bool(reasons), sorted(set(reasons))
+
+
+PROMPT_RESIDUE_PATTERNS = [
+    re.compile(r"(?im)^\s*(style notes?|keywords?|prompt|prompt notes?|negative prompt)\s*:\s*.*$"),
+]
+
+
+def sanitize_description_text(value: str) -> str:
+    text = _normalize_whitespace(re.sub(r"<[^>]+>", " ", str(value or "")))
+    for pattern in PROMPT_RESIDUE_PATTERNS:
+        text = pattern.sub(" ", text)
+    text = re.sub(r"\b(great for any occasion|perfect for any occasion)\b", "", text, flags=re.I)
+    text = re.sub(r"\b(style mood:)\b", "", text, flags=re.I)
+    return _normalize_whitespace(text)
+
+
+def sanitize_metadata_for_publish(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+    cleaned = dict(metadata)
+    cleaned["title"] = re.sub(r"\s+", " ", str(metadata.get("title") or "").strip())
+    cleaned["subtitle"] = sanitize_description_text(str(metadata.get("subtitle") or ""))
+    cleaned["description"] = sanitize_description_text(str(metadata.get("description") or ""))
+    raw_tags = _split_keywords(metadata.get("tags"))
+    sanitized_tags: List[str] = []
+    seen: set[str] = set()
+    for tag in raw_tags:
+        normalized = normalize_theme_tag(tag)
+        if not normalized or normalized in seen:
+            continue
+        if normalized in TAG_GENERIC_TOKENS and len(raw_tags) > 5:
+            continue
+        if normalized in {"keywords", "style notes", "prompt", "ai generated"}:
+            continue
+        seen.add(normalized)
+        sanitized_tags.append(normalized)
+    cleaned["tags"] = sanitized_tags
+    cleaned["seo_keywords"] = [normalize_theme_tag(v) for v in _split_keywords(metadata.get("seo_keywords")) if normalize_theme_tag(v)]
+    return cleaned
+
+
+def metadata_fingerprint(metadata: Dict[str, Any]) -> str:
+    normalized = {
+        "title": str(metadata.get("title") or "").strip(),
+        "description": str(metadata.get("description") or "").strip(),
+        "tags": [normalize_theme_tag(v) for v in _split_keywords(metadata.get("tags")) if normalize_theme_tag(v)],
+    }
+    payload = json.dumps(normalized, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def persist_inline_metadata_sidecar(
+    *,
+    artwork: Artwork,
+    candidate_metadata: Dict[str, Any],
+    generator_name: str,
+    weak_reasons: List[str],
+    metadata_source: str,
+) -> Tuple[bool, str]:
+    sidecar_path = artwork.src_path.with_suffix(".json")
+    existing_raw = load_json(sidecar_path, {}) if sidecar_path.exists() else {}
+    existing = existing_raw if isinstance(existing_raw, dict) else {}
+    sanitized_candidate = sanitize_metadata_for_publish(candidate_metadata)
+    generated_fp = metadata_fingerprint(sanitized_candidate)
+    existing_fp = str(existing.get("inline_upgrade_fingerprint") or "")
+    existing_quality_reasons = metadata_is_missing_or_weak(
+        sanitize_metadata_for_publish(existing),
+        artwork_path=artwork.src_path,
+        metadata_source="sidecar" if sidecar_path.exists() else metadata_source,
+        only_when_weak=True,
+    )[1]
+    candidate_quality_reasons = metadata_is_missing_or_weak(
+        sanitized_candidate,
+        artwork_path=artwork.src_path,
+        metadata_source="inline_generated",
+        only_when_weak=True,
+    )[1]
+    materially_better = len(candidate_quality_reasons) < len(existing_quality_reasons) or not existing
+    if existing_fp == generated_fp:
+        return False, "unchanged_fingerprint"
+    if not materially_better:
+        return False, "not_materially_better"
+    payload = dict(existing)
+    payload.update(sanitized_candidate)
+    payload["metadata_provenance"] = f"inline_{generator_name}"
+    payload["inline_upgrade_fingerprint"] = generated_fp
+    payload["inline_upgrade_timestamp"] = datetime.now(timezone.utc).isoformat()
+    payload["inline_upgrade_reasons"] = sorted(set(weak_reasons))
+    save_json_atomic(sidecar_path, payload)
+    return True, "written"
 
 
 def filename_title_quality_reason(value: str) -> str:
@@ -1626,9 +1738,16 @@ def render_product_description(template: ProductTemplate, artwork: Artwork) -> s
     metadata = artwork.metadata or {}
     metadata_description = str(metadata.get("description", "")).strip()
 
+    def _sanitize_html(html: str) -> str:
+        cleaned = html
+        cleaned = re.sub(r"(?is)<p>\s*(Style notes?|Keywords?)\s*:.*?</p>", "", cleaned)
+        cleaned = re.sub(r"(?i)\b(Style notes?|Keywords?)\s*:\s*", "", cleaned)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned)
+        return cleaned.strip()
+
     if not pattern or pattern in {"{artwork_title}", "<p>{artwork_title}</p>"}:
         if metadata_description:
-            return generated.strip()
+            return _sanitize_html(generated.strip())
         details: List[str] = []
         family_label = str(context.get("family_label") or context.get("product_type_label") or "product").strip()
         theme = str(context.get("theme") or "").strip()
@@ -1656,12 +1775,12 @@ def render_product_description(template: ProductTemplate, artwork: Artwork) -> s
             details.append("<ul>" + "".join(f"<li>{row}</li>" for row in bullet_rows[:3]) + "</ul>")
         if artist_note:
             details.append(f"<p>Artist note: {artist_note}</p>")
-        return f"{generated}{''.join(details)}".strip()
+        return _sanitize_html(f"{generated}{''.join(details)}".strip())
 
-    return template.description_pattern.format(
+    return _sanitize_html(template.description_pattern.format(
         **context,
         generated_description=generated,
-    ).strip()
+    ).strip())
 
 
 def _compute_backoff(attempt: int) -> float:
@@ -1774,6 +1893,62 @@ def compute_compare_at_price_minor(template: ProductTemplate, sale_price_minor: 
     compare_minor = normalize_printify_price(template.compare_at_price)
     return compare_minor if compare_minor > sale_price_minor else None
 
+
+def _shipping_minor_for_variant(variant: Dict[str, Any], template: ProductTemplate) -> int:
+    shipping = variant.get("shipping") or variant.get("shipping_cost") or variant.get("shipping_price")
+    if shipping is None:
+        family = content_engine.infer_product_family(template)
+        defaults = {
+            "hoodie": 799,
+            "sweatshirt": 799,
+            "tshirt": 599,
+            "longsleeve": 699,
+            "mug": 499,
+            "poster": 499,
+            "tote": 599,
+        }
+        return defaults.get(family, 599)
+    return normalize_printify_price(shipping)
+
+
+def _variant_margin_after_shipping_minor(template: ProductTemplate, variant: Dict[str, Any], sale_price_minor: int) -> int:
+    cost_source = variant.get("cost") if variant.get("cost") is not None else variant.get("price")
+    if cost_source is None:
+        cost_source = template.base_price if template.base_price is not None else template.default_price
+    cost_minor = normalize_printify_price(cost_source)
+    return sale_price_minor - cost_minor - _shipping_minor_for_variant(variant, template)
+
+
+def apply_variant_margin_guardrails(template: ProductTemplate, variant_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    min_margin_minor = int((_decimal_from_value(template.min_margin_after_shipping, default="0") * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    target_margin_minor = int((_decimal_from_value(template.target_margin_after_shipping, default=str(template.min_margin_after_shipping or "0")) * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    adjusted: List[Dict[str, Any]] = []
+    disabled: List[int] = []
+    repriced: List[int] = []
+    for variant in variant_rows:
+        variant_copy = dict(variant)
+        sale_minor = compute_sale_price_minor(template, variant_copy)
+        margin_minor = _variant_margin_after_shipping_minor(template, variant_copy, sale_minor)
+        if margin_minor < min_margin_minor:
+            if template.reprice_variants_to_margin_floor:
+                cost_source = variant_copy.get("cost") if variant_copy.get("cost") is not None else variant_copy.get("price")
+                cost_minor = normalize_printify_price(cost_source if cost_source is not None else template.default_price)
+                repriced_minor = cost_minor + _shipping_minor_for_variant(variant_copy, template) + target_margin_minor
+                if repriced_minor > sale_minor:
+                    variant_copy["price"] = repriced_minor
+                    repriced.append(int(variant_copy.get("id", 0)))
+                    sale_minor = repriced_minor
+                    margin_minor = _variant_margin_after_shipping_minor(template, variant_copy, sale_minor)
+            if margin_minor < min_margin_minor and template.disable_variants_below_margin_floor:
+                disabled.append(int(variant_copy.get("id", 0)))
+                continue
+        if margin_minor < 0:
+            if template.disable_variants_below_margin_floor:
+                disabled.append(int(variant_copy.get("id", 0)))
+                continue
+        adjusted.append(variant_copy)
+    viable = bool(adjusted)
+    return adjusted, {"disabled_variant_ids": disabled, "repriced_variant_ids": repriced, "viable": viable}
 
 
 def file_fingerprint(path: pathlib.Path) -> str:
@@ -2688,6 +2863,7 @@ def _apply_inline_metadata_generation(
     metadata_openai_timeout: float,
 ) -> Artwork:
     artwork.metadata_resolution_source = metadata_source
+    artwork.metadata = sanitize_metadata_for_publish(artwork.metadata or {})
     should_generate, weak_reasons = metadata_is_missing_or_weak(
         artwork.metadata,
         artwork_path=artwork.src_path,
@@ -2695,15 +2871,14 @@ def _apply_inline_metadata_generation(
         only_when_weak=metadata_inline_only_when_weak,
     )
     artwork.weak_metadata_detected = weak_reasons
+    if weak_reasons:
+        logger.info(
+            "Weak metadata detected artwork=%s source=%s reasons=%s",
+            artwork.src_path.name,
+            metadata_source,
+            ",".join(weak_reasons),
+        )
     if not auto_generate_missing_metadata or not should_generate:
-        if weak_reasons:
-            logger.info(
-                "Weak metadata detected artwork=%s source=%s reasons=%s inline_generation=%s",
-                artwork.src_path.name,
-                metadata_source,
-                ",".join(weak_reasons),
-                "disabled" if not auto_generate_missing_metadata else "not_required",
-            )
         return artwork
 
     logger.info(
@@ -2724,7 +2899,7 @@ def _apply_inline_metadata_generation(
     except Exception as exc:
         logger.warning("Inline metadata generation failed artwork=%s error=%s", artwork.src_path.name, exc)
         return artwork
-    generated_payload = candidate.metadata.as_sidecar_dict()
+    generated_payload = sanitize_metadata_for_publish(candidate.metadata.as_sidecar_dict())
     artwork.metadata = generated_payload
     artwork.title = str(generated_payload.get("title") or artwork.title).strip() or artwork.title
     artwork.metadata_generated_inline = True
@@ -2735,24 +2910,24 @@ def _apply_inline_metadata_generation(
     else:
         artwork.metadata_resolution_source = "inline_heuristic"
 
-    sidecar_exists = artwork.src_path.with_suffix(".json").exists()
-    should_attempt_write = auto_write_generated_sidecars and (not sidecar_exists or metadata_inline_overwrite_weak_sidecars)
     wrote_sidecar = False
-    if should_attempt_write:
-        if should_write_sidecar(
-            artwork.src_path.with_suffix(".json"),
-            overwrite_sidecars=metadata_inline_overwrite_weak_sidecars,
-            only_missing=not metadata_inline_overwrite_weak_sidecars,
-        ):
-            write_artwork_sidecar(candidate=candidate)
-            wrote_sidecar = True
+    sidecar_reason = "auto_write_disabled"
+    if auto_write_generated_sidecars:
+        wrote_sidecar, sidecar_reason = persist_inline_metadata_sidecar(
+            artwork=artwork,
+            candidate_metadata=generated_payload,
+            generator_name=candidate.generator,
+            weak_reasons=weak_reasons,
+            metadata_source=metadata_source,
+        )
     artwork.metadata_sidecar_written = wrote_sidecar
     logger.info(
-        "Inline metadata generated artwork=%s generator=%s title=%s sidecar_written=%s",
+        "Inline metadata generated artwork=%s generator=%s title=%s sidecar_written=%s reason=%s",
         artwork.src_path.name,
         candidate.generator,
         artwork.title,
         wrote_sidecar,
+        sidecar_reason,
     )
     return artwork
 
@@ -2813,7 +2988,7 @@ def discover_artworks(
             tags=[],
             image_width=width,
             image_height=height,
-            metadata=metadata,
+            metadata=sanitize_metadata_for_publish(metadata),
         )
         artwork = _apply_inline_metadata_generation(
             artwork=artwork,
@@ -3876,6 +4051,16 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
         raise TemplateValidationError(f"Template[{index}] rounding_mode must be none|whole_dollar|x_99")
     if row.get("max_enabled_variants") is not None and int(row.get("max_enabled_variants", 0)) <= 0:
         raise TemplateValidationError(f"Template[{index}] max_enabled_variants must be > 0 when provided")
+    for margin_key in ("min_margin_after_shipping", "target_margin_after_shipping"):
+        if row.get(margin_key) is not None and _decimal_from_value(row.get(margin_key), default="0") < 0:
+            raise TemplateValidationError(f"Template[{index}] {margin_key} must be >= 0 when provided")
+    if row.get("shipping_basis_for_margin") is not None:
+        basis = str(row.get("shipping_basis_for_margin", "cost")).strip().lower()
+        if basis not in {"cost"}:
+            raise TemplateValidationError(f"Template[{index}] shipping_basis_for_margin must be 'cost'")
+    for bool_field in ("disable_variants_below_margin_floor", "reprice_variants_to_margin_floor", "mark_template_nonviable_if_needed"):
+        if row.get(bool_field) is not None and not isinstance(row.get(bool_field), bool):
+            raise TemplateValidationError(f"Template[{index}] {bool_field} must be boolean when provided")
     if row.get("max_upscale_factor") is not None and float(row.get("max_upscale_factor", 0)) <= 0:
         raise TemplateValidationError(f"Template[{index}] max_upscale_factor must be > 0 when provided")
     if row.get("poster_safe_max_upscale_factor") is not None and float(row.get("poster_safe_max_upscale_factor", 0)) <= 0:
@@ -3974,6 +4159,12 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
                 preferred_featured_image_strategy=str(row.get("preferred_featured_image_strategy", "variant_color_then_mockup_type")).strip().lower() or "variant_color_then_mockup_type",
                 preferred_mockup_position=str(row.get("preferred_mockup_position", "")).strip() or None,
                 secondary_collection_handles=[str(v) for v in row.get("secondary_collection_handles", [])],
+                min_margin_after_shipping=str(row["min_margin_after_shipping"]) if row.get("min_margin_after_shipping") is not None else None,
+                target_margin_after_shipping=str(row["target_margin_after_shipping"]) if row.get("target_margin_after_shipping") is not None else None,
+                shipping_basis_for_margin=str(row.get("shipping_basis_for_margin", "cost")).strip().lower() or "cost",
+                disable_variants_below_margin_floor=bool(row.get("disable_variants_below_margin_floor", False)),
+                reprice_variants_to_margin_floor=bool(row.get("reprice_variants_to_margin_floor", True)),
+                mark_template_nonviable_if_needed=bool(row.get("mark_template_nonviable_if_needed", False)),
                 placements=[PlacementRequirement(**p) for p in row.get("placements", [])],
             )
         )
@@ -4214,10 +4405,28 @@ def build_printify_product_payload(artwork: Artwork, template: ProductTemplate, 
     title = render_product_title(template, artwork)
     description_html = render_product_description(template, artwork)
     tags = _render_listing_tags(template, artwork)
+    guarded_variants, margin_report = apply_variant_margin_guardrails(template, variant_rows)
+    if margin_report["repriced_variant_ids"]:
+        logger.info(
+            "Variant margin guardrails repriced template=%s variants=%s",
+            template.key,
+            margin_report["repriced_variant_ids"],
+        )
+    if margin_report["disabled_variant_ids"]:
+        logger.warning(
+            "Variant margin guardrails disabled template=%s variants=%s",
+            template.key,
+            margin_report["disabled_variant_ids"],
+        )
+    if template.key == "longsleeve_gildan" and not margin_report["viable"]:
+        logger.warning("Long-sleeve template nonviable after shipping guardrails template=%s", template.key)
+        raise ValueError("longsleeve_nonviable_after_shipping")
+    if template.mark_template_nonviable_if_needed and not margin_report["viable"]:
+        raise ValueError(f"template_nonviable_after_shipping:{template.key}")
 
     variants_payload: List[Dict[str, Any]] = []
     enabled_variant_ids: List[int] = []
-    for variant in variant_rows:
+    for variant in guarded_variants:
         variant_id = int(variant["id"])
         enabled_variant_ids.append(variant_id)
         normalized_price = compute_sale_price_minor(template, variant)
@@ -4711,7 +4920,7 @@ def run_storefront_qa(
                 tags=DEFAULT_TAGS.copy(),
                 image_width=width,
                 image_height=height,
-                metadata=metadata,
+                metadata=sanitize_metadata_for_publish(metadata),
             )
             template = build_resolved_template(template_by_key[launch_row.template_key], launch_row.overrides)
             variant_rows = choose_variants_from_catalog(
@@ -6297,7 +6506,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                     tags=DEFAULT_TAGS.copy(),
                     image_width=width,
                     image_height=height,
-                    metadata=metadata,
+                    metadata=sanitize_metadata_for_publish(metadata),
                 )
                 artwork = _apply_inline_metadata_generation(
                     artwork=artwork,

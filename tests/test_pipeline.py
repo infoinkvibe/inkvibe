@@ -61,6 +61,9 @@ from printify_shopify_sync_pipeline import (
     metadata_is_missing_or_weak,
     title_is_sluglike_or_generic,
     description_is_weak_fallback,
+    sanitize_metadata_for_publish,
+    persist_inline_metadata_sidecar,
+    apply_variant_margin_guardrails,
     filename_title_quality_reason,
     resolve_artwork_title,
     discover_artworks,
@@ -1185,9 +1188,65 @@ def test_inline_generation_does_not_overwrite_existing_sidecar_by_default(tmp_pa
     monkeypatch.setattr("printify_shopify_sync_pipeline.select_artwork_metadata_generator", lambda **kwargs: StubInlineGenerator())
     artworks = discover_artworks(tmp_path, metadata_inline_generator=MetadataGeneratorMode.AUTO.value)
     assert artworks[0].metadata_generated_inline is True
-    assert artworks[0].metadata_sidecar_written is False
+    assert artworks[0].metadata_sidecar_written is True
     persisted = json.loads(sidecar.read_text(encoding="utf-8"))
-    assert persisted["title"] == "Chicken 6600568"
+    assert persisted["title"] == "Vintage Country Chicken Portrait"
+    assert persisted["metadata_provenance"].startswith("inline_")
+
+
+def test_inline_generation_does_not_rewrite_same_upgraded_sidecar(tmp_path: Path):
+    image = tmp_path / "owly.png"
+    Image.new("RGBA", (1000, 1000), (0, 0, 0, 255)).save(image)
+    artwork = Artwork("owly", image, "Owly", "", [], 1000, 1000)
+    candidate = {"title": "Night Owl Portrait", "description": "A moody owl portrait in moonlight.", "tags": ["owl", "night forest"]}
+    wrote, reason = persist_inline_metadata_sidecar(
+        artwork=artwork,
+        candidate_metadata=candidate,
+        generator_name="openai",
+        weak_reasons=["title_slug_like"],
+        metadata_source="sidecar",
+    )
+    assert wrote is True
+    assert reason == "written"
+    wrote_again, reason_again = persist_inline_metadata_sidecar(
+        artwork=artwork,
+        candidate_metadata=candidate,
+        generator_name="openai",
+        weak_reasons=["title_slug_like"],
+        metadata_source="sidecar",
+    )
+    assert wrote_again is False
+    assert reason_again == "unchanged_fingerprint"
+
+
+def test_curated_sluglike_sidecar_not_forced_to_regenerate(tmp_path: Path):
+    image = tmp_path / "sunset-over-lake.png"
+    Image.new("RGBA", (1000, 1000), (0, 0, 0, 255)).save(image)
+    is_weak, reasons = metadata_is_missing_or_weak(
+        {
+            "title": "sunset-over-lake-special-edition-print",
+            "description": "A warm sunset scene over a calm alpine lake with detailed brush texture.",
+            "tags": ["sunset lake", "landscape wall art", "alpine twilight"],
+        },
+        artwork_path=image,
+        metadata_source="sidecar",
+    )
+    assert is_weak is False
+    assert "title_slug_like" not in reasons
+
+
+def test_metadata_sanitizer_strips_prompt_artifacts():
+    cleaned = sanitize_metadata_for_publish(
+        {
+            "title": "Poster",
+            "description": "Style notes: moody tones. Keywords: wolf, moon. Great for any occasion.",
+            "tags": ["wolf", "wolf", "keywords", "gift idea", "moonlit forest"],
+        }
+    )
+    assert "Style notes:" not in cleaned["description"]
+    assert "Keywords:" not in cleaned["description"]
+    assert "keywords" not in cleaned["tags"]
+    assert cleaned["tags"].count("wolf") == 1
 
 
 def test_inline_generation_uses_auto_generator_mode_by_default(tmp_path: Path, monkeypatch):
@@ -1216,6 +1275,51 @@ def test_inline_generation_uses_auto_generator_mode_by_default(tmp_path: Path, m
     assert artworks[0].metadata_generated_inline is True
     assert artworks[0].title == "Golden Trail Wolf"
     assert captured["mode"] == MetadataGeneratorMode.AUTO.value
+
+
+def test_variant_margin_guardrails_reprice_disable_and_longsleeve_behavior():
+    hoodie = ProductTemplate(
+        key="hoodie_gildan",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        base_price="20.00",
+        markup_type="fixed",
+        markup_value="1.00",
+        min_margin_after_shipping="3.00",
+        target_margin_after_shipping="5.00",
+        reprice_variants_to_margin_floor=True,
+        disable_variants_below_margin_floor=True,
+    )
+    adjusted, report = apply_variant_margin_guardrails(
+        hoodie,
+        [{"id": 1, "price": 2100, "cost": 2000, "shipping": 700, "is_available": True}],
+    )
+    assert report["repriced_variant_ids"] == [1]
+    assert adjusted and adjusted[0]["price"] >= 3200
+
+    longsleeve = ProductTemplate(
+        key="longsleeve_gildan",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        base_price="24.99",
+        markup_type="fixed",
+        markup_value="0.00",
+        min_margin_after_shipping="4.00",
+        target_margin_after_shipping="5.00",
+        reprice_variants_to_margin_floor=False,
+        disable_variants_below_margin_floor=True,
+        mark_template_nonviable_if_needed=True,
+    )
+    adjusted_long, report_long = apply_variant_margin_guardrails(
+        longsleeve,
+        [{"id": 2, "price": 2499, "cost": 2499, "shipping": 700, "is_available": True}],
+    )
+    assert adjusted_long == []
+    assert report_long["viable"] is False
 
 def test_uuid_noisy_filename_detection():
     assert filename_title_quality_reason("8f6f45d4-c95f-4f68-9cf9-f022f5197a18") == "uuid_like"
