@@ -535,8 +535,8 @@
   },
   {
     "key": "phone_case_basic",
-    "printify_blueprint_id": 210,
-    "printify_print_provider_id": 55,
+    "printify_blueprint_id": 421,
+    "printify_print_provider_id": 23,
     "provider_selection_strategy": "prefer_printify_choice_then_ranked",
     "fallback_provider_allowed": true,
     "active": false,
@@ -546,12 +546,12 @@
     "enabled_sizes": [],
     "enabled_variant_option_filters": {
       "model": [
-        "iPhone 15",
-        "iPhone 15 Pro",
-        "iPhone 14",
-        "Samsung Galaxy S24"
+        "iPhone 11",
+        "iPhone 8",
+        "Samsung Galaxy S20",
+        "Samsung Galaxy S20 Plus"
       ],
-      "finish": [
+      "surface": [
         "Glossy"
       ]
     },
@@ -604,11 +604,11 @@
   },
   {
     "key": "sticker_kisscut",
-    "printify_blueprint_id": 501,
-    "printify_print_provider_id": 42,
+    "printify_blueprint_id": 906,
+    "printify_print_provider_id": 36,
     "provider_selection_strategy": "prefer_printify_choice_then_ranked",
     "fallback_provider_allowed": true,
-    "active": false,
+    "active": true,
     "title_pattern": "{artwork_title} Kiss-Cut Sticker",
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],

@@ -1857,8 +1857,8 @@ def test_template_filtering_defaults_to_active_only():
 def test_default_product_templates_only_include_proven_active_set():
     templates = load_templates(Path("product_templates.json"))
     active_keys = {template.key for template in templates if template.active}
-    assert active_keys == {"mug_new", "poster_basic", "sweatshirt_gildan", "tshirt_gildan", "hoodie_gildan"}
-    for key in {"canvas_basic", "blanket_basic", "phone_case_basic", "sticker_kisscut", "tote_basic"}:
+    assert active_keys == {"mug_new", "poster_basic", "sweatshirt_gildan", "tshirt_gildan", "hoodie_gildan", "sticker_kisscut"}
+    for key in {"canvas_basic", "blanket_basic", "phone_case_basic", "tote_basic"}:
         assert key not in active_keys
 
 
@@ -3080,6 +3080,36 @@ def test_select_provider_for_template_discovers_family_matched_catalog_pair():
     assert resolved.printify_print_provider_id == 55
 
 
+def test_preflight_reports_template_hint_vs_runtime_mapping_when_they_differ():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [
+                {"id": 9, "title": "Unisex Tee"},
+                {"id": 210, "title": "Tough Phone Cases"},
+            ]
+
+        def list_print_providers(self, blueprint_id):
+            if blueprint_id == 9:
+                return [{"id": 99, "title": "Generic"}]
+            return [{"id": 55, "title": "Printify Choice"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            if blueprint_id == 210:
+                return [{"id": 2, "is_available": True, "options": {"Device Model": "iPhone 15 Pro", "Finish": "Glossy"}, "cost": 1200, "price": 1900}]
+            return [{"id": 1, "is_available": True, "options": {"color": "Black", "size": "M"}}]
+
+    template = ProductTemplate("phone_case_basic", 9, 99, "{artwork_title}", "{artwork_title}")
+    passed, issues, report_rows = preflight_active_templates(printify=DummyPrintify(), templates=[template], explicit_template_keys=[])
+    assert len(passed) == 1
+    assert issues == []
+    row = report_rows[0]
+    assert row.template_hint_blueprint_id == 9
+    assert row.template_hint_provider_id == 99
+    assert row.blueprint_id == 210
+    assert row.provider_id == 55
+    assert row.runtime_mapping_overrode_hint is True
+
+
 def test_preflight_phone_case_can_recover_with_real_model_variants():
     class DummyPrintify:
         def list_blueprints(self):
@@ -3106,6 +3136,41 @@ def test_preflight_phone_case_can_recover_with_real_model_variants():
     passed, issues, _ = preflight_active_templates(printify=DummyPrintify(), templates=[template], explicit_template_keys=[])
     assert issues == []
     assert len(passed) == 1
+
+
+def test_preflight_phone_case_recovers_with_provider_backed_fallback_models():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [{"id": 421, "title": "Tough Phone Cases"}]
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 23, "title": "Phone Provider"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [
+                {"id": 1, "is_available": True, "options": {"Size": "iPhone 11", "Surface": "Glossy"}, "cost": 1200, "price": 1900},
+                {"id": 2, "is_available": True, "options": {"Size": "iPhone 8", "Surface": "Glossy"}, "cost": 1200, "price": 1900},
+                {"id": 3, "is_available": True, "options": {"Size": "Samsung Galaxy S20 Plus", "Surface": "Glossy"}, "cost": 1200, "price": 1900},
+            ]
+
+    template = ProductTemplate(
+        "phone_case_basic",
+        421,
+        23,
+        "{artwork_title}",
+        "{artwork_title}",
+        enabled_variant_option_filters={"model": ["iPhone 15 Pro", "Samsung Galaxy S24"], "surface": ["Glossy"]},
+        provider_selection_strategy="pinned_then_printify_choice_then_lowest_cost",
+    )
+    passed, issues, report_rows = preflight_active_templates(printify=DummyPrintify(), templates=[template], explicit_template_keys=[])
+    assert issues == []
+    assert len(passed) == 1
+    row = report_rows[0]
+    assert row.resolved_model_dimension == "Size"
+    assert row.requested_model_overlap_count == 0
+    assert row.fallback_model_set_applied is True
+    assert "iPhone 11" in row.final_selected_models
+    assert row.final_selected_models.count(",") <= 3
 
 
 def test_preflight_sticker_remains_inactive_with_correct_family_when_requested_size_missing():
@@ -3279,6 +3344,20 @@ def test_tote_template_file_stays_in_sync_with_product_templates():
     tote_standalone = next(t for t in tote_templates if t.key == "tote_basic")
     assert tote_primary.printify_blueprint_id == tote_standalone.printify_blueprint_id == 609
     assert tote_primary.printify_print_provider_id == tote_standalone.printify_print_provider_id == 74
+
+
+def test_phone_and_sticker_template_files_stay_in_sync_with_product_templates():
+    product_templates = load_templates(Path("product_templates.json"))
+    phone_templates = load_templates(Path("phone_case_basic_template.json"))
+    sticker_templates = load_templates(Path("sticker_kisscut_template.json"))
+    phone_primary = next(t for t in product_templates if t.key == "phone_case_basic")
+    phone_standalone = next(t for t in phone_templates if t.key == "phone_case_basic")
+    sticker_primary = next(t for t in product_templates if t.key == "sticker_kisscut")
+    sticker_standalone = next(t for t in sticker_templates if t.key == "sticker_kisscut")
+    assert phone_primary.printify_blueprint_id == phone_standalone.printify_blueprint_id == 421
+    assert phone_primary.printify_print_provider_id == phone_standalone.printify_print_provider_id == 23
+    assert sticker_primary.printify_blueprint_id == sticker_standalone.printify_blueprint_id == 906
+    assert sticker_primary.printify_print_provider_id == sticker_standalone.printify_print_provider_id == 36
 
 
 def test_tote_front_primary_and_publish_only_primary_behavior_preserved():

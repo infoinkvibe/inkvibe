@@ -181,6 +181,13 @@ class TemplatePreflightReportRow:
     resolved_blueprint_title: str = ""
     resolved_provider_title: str = ""
     family_mismatch_reason: str = ""
+    template_hint_blueprint_id: int = 0
+    template_hint_provider_id: int = 0
+    runtime_mapping_overrode_hint: bool = False
+    resolved_model_dimension: str = ""
+    requested_model_overlap_count: int = 0
+    fallback_model_set_applied: bool = False
+    final_selected_models: str = ""
 
 
 @dataclass
@@ -190,6 +197,10 @@ class VariantFilterDiagnostics:
     requested_option_filters: Dict[str, List[str]] = field(default_factory=dict)
     filter_counts: List[Dict[str, Any]] = field(default_factory=list)
     zero_selection_reason: str = ""
+    resolved_model_dimension: str = ""
+    requested_model_overlap_count: int = 0
+    fallback_model_set_applied: bool = False
+    final_selected_models: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1757,6 +1768,18 @@ def select_provider_for_template(
     discovered_pair = _discover_family_catalog_mapping(printify=printify, template=template)
     if discovered_pair is not None:
         blueprint_id, discovered_provider_id = discovered_pair
+        if (
+            blueprint_id != int(template.printify_blueprint_id)
+            or discovered_provider_id != int(template.printify_print_provider_id)
+        ):
+            logger.info(
+                "Catalog mapping override template=%s template_hint_blueprint_id=%s template_hint_provider_id=%s resolved_blueprint_id=%s resolved_provider_id=%s source=runtime_family_discovery",
+                template.key,
+                template.printify_blueprint_id,
+                template.printify_print_provider_id,
+                blueprint_id,
+                discovered_provider_id,
+            )
         template = replace(template, printify_blueprint_id=blueprint_id, printify_print_provider_id=discovered_provider_id)
     try:
         providers = printify.list_print_providers(blueprint_id)
@@ -3271,6 +3294,23 @@ def _canonical_option_token(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
 
 
+def _canonical_phone_model_token(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    raw = re.sub(r"\bplus\b", "+", raw)
+    return re.sub(r"[^a-z0-9+]+", "", raw)
+
+
+def _choose_phone_model_fallback_values(available_values: List[str], *, limit: int = 4) -> List[str]:
+    if not available_values:
+        return []
+    preferred_prefixes = ("iphone", "samsung galaxy")
+    preferred = [value for value in available_values if str(value).strip().lower().startswith(preferred_prefixes)]
+    pool = preferred or available_values
+    return pool[: max(1, min(limit, len(pool)))]
+
+
 def _canonical_variant_options(variant: Dict[str, Any]) -> Dict[str, str]:
     options = variant.get("options") or {}
     normalized: Dict[str, str] = {}
@@ -3293,7 +3333,7 @@ def _analyze_variant_filtering(catalog_variants: List[Dict[str, Any]], template:
     alias_hints = {
         "color": ["color", "colour", "casecolor", "finish", "surface"],
         "size": ["size", "sizes", "dimension", "dimensions", "format"],
-        "model": ["model", "device", "phonemodel", "devicemodel", "compatibility"],
+        "model": ["model", "device", "phonemodel", "devicemodel", "compatibility", "size"],
     }
     schema_names: Dict[str, str] = {}
     schema_values: Dict[str, Counter[str]] = {}
@@ -3376,20 +3416,36 @@ def _analyze_variant_filtering(catalog_variants: List[Dict[str, Any]], template:
             filtered_rows = []
             break
 
-        available_value_map = {
-            _canonical_option_token(value): value
+        available_values = [
+            str(value).strip()
             for value in schema_values.get(resolved_schema_key, Counter()).keys()
             if str(value).strip()
-        }
+        ]
+        available_value_map = {_canonical_option_token(value): value for value in available_values}
+        if _canonical_option_token(requested_key) == "model":
+            diagnostics.resolved_model_dimension = schema_names.get(resolved_schema_key, resolved_schema_key)
+            for value in available_values:
+                phone_token = _canonical_phone_model_token(value)
+                if phone_token and phone_token not in available_value_map:
+                    available_value_map[phone_token] = value
         resolved_values: List[str] = []
         missing_values: List[str] = []
         for requested_value in requested_values:
             canonical_value = _canonical_option_token(requested_value)
             matched_value = available_value_map.get(canonical_value)
+            if matched_value is None and _canonical_option_token(requested_key) == "model":
+                matched_value = available_value_map.get(_canonical_phone_model_token(requested_value))
             if matched_value:
                 resolved_values.append(matched_value)
             else:
                 missing_values.append(requested_value)
+        if _canonical_option_token(requested_key) == "model":
+            diagnostics.requested_model_overlap_count = len(set(resolved_values))
+            if not resolved_values and _template_intended_family(template) == "phone_case":
+                resolved_values = _choose_phone_model_fallback_values(available_values, limit=4)
+                diagnostics.fallback_model_set_applied = bool(resolved_values)
+                missing_values = []
+            diagnostics.final_selected_models = sorted(set(resolved_values))
         resolved_set = set(resolved_values)
         filtered_rows = [(variant, opts) for variant, opts in filtered_rows if str(opts.get(resolved_schema_key, "")).strip() in resolved_set]
         diagnostics.filter_counts.append(
@@ -4997,6 +5053,12 @@ def _preflight_template(
     resolved_template = select_provider_for_template(printify=printify, template=template)
     blueprint_id = int(resolved_template.printify_blueprint_id)
     provider_id = int(resolved_template.printify_print_provider_id)
+    template_hint_blueprint_id = int(template.printify_blueprint_id)
+    template_hint_provider_id = int(template.printify_print_provider_id)
+    runtime_mapping_overrode_hint = (
+        template_hint_blueprint_id != blueprint_id
+        or template_hint_provider_id != provider_id
+    )
     is_apparel_diag_template = template.key in {"tshirt_gildan", "hoodie_gildan"}
 
     def _recommended_action_for(classification: str) -> str:
@@ -5089,6 +5151,13 @@ def _preflight_template(
             resolved_blueprint_title=resolved_blueprint_title,
             resolved_provider_title=resolved_provider_title,
             family_mismatch_reason=family_mismatch_reason,
+            template_hint_blueprint_id=template_hint_blueprint_id,
+            template_hint_provider_id=template_hint_provider_id,
+            runtime_mapping_overrode_hint=runtime_mapping_overrode_hint,
+            resolved_model_dimension=str(option_diagnostics.resolved_model_dimension or ""),
+            requested_model_overlap_count=int(option_diagnostics.requested_model_overlap_count or 0),
+            fallback_model_set_applied=bool(option_diagnostics.fallback_model_set_applied),
+            final_selected_models=json.dumps(option_diagnostics.final_selected_models, sort_keys=True),
         )
         return issue, row
 
@@ -5255,6 +5324,13 @@ def _preflight_template(
             intended_family=family_validation.intended_family,
             resolved_blueprint_title=resolved_blueprint_title,
             resolved_provider_title=resolved_provider_title,
+            template_hint_blueprint_id=template_hint_blueprint_id,
+            template_hint_provider_id=template_hint_provider_id,
+            runtime_mapping_overrode_hint=runtime_mapping_overrode_hint,
+            resolved_model_dimension=str(option_diagnostics.resolved_model_dimension or ""),
+            requested_model_overlap_count=int(option_diagnostics.requested_model_overlap_count or 0),
+            fallback_model_set_applied=bool(option_diagnostics.fallback_model_set_applied),
+            final_selected_models=json.dumps(option_diagnostics.final_selected_models, sort_keys=True),
         )
     except TemplateValidationError as exc:
         return _failure("invalid_template_config", str(exc))
