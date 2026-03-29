@@ -2479,6 +2479,43 @@ def test_no_retry_on_404_catalog_error():
     assert client.session.calls == 1
 
 
+def test_catalog_429_retry_after_sleep_is_capped(monkeypatch):
+    class DummyResponse:
+        def __init__(self):
+            self.status_code = 429
+            self.headers = {"Retry-After": "745"}
+            self.content = b"{}"
+
+        def json(self):
+            return {}
+
+        @property
+        def text(self):
+            return "{}"
+
+    class DummySession:
+        def __init__(self):
+            self.calls = 0
+            self.headers = {}
+
+        def request(self, **kwargs):
+            self.calls += 1
+            return DummyResponse()
+
+    sleep_calls = []
+    monkeypatch.setattr("printify_shopify_sync_pipeline.time.sleep", lambda seconds: sleep_calls.append(seconds))
+
+    client = BaseApiClient.__new__(BaseApiClient)
+    client.base_url = "https://example.test"
+    client.dry_run = False
+    client.session = DummySession()
+
+    with pytest.raises(RuntimeError, match="Request failed for GET"):
+        client.get("/catalog/blueprints/1658/print_providers/90/variants.json")
+    assert sleep_calls
+    assert max(sleep_calls) <= 15
+
+
 def test_catalog_cli_invalid_provider_for_blueprint_has_helpful_error(tmp_path: Path):
     class DummyCatalogPrintify:
         def list_print_providers(self, blueprint_id):
@@ -3208,6 +3245,26 @@ def test_select_provider_for_template_discovers_family_matched_catalog_pair():
     assert resolved.printify_print_provider_id == 55
 
 
+def test_select_provider_for_template_keeps_proven_sticker_mapping_without_discovery():
+    class DummyPrintify:
+        def list_blueprints(self):
+            raise AssertionError("broad discovery should not run for proven sticker mapping")
+
+        def list_print_providers(self, blueprint_id):
+            assert blueprint_id == 906
+            return [{"id": 36, "title": "SPOKE Custom Products"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            assert blueprint_id == 906
+            assert provider_id == 36
+            return [{"id": 1, "is_available": True, "options": {"Shape": "Kiss-Cut", "Size": "4x4"}}]
+
+    template = ProductTemplate("sticker_kisscut", 906, 36, "{artwork_title}", "{artwork_title}")
+    resolved = select_provider_for_template(printify=DummyPrintify(), template=template)
+    assert resolved.printify_blueprint_id == 906
+    assert resolved.printify_print_provider_id == 36
+
+
 def test_preflight_reports_template_hint_vs_runtime_mapping_when_they_differ():
     class DummyPrintify:
         def list_blueprints(self):
@@ -3236,6 +3293,30 @@ def test_preflight_reports_template_hint_vs_runtime_mapping_when_they_differ():
     assert row.blueprint_id == 210
     assert row.provider_id == 55
     assert row.runtime_mapping_overrode_hint is True
+
+
+def test_preflight_resolution_diagnostics_report_discovery_usage_for_sticker():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [{"id": 906, "title": "Kiss-Cut Stickers"}]
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 36, "title": "SPOKE Custom Products"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [{"id": 1, "is_available": True, "options": {"Shape": "Kiss-Cut", "Size": "4x4"}, "cost": 300, "price": 700}]
+
+    template = ProductTemplate("sticker_kisscut", 906, 36, "{artwork_title}", "{artwork_title}")
+    passed, issues, report_rows = preflight_active_templates(printify=DummyPrintify(), templates=[template], explicit_template_keys=[])
+    assert issues == []
+    assert len(passed) == 1
+    row = report_rows[0]
+    assert row.template_hint_blueprint_id == 906
+    assert row.template_hint_provider_id == 36
+    assert row.catalog_discovery_used is False
+    assert row.pinned_mapping_attempted_first is True
+    assert row.fallback_discovery_triggered is False
+    assert row.fallback_discovery_reason == ""
 
 
 def test_preflight_phone_case_can_recover_with_real_model_variants():

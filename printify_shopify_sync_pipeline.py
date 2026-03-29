@@ -80,6 +80,7 @@ DEFAULT_PRICE_FALLBACK = os.getenv("DEFAULT_PRICE_FALLBACK", "29.99")
 USER_AGENT = os.getenv("PRINTIFY_USER_AGENT", "InkVibeAuto/1.1")
 RETRY_MAX_ATTEMPTS = int(os.getenv("RETRY_MAX_ATTEMPTS", "5"))
 RETRY_BACKOFF_SECONDS = float(os.getenv("RETRY_BACKOFF_SECONDS", "1.5"))
+CATALOG_RETRY_BACKOFF_CAP_SECONDS = float(os.getenv("CATALOG_RETRY_BACKOFF_CAP_SECONDS", "15"))
 PRINTIFY_DIRECT_UPLOAD_LIMIT_BYTES = 5 * 1024 * 1024
 
 logger = logging.getLogger("inkvibeauto")
@@ -184,6 +185,11 @@ class TemplatePreflightReportRow:
     template_hint_blueprint_id: int = 0
     template_hint_provider_id: int = 0
     runtime_mapping_overrode_hint: bool = False
+    catalog_discovery_used: bool = False
+    pinned_mapping_attempted_first: bool = False
+    fallback_discovery_triggered: bool = False
+    fallback_discovery_reason: str = ""
+    catalog_resolution_mode: str = "normal"
     resolved_model_dimension: str = ""
     requested_model_overlap_count: int = 0
     fallback_model_set_applied: bool = False
@@ -218,6 +224,20 @@ class RuntimeSkipDiagnostics:
     resolved_option_dimensions: Dict[str, str] = field(default_factory=dict)
     resolved_model_list: List[str] = field(default_factory=list)
     final_reason_code: str = ""
+
+
+@dataclass
+class CatalogResolutionDiagnostics:
+    template_key: str
+    template_hint_blueprint_id: int
+    template_hint_provider_id: int
+    resolved_blueprint_id: int
+    resolved_provider_id: int
+    discovery_mode: str = "normal"
+    pinned_attempted_first: bool = False
+    discovery_used: bool = False
+    fallback_discovery_triggered: bool = False
+    fallback_discovery_reason: str = ""
 
 
 @dataclass
@@ -1771,18 +1791,97 @@ def _discover_family_catalog_mapping(
     return best_pair
 
 
+def _mapping_is_plausible_for_template(
+    *,
+    printify: PrintifyClient,
+    template: ProductTemplate,
+    blueprint_id: int,
+    provider_id: int,
+) -> Tuple[bool, str]:
+    if blueprint_id <= 0 or provider_id <= 0:
+        return False, "template_mapping_ids_missing"
+    intended_family = _template_intended_family(template)
+    if intended_family == "other":
+        return True, "family_validation_not_required"
+    try:
+        variants = normalize_catalog_variants_response(printify.list_variants(blueprint_id, provider_id))
+    except Exception as exc:
+        return False, f"template_mapping_variant_fetch_failed:{type(exc).__name__}"
+    if not variants:
+        return False, "template_mapping_zero_variants"
+    validation = validate_catalog_family_schema(template=template, variants=variants)
+    if validation.plausible:
+        return True, "template_mapping_family_plausible"
+    return False, f"template_mapping_family_mismatch:{validation.reason or 'unknown'}"
+
+
 def select_provider_for_template(
     *,
     printify: PrintifyClient,
     template: ProductTemplate,
 ) -> ProductTemplate:
+    resolved_template, _ = _resolve_template_catalog_mapping(
+        printify=printify,
+        template=template,
+        discovery_mode="normal",
+    )
+    return resolved_template
+
+
+def _resolve_template_catalog_mapping(
+    *,
+    printify: PrintifyClient,
+    template: ProductTemplate,
+    discovery_mode: str = "normal",
+) -> Tuple[ProductTemplate, CatalogResolutionDiagnostics]:
     if template.key == "tote_basic":
-        return template
+        diagnostics = CatalogResolutionDiagnostics(
+            template_key=template.key,
+            template_hint_blueprint_id=int(template.printify_blueprint_id),
+            template_hint_provider_id=int(template.printify_print_provider_id),
+            resolved_blueprint_id=int(template.printify_blueprint_id),
+            resolved_provider_id=int(template.printify_print_provider_id),
+            discovery_mode=discovery_mode,
+        )
+        return template, diagnostics
     if not hasattr(printify, "list_print_providers") or not hasattr(printify, "list_variants"):
-        return template
+        diagnostics = CatalogResolutionDiagnostics(
+            template_key=template.key,
+            template_hint_blueprint_id=int(template.printify_blueprint_id),
+            template_hint_provider_id=int(template.printify_print_provider_id),
+            resolved_blueprint_id=int(template.printify_blueprint_id),
+            resolved_provider_id=int(template.printify_print_provider_id),
+            discovery_mode=discovery_mode,
+        )
+        return template, diagnostics
 
     blueprint_id = int(template.pinned_blueprint_id or template.printify_blueprint_id)
-    discovered_pair = _discover_family_catalog_mapping(printify=printify, template=template)
+    provider_id = int(template.pinned_provider_id or template.printify_print_provider_id)
+    diagnostics = CatalogResolutionDiagnostics(
+        template_key=template.key,
+        template_hint_blueprint_id=int(template.printify_blueprint_id),
+        template_hint_provider_id=int(template.printify_print_provider_id),
+        resolved_blueprint_id=blueprint_id,
+        resolved_provider_id=provider_id,
+        discovery_mode=discovery_mode,
+        pinned_attempted_first=(blueprint_id > 0 and provider_id > 0),
+    )
+
+    should_discover = discovery_mode != "normal"
+    if discovery_mode == "normal":
+        plausible, reason = _mapping_is_plausible_for_template(
+            printify=printify,
+            template=template,
+            blueprint_id=blueprint_id,
+            provider_id=provider_id,
+        )
+        if not plausible:
+            should_discover = True
+            diagnostics.fallback_discovery_triggered = True
+            diagnostics.fallback_discovery_reason = reason
+
+    discovered_pair = _discover_family_catalog_mapping(printify=printify, template=template) if should_discover else None
+    diagnostics.discovery_used = should_discover
     if discovered_pair is not None:
         blueprint_id, discovered_provider_id = discovered_pair
         if (
@@ -1798,12 +1897,15 @@ def select_provider_for_template(
                 discovered_provider_id,
             )
         template = replace(template, printify_blueprint_id=blueprint_id, printify_print_provider_id=discovered_provider_id)
+        provider_id = discovered_provider_id
+    diagnostics.resolved_blueprint_id = blueprint_id
+    diagnostics.resolved_provider_id = provider_id
     try:
         providers = printify.list_print_providers(blueprint_id)
     except Exception:
-        return template
+        return template, diagnostics
     if not providers:
-        return template
+        return template, diagnostics
 
     providers_by_id = {int(provider.get("id") or 0): provider for provider in providers}
     provider_candidates: List[int] = []
@@ -1865,7 +1967,22 @@ def select_provider_for_template(
             template.printify_blueprint_id,
             template.printify_print_provider_id,
         )
-    return replace(template, printify_blueprint_id=blueprint_id, printify_print_provider_id=selected_provider_id)
+    resolved = replace(template, printify_blueprint_id=blueprint_id, printify_print_provider_id=selected_provider_id)
+    diagnostics.resolved_provider_id = int(selected_provider_id)
+    logger.info(
+        "Catalog resolution diagnostics template=%s mode=%s template_hint_blueprint_id=%s template_hint_provider_id=%s resolved_blueprint_id=%s resolved_provider_id=%s pinned_attempted_first=%s discovery_used=%s fallback_discovery_triggered=%s fallback_discovery_reason=%s",
+        diagnostics.template_key,
+        diagnostics.discovery_mode,
+        diagnostics.template_hint_blueprint_id,
+        diagnostics.template_hint_provider_id,
+        diagnostics.resolved_blueprint_id,
+        diagnostics.resolved_provider_id,
+        diagnostics.pinned_attempted_first,
+        diagnostics.discovery_used,
+        diagnostics.fallback_discovery_triggered,
+        diagnostics.fallback_discovery_reason or "-",
+    )
+    return resolved, diagnostics
 
 
 def generate_template_snippet(
@@ -2222,6 +2339,17 @@ def _retry_after_seconds(value: Optional[str], attempt: int) -> float:
             except Exception:
                 pass
     return _compute_backoff(attempt)
+
+
+def _is_catalog_discovery_path(path: str) -> bool:
+    normalized = str(path or "").strip().lower()
+    return normalized.startswith("/catalog/")
+
+
+def _cap_catalog_retry_sleep(path: str, requested_backoff: float) -> float:
+    if not _is_catalog_discovery_path(path):
+        return requested_backoff
+    return min(requested_backoff, CATALOG_RETRY_BACKOFF_CAP_SECONDS)
 
 
 def normalize_printify_price(value: Any) -> int:
@@ -2879,14 +3007,17 @@ class BaseApiClient:
                     return response.json() if response.content else {}
 
                 if response.status_code in {429, 500, 502, 503, 504}:
-                    sleep_seconds = _retry_after_seconds(response.headers.get("Retry-After"), attempt)
+                    requested_sleep_seconds = _retry_after_seconds(response.headers.get("Retry-After"), attempt)
+                    sleep_seconds = _cap_catalog_retry_sleep(path, requested_sleep_seconds)
                     logger.warning(
-                        "Request %s %s failed with HTTP %s (%s/%s); retryable status, retrying in %.2fs",
+                        "Request %s %s failed with HTTP %s (%s/%s); retryable status, retrying in %.2fs (requested=%.2fs capped=%.2fs)",
                         method.upper(),
                         path,
                         response.status_code,
                         attempt,
                         RETRY_MAX_ATTEMPTS,
+                        sleep_seconds,
+                        requested_sleep_seconds,
                         sleep_seconds,
                     )
                     time.sleep(sleep_seconds)
@@ -5072,7 +5203,11 @@ def _preflight_template(
     blueprint_ids: set[int],
     blueprint_titles: Optional[Dict[int, str]] = None,
 ) -> Tuple[Optional[TemplatePreflightIssue], TemplatePreflightReportRow]:
-    resolved_template = select_provider_for_template(printify=printify, template=template)
+    resolved_template, resolution_diag = _resolve_template_catalog_mapping(
+        printify=printify,
+        template=template,
+        discovery_mode="normal",
+    )
     blueprint_id = int(resolved_template.printify_blueprint_id)
     provider_id = int(resolved_template.printify_print_provider_id)
     template_hint_blueprint_id = int(template.printify_blueprint_id)
@@ -5176,6 +5311,11 @@ def _preflight_template(
             template_hint_blueprint_id=template_hint_blueprint_id,
             template_hint_provider_id=template_hint_provider_id,
             runtime_mapping_overrode_hint=runtime_mapping_overrode_hint,
+            catalog_discovery_used=bool(resolution_diag.discovery_used),
+            pinned_mapping_attempted_first=bool(resolution_diag.pinned_attempted_first),
+            fallback_discovery_triggered=bool(resolution_diag.fallback_discovery_triggered),
+            fallback_discovery_reason=str(resolution_diag.fallback_discovery_reason or ""),
+            catalog_resolution_mode=str(resolution_diag.discovery_mode or "normal"),
             resolved_model_dimension=str(option_diagnostics.resolved_model_dimension or ""),
             requested_model_overlap_count=int(option_diagnostics.requested_model_overlap_count or 0),
             fallback_model_set_applied=bool(option_diagnostics.fallback_model_set_applied),
@@ -5349,6 +5489,11 @@ def _preflight_template(
             template_hint_blueprint_id=template_hint_blueprint_id,
             template_hint_provider_id=template_hint_provider_id,
             runtime_mapping_overrode_hint=runtime_mapping_overrode_hint,
+            catalog_discovery_used=bool(resolution_diag.discovery_used),
+            pinned_mapping_attempted_first=bool(resolution_diag.pinned_attempted_first),
+            fallback_discovery_triggered=bool(resolution_diag.fallback_discovery_triggered),
+            fallback_discovery_reason=str(resolution_diag.fallback_discovery_reason or ""),
+            catalog_resolution_mode=str(resolution_diag.discovery_mode or "normal"),
             resolved_model_dimension=str(option_diagnostics.resolved_model_dimension or ""),
             requested_model_overlap_count=int(option_diagnostics.requested_model_overlap_count or 0),
             fallback_model_set_applied=bool(option_diagnostics.fallback_model_set_applied),
@@ -6605,7 +6750,11 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     template=template,
                 )
             else:
-                resolved_template = select_provider_for_template(printify=printify, template=template)
+                resolved_template, resolution_diag = _resolve_template_catalog_mapping(
+                    printify=printify,
+                    template=template,
+                    discovery_mode="normal",
+                )
                 try:
                     providers = printify.list_print_providers(resolved_template.printify_blueprint_id)
                     provider_title = next(
@@ -6619,6 +6768,18 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 except Exception:
                     provider_title = ""
                 catalog_variants = printify.list_variants(resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id)
+                logger.info(
+                    "Runtime catalog resolution template=%s template_hint_blueprint_id=%s template_hint_provider_id=%s resolved_blueprint_id=%s resolved_provider_id=%s discovery_used=%s pinned_attempted_first=%s fallback_discovery_triggered=%s fallback_discovery_reason=%s",
+                    template.key,
+                    resolution_diag.template_hint_blueprint_id,
+                    resolution_diag.template_hint_provider_id,
+                    resolution_diag.resolved_blueprint_id,
+                    resolution_diag.resolved_provider_id,
+                    resolution_diag.discovery_used,
+                    resolution_diag.pinned_attempted_first,
+                    resolution_diag.fallback_discovery_triggered,
+                    resolution_diag.fallback_discovery_reason or "-",
+                )
             normalized_catalog_variants = normalize_catalog_variants_response(catalog_variants)
             family_validation = validate_catalog_family_schema(template=resolved_template, variants=normalized_catalog_variants)
             resolved_blueprint_title = str(blueprint_titles_cache.get(resolved_template.printify_blueprint_id, ""))
