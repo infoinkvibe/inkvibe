@@ -350,9 +350,9 @@
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],
     "enabled_sizes": [
-      "11\u2033 x 14\u2033 (Vertical)",
-      "12\u2033 x 16\u2033 (Vertical)",
-      "16\u2033 x 20\u2033 (Vertical)"
+      "11″ x 14″ (Vertical)",
+      "12″ x 16″ (Vertical)",
+      "16″ x 20″ (Vertical)"
     ],
     "placements": [
       {
@@ -482,9 +482,9 @@
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],
     "enabled_sizes": [
-      "12\u2033 x 16\u2033",
-      "16\u2033 x 20\u2033",
-      "18\u2033 x 24\u2033"
+      "12″ x 16″",
+      "16″ x 20″",
+      "18″ x 24″"
     ],
     "max_enabled_variants": 12,
     "tags": [
@@ -539,7 +539,7 @@
     "printify_print_provider_id": 23,
     "provider_selection_strategy": "prefer_printify_choice_then_ranked",
     "fallback_provider_allowed": true,
-    "active": false,
+    "active": true,
     "title_pattern": "{artwork_title} Phone Case",
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],
@@ -661,8 +661,8 @@
     "mark_template_nonviable_if_needed": true,
     "enabled_variant_option_filters": {
       "size": [
-        "3\" \u00d7 3\"",
-        "4\" \u00d7 4\""
+        "3\" × 3\"",
+        "4\" × 4\""
       ]
     }
   },
@@ -677,8 +677,8 @@
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],
     "enabled_sizes": [
-      "50\" \u00d7 60\"",
-      "60\" \u00d7 80\""
+      "50\" × 60\"",
+      "60\" × 80\""
     ],
     "max_enabled_variants": 6,
     "tags": [
