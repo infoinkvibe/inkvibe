@@ -81,6 +81,9 @@ USER_AGENT = os.getenv("PRINTIFY_USER_AGENT", "InkVibeAuto/1.1")
 RETRY_MAX_ATTEMPTS = int(os.getenv("RETRY_MAX_ATTEMPTS", "5"))
 RETRY_BACKOFF_SECONDS = float(os.getenv("RETRY_BACKOFF_SECONDS", "1.5"))
 CATALOG_RETRY_BACKOFF_CAP_SECONDS = float(os.getenv("CATALOG_RETRY_BACKOFF_CAP_SECONDS", "15"))
+MUTATION_RETRY_BACKOFF_CAP_SECONDS = float(os.getenv("MUTATION_RETRY_BACKOFF_CAP_SECONDS", "20"))
+INTERACTIVE_RETRY_CAP_SECONDS = float(os.getenv("INTERACTIVE_RETRY_CAP_SECONDS", "12"))
+MAX_RETRY_SLEEP_SECONDS = float(os.getenv("MAX_RETRY_SLEEP_SECONDS", "45"))
 PRINTIFY_DIRECT_UPLOAD_LIMIT_BYTES = 5 * 1024 * 1024
 
 logger = logging.getLogger("inkvibeauto")
@@ -108,6 +111,20 @@ class StateFileError(RuntimeError):
 
 class NonRetryableRequestError(RuntimeError):
     pass
+
+
+class RetryLimitExceededError(RuntimeError):
+    def __init__(self, *, method: str, path: str, policy_bucket: str, status_code: int, attempts: int, reason_code: str):
+        super().__init__(
+            f"Retry limit exceeded for {method.upper()} {path} "
+            f"(status={status_code}, attempts={attempts}, policy={policy_bucket}, reason_code={reason_code})"
+        )
+        self.method = method.upper()
+        self.path = path
+        self.policy_bucket = policy_bucket
+        self.status_code = status_code
+        self.attempts = attempts
+        self.reason_code = reason_code
 
 
 class CatalogCliUsageError(RuntimeError):
@@ -248,6 +265,8 @@ class CatalogFamilyValidationResult:
 
 
 def classify_failure(exc: Exception) -> str:
+    if isinstance(exc, RetryLimitExceededError):
+        return exc.reason_code
     if isinstance(exc, TemplateValidationError):
         return "invalid_template_config"
     if isinstance(exc, TemplateSkipGuardrail):
@@ -255,6 +274,12 @@ def classify_failure(exc: Exception) -> str:
     if isinstance(exc, NonRetryableRequestError):
         return "invalid_template_config" if "HTTP 404" in str(exc) else "runtime_api_failure"
     return "runtime_api_failure"
+
+
+def _failure_reason_code(exc: Exception) -> str:
+    if isinstance(exc, RetryLimitExceededError):
+        return exc.reason_code
+    return classify_failure(exc)
 
 
 @dataclass
@@ -434,6 +459,7 @@ class FailureReportRow:
     provider_id: int
     upload_strategy: str
     error_type: str
+    reason_code: str
     error_message: str
     suggested_next_action: str
     launch_plan_row: str = ""
@@ -2352,6 +2378,25 @@ def _cap_catalog_retry_sleep(path: str, requested_backoff: float) -> float:
     return min(requested_backoff, CATALOG_RETRY_BACKOFF_CAP_SECONDS)
 
 
+def _retry_policy_bucket(path: str, *, mutating: bool) -> str:
+    if _is_catalog_discovery_path(path):
+        return "catalog"
+    if mutating:
+        return "mutation"
+    return "default"
+
+
+def _reason_code_for_retry_limit(path: str, *, mutating: bool) -> str:
+    normalized = str(path or "").strip().lower()
+    if "/publish.json" in normalized:
+        return "publish_rate_limited"
+    if mutating:
+        return "mutation_rate_limited"
+    if _is_catalog_discovery_path(path):
+        return "catalog_rate_limited"
+    return "request_retry_exhausted"
+
+
 def normalize_printify_price(value: Any) -> int:
     if isinstance(value, bool) or value is None:
         raise ValueError(f"Invalid Printify price value: {value!r}")
@@ -2963,6 +3008,7 @@ def resolve_launch_plan_rows(
                 provider_id=0,
                 upload_strategy="n/a",
                 error_type=type(exc).__name__,
+                reason_code=type(exc).__name__,
                 error_message=str(exc),
                 suggested_next_action="Fix launch-plan row and rerun.",
                 launch_plan_row=str(idx),
@@ -2977,9 +3023,21 @@ def resolve_launch_plan_rows(
 
 
 class BaseApiClient:
-    def __init__(self, base_url: str, headers: Dict[str, str], dry_run: bool = False):
+    def __init__(
+        self,
+        base_url: str,
+        headers: Dict[str, str],
+        dry_run: bool = False,
+        *,
+        interactive_retry_policy: bool = True,
+        interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS,
+        max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS,
+    ):
         self.base_url = base_url.rstrip("/")
         self.dry_run = dry_run
+        self.interactive_retry_policy = bool(interactive_retry_policy)
+        self.interactive_retry_cap_seconds = max(0.0, float(interactive_retry_cap_seconds))
+        self.max_retry_sleep_seconds = max(0.0, float(max_retry_sleep_seconds))
         self.session = requests.Session()
         self.session.headers.update(headers)
 
@@ -2999,6 +3057,9 @@ class BaseApiClient:
 
         url = f"{self.base_url}{path}"
         last_exc: Optional[Exception] = None
+        interactive_retry_policy = bool(getattr(self, "interactive_retry_policy", True))
+        interactive_retry_cap_seconds = max(0.0, float(getattr(self, "interactive_retry_cap_seconds", INTERACTIVE_RETRY_CAP_SECONDS)))
+        max_retry_sleep_seconds = max(0.0, float(getattr(self, "max_retry_sleep_seconds", MAX_RETRY_SLEEP_SECONDS)))
 
         for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
             try:
@@ -3008,18 +3069,37 @@ class BaseApiClient:
 
                 if response.status_code in {429, 500, 502, 503, 504}:
                     requested_sleep_seconds = _retry_after_seconds(response.headers.get("Retry-After"), attempt)
-                    sleep_seconds = _cap_catalog_retry_sleep(path, requested_sleep_seconds)
+                    retry_bucket = _retry_policy_bucket(path, mutating=mutating)
+                    bucket_cap = (
+                        CATALOG_RETRY_BACKOFF_CAP_SECONDS
+                        if retry_bucket == "catalog"
+                        else MUTATION_RETRY_BACKOFF_CAP_SECONDS if retry_bucket == "mutation" else max_retry_sleep_seconds
+                    )
+                    applied_cap = min(bucket_cap, max_retry_sleep_seconds)
+                    if interactive_retry_policy and retry_bucket == "mutation":
+                        applied_cap = min(applied_cap, interactive_retry_cap_seconds)
+                    sleep_seconds = min(requested_sleep_seconds, applied_cap)
                     logger.warning(
-                        "Request %s %s failed with HTTP %s (%s/%s); retryable status, retrying in %.2fs (requested=%.2fs capped=%.2fs)",
-                        method.upper(),
+                        "Request retry endpoint=%s method=%s status=%s retry=%s/%s policy_bucket=%s policy_mode=%s requested=%.2fs capped=%.2fs",
                         path,
+                        method.upper(),
                         response.status_code,
                         attempt,
                         RETRY_MAX_ATTEMPTS,
-                        sleep_seconds,
+                        retry_bucket,
+                        "interactive" if interactive_retry_policy else "automated",
                         requested_sleep_seconds,
                         sleep_seconds,
                     )
+                    if attempt >= RETRY_MAX_ATTEMPTS:
+                        raise RetryLimitExceededError(
+                            method=method,
+                            path=path,
+                            policy_bucket=retry_bucket,
+                            status_code=response.status_code,
+                            attempts=attempt,
+                            reason_code=_reason_code_for_retry_limit(path, mutating=mutating),
+                        )
                     time.sleep(sleep_seconds)
                     continue
 
@@ -3083,7 +3163,15 @@ class BaseApiClient:
 
 
 class PrintifyClient(BaseApiClient):
-    def __init__(self, api_token: str, dry_run: bool = False):
+    def __init__(
+        self,
+        api_token: str,
+        dry_run: bool = False,
+        *,
+        interactive_retry_policy: bool = True,
+        interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS,
+        max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS,
+    ):
         super().__init__(
             base_url=PRINTIFY_API_BASE,
             headers={
@@ -3093,6 +3181,9 @@ class PrintifyClient(BaseApiClient):
                 "Accept": "application/json",
             },
             dry_run=dry_run,
+            interactive_retry_policy=interactive_retry_policy,
+            interactive_retry_cap_seconds=interactive_retry_cap_seconds,
+            max_retry_sleep_seconds=max_retry_sleep_seconds,
         )
 
     def list_shops(self) -> List[Dict[str, Any]]:
@@ -7223,6 +7314,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     provider_id=resolved_template.printify_print_provider_id,
                     upload_strategy=summarize_upload_strategy(upload_map),
                     error_type=classify_failure(exc),
+                    reason_code=_failure_reason_code(exc),
                     error_message=str(exc),
                     suggested_next_action="Inspect state and rerun with --resume after fixing template or artwork",
                     launch_plan_row=launch_plan_row,
@@ -7323,6 +7415,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--publish", action="store_true", help="Force publish after create/update/rebuild")
     parser.add_argument("--skip-publish", action="store_true", help="Skip publish after create/update/rebuild")
     parser.add_argument("--verify-publish", action="store_true", help="Read back created/updated product and verify basic storefront indicators")
+    parser.add_argument(
+        "--max-retry-sleep-seconds",
+        type=float,
+        default=MAX_RETRY_SLEEP_SECONDS,
+        help="Absolute max retry sleep for API requests (applies to catalog + mutation retry caps).",
+    )
+    parser.add_argument(
+        "--interactive-retry-cap-seconds",
+        type=float,
+        default=INTERACTIVE_RETRY_CAP_SECONDS,
+        help="Extra retry sleep cap for interactive mutation endpoints (publish/create/update).",
+    )
     parser.add_argument("--inspect-state-key", default="", help="Read-only inspect state entry by key (artwork_slug:template_key)")
     parser.add_argument("--list-state-keys", action="store_true", help="List known state keys from state.json and exit")
     parser.add_argument("--list-failures", action="store_true", help="List failed combinations from state and exit")
@@ -7637,7 +7741,9 @@ def run_catalog_cli(
     return False
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", export_preflight_report_path: str = "", allow_preflight_failures: bool = False, preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "") -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", export_preflight_report_path: str = "", allow_preflight_failures: bool = False, preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "", max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS, interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS) -> None:
+    max_retry_sleep_seconds = max(0.0, float(max_retry_sleep_seconds))
+    interactive_retry_cap_seconds = max(0.0, float(interactive_retry_cap_seconds))
     if publish_mode not in {"default", "publish", "skip"}:
         raise RuntimeError(f"Unsupported publish mode: {publish_mode}")
 
@@ -7823,7 +7929,18 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
     if not PRINTIFY_API_TOKEN:
         raise RuntimeError("Missing PRINTIFY_API_TOKEN")
 
-    printify = PrintifyClient(PRINTIFY_API_TOKEN, dry_run=dry_run)
+    interactive_retry_policy = not any([resume, launch_plan_path, batch_size > 0, stop_after_failures > 0])
+    try:
+        printify = PrintifyClient(
+            PRINTIFY_API_TOKEN,
+            dry_run=dry_run,
+            interactive_retry_policy=interactive_retry_policy,
+            interactive_retry_cap_seconds=interactive_retry_cap_seconds,
+            max_retry_sleep_seconds=max_retry_sleep_seconds,
+        )
+    except TypeError:
+        # Backward-compatible path for tests/mocks that monkeypatch PrintifyClient with legacy signature.
+        printify = PrintifyClient(PRINTIFY_API_TOKEN, dry_run=dry_run)
 
     if run_catalog_cli(
         printify=printify,
@@ -8198,6 +8315,8 @@ if __name__ == "__main__":
             rebuild_product=args.rebuild_product,
             publish_mode=publish_mode,
             verify_publish=args.verify_publish,
+            max_retry_sleep_seconds=args.max_retry_sleep_seconds,
+            interactive_retry_cap_seconds=args.interactive_retry_cap_seconds,
             auto_rebuild_on_incompatible_update=args.auto_rebuild_on_incompatible_update,
             sync_collections=args.sync_collections,
             skip_collections=args.skip_collections,
