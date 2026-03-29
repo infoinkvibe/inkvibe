@@ -63,6 +63,12 @@
         "artwork_fit_mode": "contain",
         "max_upscale_factor": 6.0
       }
-    ]
+    ],
+    "min_margin_after_shipping": "3.00",
+    "target_margin_after_shipping": "5.00",
+    "shipping_basis_for_margin": "cost",
+    "disable_variants_below_margin_floor": true,
+    "reprice_variants_to_margin_floor": false,
+    "mark_template_nonviable_if_needed": true
   }
 ]
