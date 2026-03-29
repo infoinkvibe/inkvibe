@@ -4,7 +4,7 @@
   "printify_print_provider_id": 1,
   "provider_selection_strategy": "prefer_printify_choice_then_ranked",
   "fallback_provider_allowed": true,
-  "active": true,
+  "active": false,
   "title_pattern": "{artwork_title} Kiss-Cut Sticker",
   "description_pattern": "<p>{generated_description}</p>",
   "enabled_colors": [

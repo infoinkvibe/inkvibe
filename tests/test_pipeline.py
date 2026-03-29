@@ -110,6 +110,7 @@ from printify_shopify_sync_pipeline import (
     choose_preferred_featured_mockup_candidate,
     resolve_family_collection_target,
     select_provider_for_template,
+    preflight_active_templates,
 )
 from artwork_metadata_generator import (
     CompositeArtworkMetadataGenerator,
@@ -1301,6 +1302,7 @@ def test_variant_margin_guardrails_reprice_disable_and_longsleeve_behavior():
     )
     assert report["repriced_variant_ids"] == [1]
     assert adjusted and adjusted[0]["price"] >= 3200
+    assert compute_sale_price_minor(hoodie, adjusted[0]) == adjusted[0]["price"]
     assert report["final_enabled_count"] == 1
     assert report["disabled_count_after_reprice"] == 0
 
@@ -1785,6 +1787,57 @@ def test_template_filtering_defaults_to_active_only():
     ]
     selected = select_templates(templates)
     assert [template.key for template in selected] == ["tee"]
+
+
+def test_default_product_templates_only_include_proven_active_set():
+    templates = load_templates(Path("product_templates.json"))
+    active_keys = {template.key for template in templates if template.active}
+    assert active_keys == {"mug_new", "poster_basic", "sweatshirt_gildan", "tote_basic"}
+    for key in {"canvas_basic", "blanket_basic", "phone_case_basic", "sticker_kisscut", "tshirt_gildan", "hoodie_gildan"}:
+        assert key not in active_keys
+
+
+def test_preflight_classifies_invalid_zero_selected_and_guardrail_failures():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [{"id": 1}]
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 2}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [
+                {"id": 11, "is_available": True, "options": {"color": "Black", "size": "M"}, "cost": 2000, "price": 2000},
+            ]
+
+    invalid = ProductTemplate("invalid", 404, 2, "{artwork_title}", "{artwork_title}", active=True)
+    zero_selected = ProductTemplate(
+        "zero_selected", 1, 2, "{artwork_title}", "{artwork_title}", active=True, enabled_colors=["White"]
+    )
+    guardrail_zero = ProductTemplate(
+        "guardrail_zero",
+        1,
+        2,
+        "{artwork_title}",
+        "{artwork_title}",
+        active=True,
+        base_price="10.00",
+        markup_type="fixed",
+        markup_value="0",
+        min_margin_after_shipping="50.00",
+        reprice_variants_to_margin_floor=False,
+        disable_variants_below_margin_floor=True,
+    )
+    passed, issues = preflight_active_templates(
+        printify=DummyPrintify(),
+        templates=[invalid, zero_selected, guardrail_zero],
+        explicit_template_keys=[],
+    )
+    assert passed == []
+    issue_map = {issue.template_key: issue.classification for issue in issues}
+    assert issue_map["invalid"] == "invalid_template_config"
+    assert issue_map["zero_selected"] == "zero_variants_selected"
+    assert issue_map["guardrail_zero"] == "zero_enabled_after_guardrails"
 
 
 def test_seo_metadata_context_and_rendering(tmp_path: Path):

@@ -121,6 +121,24 @@ class TemplateSkipGuardrail(RuntimeError):
 
 
 @dataclass
+class TemplatePreflightIssue:
+    template_key: str
+    classification: str
+    message: str
+    requested_explicitly: bool = False
+
+
+def classify_failure(exc: Exception) -> str:
+    if isinstance(exc, TemplateValidationError):
+        return "invalid_template_config"
+    if isinstance(exc, TemplateSkipGuardrail):
+        return "zero_enabled_after_guardrails"
+    if isinstance(exc, NonRetryableRequestError):
+        return "invalid_template_config" if "HTTP 404" in str(exc) else "runtime_api_failure"
+    return "runtime_api_failure"
+
+
+@dataclass
 class Artwork:
     slug: str
     src_path: pathlib.Path
@@ -1967,6 +1985,8 @@ def apply_rounding_mode(price_minor: int, rounding_mode: str) -> int:
 
 
 def compute_sale_price_minor(template: ProductTemplate, variant: Dict[str, Any]) -> int:
+    if variant.get("__sale_price_minor") is not None:
+        return int(variant["__sale_price_minor"])
     base_source = template.base_price if template.base_price is not None else variant.get("price")
     if base_source is None:
         base_source = variant.get("cost")
@@ -2040,6 +2060,7 @@ def apply_variant_margin_guardrails(template: ProductTemplate, variant_rows: Lis
             repriced_minor = cost_minor + _shipping_minor_for_variant(variant_copy, template) + target_margin_minor
             if repriced_minor > sale_minor:
                 variant_copy["price"] = repriced_minor
+                variant_copy["__sale_price_minor"] = repriced_minor
                 repriced.append(int(variant_copy.get("id", 0)))
                 sale_minor = repriced_minor
             margin_minor = _variant_margin_after_shipping_minor(template, variant_copy, sale_minor)
@@ -2051,6 +2072,7 @@ def apply_variant_margin_guardrails(template: ProductTemplate, variant_rows: Lis
             if template.disable_variants_below_margin_floor:
                 disabled.append(int(variant_copy.get("id", 0)))
                 continue
+        variant_copy["__sale_price_minor"] = sale_minor
         adjusted.append(variant_copy)
     viable = bool(adjusted)
     report = {
@@ -4471,6 +4493,89 @@ def _validate_template_catalog_mapping(
     return variants, placement_note
 
 
+def _preflight_template(
+    *,
+    printify: PrintifyClient,
+    template: ProductTemplate,
+    blueprint_ids: set[int],
+) -> Optional[TemplatePreflightIssue]:
+    try:
+        if template.printify_blueprint_id not in blueprint_ids:
+            return TemplatePreflightIssue(
+                template_key=template.key,
+                classification="invalid_template_config",
+                message=f"Blueprint {template.printify_blueprint_id} is not available.",
+            )
+        providers = printify.list_print_providers(template.printify_blueprint_id)
+        provider_ids = {int(provider.get("id", 0)) for provider in providers}
+        if int(template.printify_print_provider_id) not in provider_ids:
+            return TemplatePreflightIssue(
+                template_key=template.key,
+                classification="invalid_template_config",
+                message=(
+                    f"Provider {template.printify_print_provider_id} is not available for blueprint "
+                    f"{template.printify_blueprint_id}."
+                ),
+            )
+        variants = printify.list_variants(template.printify_blueprint_id, template.printify_print_provider_id)
+        selected = choose_variants_from_catalog(variants, template)
+        if not selected:
+            return TemplatePreflightIssue(
+                template_key=template.key,
+                classification="zero_variants_selected",
+                message="Curated option filters selected zero variants.",
+            )
+        guarded, report = apply_variant_margin_guardrails(template, selected)
+        if not guarded:
+            return TemplatePreflightIssue(
+                template_key=template.key,
+                classification="zero_enabled_after_guardrails",
+                message=(
+                    "All selected variants were disabled after pricing guardrails "
+                    f"(selected={report.get('selected_count', 0)} repriced={report.get('repriced_count', 0)})."
+                ),
+            )
+        return None
+    except TemplateValidationError as exc:
+        return TemplatePreflightIssue(template.key, "invalid_template_config", str(exc))
+    except NonRetryableRequestError as exc:
+        classification = "invalid_template_config" if "HTTP 404" in str(exc) else "runtime_api_failure"
+        return TemplatePreflightIssue(template.key, classification, str(exc))
+    except Exception as exc:
+        return TemplatePreflightIssue(template.key, "runtime_api_failure", str(exc))
+
+
+def preflight_active_templates(
+    *,
+    printify: PrintifyClient,
+    templates: List[ProductTemplate],
+    explicit_template_keys: Optional[List[str]] = None,
+) -> Tuple[List[ProductTemplate], List[TemplatePreflightIssue]]:
+    if not all(hasattr(printify, method) for method in ("list_blueprints", "list_print_providers", "list_variants")):
+        logger.warning("Template preflight skipped because Printify client does not expose catalog inspection methods.")
+        return templates, []
+    explicit = {key.strip() for key in (explicit_template_keys or []) if key.strip()}
+    blueprints = printify.list_blueprints()
+    blueprint_ids = {int(blueprint.get("id", 0)) for blueprint in blueprints}
+    passed: List[ProductTemplate] = []
+    issues: List[TemplatePreflightIssue] = []
+    for template in templates:
+        issue = _preflight_template(printify=printify, template=template, blueprint_ids=blueprint_ids)
+        if issue is None:
+            passed.append(template)
+            continue
+        issue.requested_explicitly = template.key in explicit
+        issues.append(issue)
+        logger.warning(
+            "Template preflight failed template=%s classification=%s requested_explicitly=%s message=%s",
+            template.key,
+            issue.classification,
+            issue.requested_explicitly,
+            issue.message,
+        )
+    return passed, issues
+
+
 def resolve_tote_template_catalog_mapping(
     *,
     printify: PrintifyClient,
@@ -5634,7 +5739,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 all_templates_successful = False
                 if summary is not None:
                     summary.products_skipped += 1
-                result = {"status": "no_matching_variants"}
+                result = {"status": "no_matching_variants", "failure_classification": "zero_variants_selected"}
                 record["products"].append({"template": template.key, "state_key": state_key, "title_source": title_info.title_source, "rendered_title": rendered_title, "result": result})
                 if run_rows is not None:
                     run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, "", "", "", "", "", "", "", "", False, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
@@ -5966,7 +6071,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     blueprint_id=resolved_template.printify_blueprint_id,
                     provider_id=resolved_template.printify_print_provider_id,
                     upload_strategy=summarize_upload_strategy(upload_map),
-                    error_type=type(exc).__name__,
+                    error_type=classify_failure(exc),
                     error_message=str(exc),
                     suggested_next_action="Inspect state and rerun with --resume after fixing template or artwork",
                     launch_plan_row=launch_plan_row,
@@ -6586,6 +6691,20 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         template_output_file=template_output_file,
     ):
         return
+
+    templates, preflight_issues = preflight_active_templates(
+        printify=printify,
+        templates=templates,
+        explicit_template_keys=template_keys,
+    )
+    explicit_failures = [issue for issue in preflight_issues if issue.requested_explicitly]
+    if explicit_failures:
+        rendered = "; ".join(
+            f"{issue.template_key}:{issue.classification}:{issue.message}" for issue in explicit_failures
+        )
+        raise RuntimeError(f"Template preflight failed for explicitly requested template(s): {rendered}")
+    if not template_keys and not templates:
+        raise RuntimeError("No runnable active templates after preflight validation.")
 
     shop_id = resolve_shop_id(printify, PRINTIFY_SHOP_ID)
     shopify = ShopifyClient(SHOPIFY_ADMIN_TOKEN, dry_run=dry_run) if SHOPIFY_ADMIN_TOKEN else None

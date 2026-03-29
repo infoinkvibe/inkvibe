@@ -71,5 +71,7 @@
   "aggressive_subject_trim_for_shirts": true,
   "aggressive_subject_trim_mode": "clipart_central",
   "shirt_subject_fill_target": 0.7,
-  "max_upscale_factor": 6.0
+  "max_upscale_factor": 6.0,
+  "active": false,
+  "mark_template_nonviable_if_needed": true
 }
