@@ -73,5 +73,13 @@
   "shirt_subject_fill_target": 0.7,
   "max_upscale_factor": 6.0,
   "active": false,
-  "mark_template_nonviable_if_needed": true
+  "mark_template_nonviable_if_needed": true,
+  "max_allowed_price": "54.99",
+  "min_margin_after_shipping": "3.00",
+  "target_margin_after_shipping": "5.00",
+  "shipping_basis_for_margin": "cost",
+  "disable_variants_below_margin_floor": true,
+  "reprice_variants_to_margin_floor": true,
+  "provider_selection_strategy": "prefer_printify_choice_then_ranked",
+  "fallback_provider_allowed": true
 }

@@ -7,13 +7,18 @@
     "description_pattern": "{generated_description}<p>Best for {audience}. Style notes: {style_keywords}.</p>",
     "enabled_colors": [
       "Black",
-      "White"
+      "White",
+      "Navy",
+      "Sport Grey",
+      "Sand"
     ],
     "enabled_sizes": [
       "S",
       "M",
       "L",
-      "XL"
+      "XL",
+      "2XL",
+      "3XL"
     ],
     "tags": [
       "shirt",
@@ -67,7 +72,15 @@
     "aggressive_subject_trim_for_shirts": true,
     "aggressive_subject_trim_mode": "clipart_central",
     "shirt_subject_fill_target": 0.7,
-    "max_upscale_factor": 6.0
+    "max_upscale_factor": 6.0,
+    "min_margin_after_shipping": "3.00",
+    "target_margin_after_shipping": "5.00",
+    "shipping_basis_for_margin": "cost",
+    "disable_variants_below_margin_floor": true,
+    "reprice_variants_to_margin_floor": true,
+    "max_allowed_price": "34.99",
+    "provider_selection_strategy": "prefer_printify_choice_then_ranked",
+    "fallback_provider_allowed": true
   },
   {
     "key": "mug_11oz",
