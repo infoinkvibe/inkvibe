@@ -94,7 +94,8 @@
     "fallback_provider_allowed": true,
     "active": false,
     "default_price": "24.99",
-    "compare_at_price": "29.99"
+    "compare_at_price": "29.99",
+    "max_allowed_price": "34.99"
   },
   {
     "key": "sweatshirt_gildan",
@@ -275,7 +276,8 @@
     "mark_template_nonviable_if_needed": true,
     "provider_selection_strategy": "prefer_printify_choice_then_ranked",
     "fallback_provider_allowed": true,
-    "active": false
+    "active": false,
+    "max_allowed_price": "54.99"
   },
   {
     "key": "mug_new",

@@ -1364,6 +1364,34 @@ def test_tote_guardrails_report_economics_and_ceiling_failure_reason():
     assert diag["after_shipping_margin_after_reprice_minor"] == -201
     assert diag["max_allowed_price_minor"] == 2999
     assert diag["failure_reason"] == "required_price_exceeds_max_allowed_price"
+    assert report["failure_reason_counts"]["required_price_exceeds_max_allowed_price"] == 1
+
+
+def test_apparel_guardrails_preserve_original_cost_when_price_is_repriced():
+    tee = ProductTemplate(
+        key="tshirt_gildan",
+        printify_blueprint_id=6,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        base_price="19.99",
+        markup_type="fixed",
+        markup_value="0.00",
+        min_margin_after_shipping="3.00",
+        target_margin_after_shipping="5.00",
+        reprice_variants_to_margin_floor=True,
+        disable_variants_below_margin_floor=True,
+    )
+    adjusted, report = apply_variant_margin_guardrails(
+        tee,
+        [{"id": 31, "price": 1200, "shipping": 500, "is_available": True, "options": {"color": "Black", "size": "M"}}],
+    )
+    assert report["repriced_count"] == 1
+    assert report["final_enabled_count"] == 1
+    assert adjusted and adjusted[0]["price"] == 2200
+    diag = report["variant_diagnostics"][0]
+    assert diag["printify_cost_minor"] == 1200
+    assert diag["after_shipping_margin_after_reprice_minor"] == 500
 
 def test_uuid_noisy_filename_detection():
     assert filename_title_quality_reason("8f6f45d4-c95f-4f68-9cf9-f022f5197a18") == "uuid_like"
@@ -1930,6 +1958,53 @@ def test_preflight_tote_nonviable_report_includes_economic_diagnostics():
     assert "reason=required_price_exceeds_max_allowed_price" in row.message
 
 
+def test_preflight_apparel_nonviable_report_includes_economic_diagnostics_and_reason_counts():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [{"id": 6}]
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 99, "title": "Printify Choice"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [
+                {"id": 22, "is_available": True, "options": {"color": "Black", "size": "M"}, "cost": 2600, "shipping": 600},
+            ]
+
+    tee = ProductTemplate(
+        "tshirt_gildan",
+        6,
+        99,
+        "{artwork_title}",
+        "{artwork_title}",
+        active=True,
+        enabled_colors=["Black"],
+        enabled_sizes=["M"],
+        base_price="24.99",
+        markup_type="fixed",
+        markup_value="0.00",
+        min_margin_after_shipping="3.00",
+        target_margin_after_shipping="5.00",
+        max_allowed_price="29.99",
+        reprice_variants_to_margin_floor=True,
+        disable_variants_below_margin_floor=True,
+    )
+    passed, issues, report_rows = preflight_active_templates(printify=DummyPrintify(), templates=[tee], explicit_template_keys=[])
+    assert passed == []
+    assert issues and issues[0].classification == "zero_enabled_after_guardrails"
+    row = report_rows[0]
+    assert row.apparel_original_sale_price_minor == 2499
+    assert row.apparel_repriced_sale_price_minor == 2999
+    assert row.apparel_printify_cost_minor == 2600
+    assert row.apparel_shipping_basis_used == "cost"
+    assert row.apparel_shipping_minor == 600
+    assert row.apparel_target_margin_after_shipping_minor == 500
+    assert row.apparel_min_margin_after_shipping_minor == 300
+    assert row.apparel_margin_after_reprice_minor == -201
+    assert '"required_price_exceeds_max_allowed_price": 1' in row.apparel_failure_reason_counts
+    assert "Apparel economics:" in row.message
+
+
 def test_preflight_applies_provider_strategy_before_invalid_template_classification():
     class DummyPrintify:
         def list_blueprints(self):
@@ -1961,6 +2036,29 @@ def test_preflight_applies_provider_strategy_before_invalid_template_classificat
     assert issues == []
     assert report_rows[0].provider_id == 2
     assert report_rows[0].preflight_status == "passed"
+
+
+def test_choose_variants_for_apparel_prefers_core_colors_and_common_sizes_when_capped():
+    template = ProductTemplate(
+        "hoodie_gildan",
+        77,
+        99,
+        "{artwork_title}",
+        "{artwork_title}",
+        enabled_colors=["Black", "White", "Navy", "Sport Grey", "Sand"],
+        enabled_sizes=["S", "M", "L", "XL", "2XL", "3XL"],
+        max_enabled_variants=4,
+    )
+    variants = [
+        {"id": 1, "is_available": True, "options": {"color": "Sand", "size": "3XL"}, "cost": 3200},
+        {"id": 2, "is_available": True, "options": {"color": "Black", "size": "XL"}, "cost": 2800},
+        {"id": 3, "is_available": True, "options": {"color": "Black", "size": "M"}, "cost": 2600},
+        {"id": 4, "is_available": True, "options": {"color": "White", "size": "L"}, "cost": 2700},
+        {"id": 5, "is_available": True, "options": {"color": "Navy", "size": "S"}, "cost": 2750},
+        {"id": 6, "is_available": True, "options": {"color": "Sport Grey", "size": "2XL"}, "cost": 2900},
+    ]
+    chosen = choose_variants_from_catalog(variants, template)
+    assert [v["id"] for v in chosen] == [3, 2, 4, 5]
 
 
 def test_run_audit_mode_does_not_raise_on_explicit_preflight_failures_and_exports_report(tmp_path: Path, monkeypatch):

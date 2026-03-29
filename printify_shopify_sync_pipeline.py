@@ -159,6 +159,18 @@ class TemplatePreflightReportRow:
     tote_margin_after_reprice_minor: int = 0
     tote_max_allowed_price_minor: int = 0
     tote_failure_reason: str = ""
+    apparel_original_sale_price_minor: int = 0
+    apparel_repriced_sale_price_minor: int = 0
+    apparel_printify_cost_minor: int = 0
+    apparel_shipping_basis_used: str = ""
+    apparel_shipping_minor: int = 0
+    apparel_target_margin_after_shipping_minor: int = 0
+    apparel_min_margin_after_shipping_minor: int = 0
+    apparel_margin_before_reprice_minor: int = 0
+    apparel_margin_after_reprice_minor: int = 0
+    apparel_max_allowed_price_minor: int = 0
+    apparel_failed_variant_reasons: str = ""
+    apparel_failure_reason_counts: str = ""
 
 
 def classify_failure(exc: Exception) -> str:
@@ -2070,10 +2082,13 @@ def _shipping_minor_for_variant(variant: Dict[str, Any], template: ProductTempla
 
 
 def _variant_margin_after_shipping_minor(template: ProductTemplate, variant: Dict[str, Any], sale_price_minor: int) -> int:
-    cost_source = variant.get("cost") if variant.get("cost") is not None else variant.get("price")
-    if cost_source is None:
-        cost_source = template.base_price if template.base_price is not None else template.default_price
-    cost_minor = normalize_printify_price(cost_source)
+    if variant.get("__printify_cost_minor") is not None:
+        cost_minor = int(variant.get("__printify_cost_minor", 0))
+    else:
+        cost_source = variant.get("cost") if variant.get("cost") is not None else variant.get("price")
+        if cost_source is None:
+            cost_source = template.base_price if template.base_price is not None else template.default_price
+        cost_minor = normalize_printify_price(cost_source)
     return sale_price_minor - cost_minor - _shipping_minor_for_variant(variant, template)
 
 
@@ -2094,6 +2109,7 @@ def apply_variant_margin_guardrails(template: ProductTemplate, variant_rows: Lis
     disabled: List[int] = []
     repriced: List[int] = []
     failed_variant_reasons: Dict[int, str] = {}
+    failure_reason_counts: Dict[str, int] = {}
     variant_diagnostics: List[Dict[str, Any]] = []
     selected_count = len(variant_rows)
     for variant in variant_rows:
@@ -2104,6 +2120,7 @@ def apply_variant_margin_guardrails(template: ProductTemplate, variant_rows: Lis
         margin_minor = margin_before_reprice_minor
         cost_source = variant_copy.get("cost") if variant_copy.get("cost") is not None else variant_copy.get("price")
         cost_minor = normalize_printify_price(cost_source if cost_source is not None else template.default_price)
+        variant_copy["__printify_cost_minor"] = cost_minor
         shipping_minor = _shipping_minor_for_variant(variant_copy, template)
         ceiling_minor = _variant_price_ceiling_minor(template, variant_copy)
         failure_reason = ""
@@ -2125,6 +2142,7 @@ def apply_variant_margin_guardrails(template: ProductTemplate, variant_rows: Lis
                 failure_reason = "margin_below_floor_after_reprice" if template.reprice_variants_to_margin_floor else "margin_below_floor_no_reprice"
             disabled.append(int(variant_copy.get("id", 0)))
             failed_variant_reasons[int(variant_copy.get("id", 0))] = failure_reason
+            failure_reason_counts[failure_reason] = failure_reason_counts.get(failure_reason, 0) + 1
             variant_diagnostics.append({
                 "variant_id": int(variant_copy.get("id", 0)),
                 "original_sale_price_minor": original_sale_minor,
@@ -2145,6 +2163,7 @@ def apply_variant_margin_guardrails(template: ProductTemplate, variant_rows: Lis
                 failure_reason = failure_reason or "negative_margin_after_shipping"
                 disabled.append(int(variant_copy.get("id", 0)))
                 failed_variant_reasons[int(variant_copy.get("id", 0))] = failure_reason
+                failure_reason_counts[failure_reason] = failure_reason_counts.get(failure_reason, 0) + 1
                 variant_diagnostics.append({
                     "variant_id": int(variant_copy.get("id", 0)),
                     "original_sale_price_minor": original_sale_minor,
@@ -2187,6 +2206,7 @@ def apply_variant_margin_guardrails(template: ProductTemplate, variant_rows: Lis
         "final_enabled_count": len(adjusted),
         "skip_reason": "" if viable else "disabled_by_guardrails_after_reprice",
         "failed_variant_reasons": failed_variant_reasons,
+        "failure_reason_counts": failure_reason_counts,
         "variant_diagnostics": variant_diagnostics,
     }
     logger.info(
@@ -4507,6 +4527,26 @@ def choose_variants_from_catalog(catalog_variants: Any, template: ProductTemplat
 
         if color_ok and size_ok and option_filter_ok and is_available:
             chosen.append(variant)
+    def _is_apparel_recovery_key(key: str) -> bool:
+        return key in {"tshirt_gildan", "hoodie_gildan"}
+
+    if _is_apparel_recovery_key(template.key):
+        color_rank = {"Black": 0, "White": 1, "Navy": 2, "Sport Grey": 3, "Sand": 4}
+        size_rank = {"S": 0, "M": 1, "L": 2, "XL": 3, "2XL": 4, "3XL": 5}
+
+        def _variant_sort_key(variant: Dict[str, Any]) -> Tuple[int, int, int]:
+            color = _variant_option_value(variant, "color")
+            size = _variant_option_value(variant, "size")
+            cost_source = variant.get("cost") if variant.get("cost") is not None else variant.get("price")
+            cost_minor = normalize_printify_price(cost_source if cost_source is not None else template.default_price)
+            return (
+                color_rank.get(color, 99),
+                size_rank.get(size, 99),
+                cost_minor,
+            )
+
+        chosen.sort(key=_variant_sort_key)
+
     effective_limit = template.max_enabled_variants if template.max_enabled_variants is not None else DEFAULT_MAX_ENABLED_VARIANTS
     if effective_limit > 0 and len(chosen) > effective_limit:
         logger.warning(
@@ -4628,6 +4668,7 @@ def _preflight_template(
     resolved_template = select_provider_for_template(printify=printify, template=template)
     blueprint_id = int(resolved_template.printify_blueprint_id)
     provider_id = int(resolved_template.printify_print_provider_id)
+    is_apparel_diag_template = template.key in {"tshirt_gildan", "hoodie_gildan"}
 
     def _recommended_action_for(classification: str) -> str:
         if classification == "zero_enabled_after_guardrails":
@@ -4647,8 +4688,14 @@ def _preflight_template(
         disabled_count_after_reprice: int = 0,
         final_enabled_count: int = 0,
         tote_diag: Optional[Dict[str, Any]] = None,
+        apparel_diag: Optional[Dict[str, Any]] = None,
+        failed_variant_reasons: Optional[Dict[int, str]] = None,
+        failure_reason_counts: Optional[Dict[str, int]] = None,
     ) -> Tuple[TemplatePreflightIssue, TemplatePreflightReportRow]:
         tote_diag = tote_diag or {}
+        apparel_diag = apparel_diag or {}
+        failed_variant_reasons = failed_variant_reasons or {}
+        failure_reason_counts = failure_reason_counts or {}
         issue = TemplatePreflightIssue(
             template_key=template.key,
             classification=classification,
@@ -4684,6 +4731,18 @@ def _preflight_template(
             tote_margin_after_reprice_minor=int(tote_diag.get("after_shipping_margin_after_reprice_minor", 0)),
             tote_max_allowed_price_minor=int(tote_diag.get("max_allowed_price_minor", 0)),
             tote_failure_reason=str(tote_diag.get("failure_reason", "")),
+            apparel_original_sale_price_minor=int(apparel_diag.get("original_sale_price_minor", 0)),
+            apparel_repriced_sale_price_minor=int(apparel_diag.get("repriced_sale_price_minor", 0)),
+            apparel_printify_cost_minor=int(apparel_diag.get("printify_cost_minor", 0)),
+            apparel_shipping_basis_used=str(apparel_diag.get("shipping_basis_used", "")),
+            apparel_shipping_minor=int(apparel_diag.get("shipping_minor", 0)),
+            apparel_target_margin_after_shipping_minor=int(apparel_diag.get("target_margin_after_shipping_minor", 0)),
+            apparel_min_margin_after_shipping_minor=int(apparel_diag.get("min_margin_after_shipping_minor", 0)),
+            apparel_margin_before_reprice_minor=int(apparel_diag.get("after_shipping_margin_before_reprice_minor", 0)),
+            apparel_margin_after_reprice_minor=int(apparel_diag.get("after_shipping_margin_after_reprice_minor", 0)),
+            apparel_max_allowed_price_minor=int(apparel_diag.get("max_allowed_price_minor", 0)),
+            apparel_failed_variant_reasons=json.dumps(failed_variant_reasons, sort_keys=True),
+            apparel_failure_reason_counts=json.dumps(failure_reason_counts, sort_keys=True),
         )
         return issue, row
 
@@ -4707,6 +4766,9 @@ def _preflight_template(
         repriced_count = int(report.get("repriced_count", 0))
         disabled_count = int(report.get("disabled_count_after_reprice", 0))
         final_enabled_count = len(guarded)
+        apparel_diag = (report.get("variant_diagnostics") or [])[0] if is_apparel_diag_template else {}
+        failed_variant_reasons = {int(k): str(v) for k, v in (report.get("failed_variant_reasons") or {}).items()}
+        failure_reason_counts = {str(k): int(v) for k, v in (report.get("failure_reason_counts") or {}).items()}
         if not guarded:
             tote_diag_suffix = ""
             if template.key == "tote_basic" and tote_diag:
@@ -4723,15 +4785,34 @@ def _preflight_template(
                     f"max_allowed_minor={int(tote_diag.get('max_allowed_price_minor', 0))} "
                     f"reason={str(tote_diag.get('failure_reason', 'margin_below_floor_after_reprice'))}"
                 )
+            apparel_diag_suffix = ""
+            if is_apparel_diag_template and apparel_diag:
+                apparel_diag_suffix = (
+                    " "
+                    f"Apparel economics: original_sale_minor={int(apparel_diag.get('original_sale_price_minor', 0))} "
+                    f"repriced_sale_minor={int(apparel_diag.get('repriced_sale_price_minor', 0))} "
+                    f"cost_minor={int(apparel_diag.get('printify_cost_minor', 0))} "
+                    f"shipping_basis={str(apparel_diag.get('shipping_basis_used', '')) or '-'} "
+                    f"shipping_minor={int(apparel_diag.get('shipping_minor', 0))} "
+                    f"margin_before_minor={int(apparel_diag.get('after_shipping_margin_before_reprice_minor', 0))} "
+                    f"margin_after_minor={int(apparel_diag.get('after_shipping_margin_after_reprice_minor', 0))} "
+                    f"min_margin_minor={int(apparel_diag.get('min_margin_after_shipping_minor', 0))} "
+                    f"target_margin_minor={int(apparel_diag.get('target_margin_after_shipping_minor', 0))} "
+                    f"max_allowed_minor={int(apparel_diag.get('max_allowed_price_minor', 0))} "
+                    f"failure_reason_counts={json.dumps(failure_reason_counts, sort_keys=True)}"
+                )
             return _failure(
                 "zero_enabled_after_guardrails",
                 "All selected variants were disabled after pricing guardrails "
-                f"(selected={selected_count} repriced={repriced_count}).{tote_diag_suffix}",
+                f"(selected={selected_count} repriced={repriced_count}).{tote_diag_suffix}{apparel_diag_suffix}",
                 selected_count=selected_count,
                 repriced_count=repriced_count,
                 disabled_count_after_reprice=disabled_count,
                 final_enabled_count=final_enabled_count,
                 tote_diag=tote_diag,
+                apparel_diag=apparel_diag,
+                failed_variant_reasons=failed_variant_reasons,
+                failure_reason_counts=failure_reason_counts,
             )
         return None, TemplatePreflightReportRow(
             template_key=template.key,
@@ -4756,6 +4837,18 @@ def _preflight_template(
             tote_margin_after_reprice_minor=int(tote_diag.get("after_shipping_margin_after_reprice_minor", 0)),
             tote_max_allowed_price_minor=int(tote_diag.get("max_allowed_price_minor", 0)),
             tote_failure_reason=str(tote_diag.get("failure_reason", "")),
+            apparel_original_sale_price_minor=int(apparel_diag.get("original_sale_price_minor", 0)),
+            apparel_repriced_sale_price_minor=int(apparel_diag.get("repriced_sale_price_minor", 0)),
+            apparel_printify_cost_minor=int(apparel_diag.get("printify_cost_minor", 0)),
+            apparel_shipping_basis_used=str(apparel_diag.get("shipping_basis_used", "")),
+            apparel_shipping_minor=int(apparel_diag.get("shipping_minor", 0)),
+            apparel_target_margin_after_shipping_minor=int(apparel_diag.get("target_margin_after_shipping_minor", 0)),
+            apparel_min_margin_after_shipping_minor=int(apparel_diag.get("min_margin_after_shipping_minor", 0)),
+            apparel_margin_before_reprice_minor=int(apparel_diag.get("after_shipping_margin_before_reprice_minor", 0)),
+            apparel_margin_after_reprice_minor=int(apparel_diag.get("after_shipping_margin_after_reprice_minor", 0)),
+            apparel_max_allowed_price_minor=int(apparel_diag.get("max_allowed_price_minor", 0)),
+            apparel_failed_variant_reasons=json.dumps(failed_variant_reasons, sort_keys=True),
+            apparel_failure_reason_counts=json.dumps(failure_reason_counts, sort_keys=True),
         )
     except TemplateValidationError as exc:
         return _failure("invalid_template_config", str(exc))
