@@ -24,9 +24,12 @@ from printify_shopify_sync_pipeline import (
     ProductTemplate,
     PreparedArtwork,
     TemplateValidationError,
+    InsufficientArtworkResolutionError,
     choose_upload_strategy,
+    classify_failure,
     _compute_backoff,
     choose_variants_from_catalog,
+    choose_variants_from_catalog_with_diagnostics,
     ensure_state_shape,
     normalize_printify_price,
     compute_sale_price_minor,
@@ -3617,12 +3620,102 @@ def test_select_provider_for_template_discovers_canvas_mapping_when_template_hin
         "{artwork_title}",
         "{artwork_title}",
         active=False,
-        enabled_variant_option_filters={"size": ['12" x 16"', '16" x 20"']},
+        enabled_variant_option_filters={"size": ['9" x 12"', '11" x 14"']},
         provider_selection_strategy="prefer_printify_choice_then_ranked",
     )
     resolved = select_provider_for_template(printify=DummyPrintify(), template=template)
     assert resolved.printify_blueprint_id == 13
     assert resolved.printify_print_provider_id == 7
+
+
+def test_canvas_size_normalization_matches_provider_quotes_and_orientation_labels():
+    template = ProductTemplate(
+        "canvas_basic",
+        944,
+        105,
+        "{artwork_title}",
+        "{artwork_title}",
+        enabled_sizes=['9" x 12"', "11″ x 14″"],
+    )
+    variants = [
+        {"id": 1, "is_available": True, "options": {"size": '9" x 12" (Vertical)'}},
+        {"id": 2, "is_available": True, "options": {"size": "11″ x 14″ (Vertical)"}},
+        {"id": 3, "is_available": True, "options": {"size": '16" x 12" (Horizontal)'}},
+    ]
+    selected, diagnostics = choose_variants_from_catalog_with_diagnostics(variants, template)
+    assert sorted([row["id"] for row in selected]) == [1, 2]
+    assert diagnostics.zero_selection_reason == ""
+
+
+def test_preflight_canvas_reports_size_filter_mismatch_classification_with_valid_family():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [{"id": 944, "title": "Canvas Print"}]
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 105, "title": "Canvas Provider"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [
+                {"id": 1, "is_available": True, "cost": 2200, "price": 3200, "options": {"size": '9" x 12" (Vertical)'}},
+                {"id": 2, "is_available": True, "cost": 2400, "price": 3400, "options": {"size": "11″ x 14″ (Vertical)"}},
+            ]
+
+    template = ProductTemplate(
+        "canvas_basic",
+        944,
+        105,
+        "{artwork_title}",
+        "{artwork_title}",
+        active=False,
+        enabled_sizes=["12″ x 16″", "16″ x 20″"],
+        provider_selection_strategy="prefer_printify_choice_then_ranked",
+    )
+    passed, issues, rows = preflight_active_templates(printify=DummyPrintify(), templates=[template], explicit_template_keys=[])
+    assert passed == []
+    assert issues and issues[0].classification == "canvas_size_filter_mismatch"
+    assert rows[0].classification == "canvas_size_filter_mismatch"
+
+
+def test_preflight_canvas_recovers_with_provider_backed_vertical_sizes_and_stays_inactive():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [
+                {"id": 13, "title": "Unisex Tee"},
+                {"id": 944, "title": "Canvas Print"},
+            ]
+
+        def list_print_providers(self, blueprint_id):
+            if blueprint_id == 13:
+                return [{"id": 1, "title": "Legacy Tee Provider"}]
+            return [{"id": 105, "title": "Canvas Provider"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            if blueprint_id == 13:
+                return [{"id": 10, "is_available": True, "options": {"color": "Black", "size": "M"}}]
+            return [
+                {"id": 21, "is_available": True, "cost": 2200, "price": 3200, "options": {"size": '9" x 12" (Vertical)', "depth": '1.25"'}},
+                {"id": 22, "is_available": True, "cost": 2400, "price": 3400, "options": {"size": "11″ x 14″ (Vertical)", "depth": '1.25"'}},
+                {"id": 23, "is_available": True, "cost": 2600, "price": 3600, "options": {"size": '16" x 12" (Horizontal)', "depth": '1.25"'}},
+            ]
+
+    template = ProductTemplate(
+        "canvas_basic",
+        13,
+        1,
+        "{artwork_title}",
+        "{artwork_title}",
+        active=False,
+        enabled_sizes=['9" x 12"', '11" x 14"'],
+        provider_selection_strategy="prefer_printify_choice_then_ranked",
+    )
+    passed, issues, rows = preflight_active_templates(printify=DummyPrintify(), templates=[template], explicit_template_keys=[])
+    assert issues == []
+    assert len(passed) == 1
+    assert passed[0].active is False
+    assert rows[0].blueprint_id == 944
+    assert rows[0].provider_id == 105
+    assert rows[0].catalog_discovery_used is True
 
 
 def test_preflight_blanket_recovers_to_plausible_mapping_and_stays_inactive():
@@ -4250,6 +4343,47 @@ def test_resolve_artwork_for_placement_non_poster_behavior_unchanged_for_contain
     assert result.upscaled is False
     assert result.requested_upscale_factor == 1.0
     assert result.applied_upscale_factor == 1.0
+
+
+def test_resolve_artwork_for_blanket_undersized_cover_raises_structured_resolution_error(tmp_path: Path):
+    path = tmp_path / "blanket-small.png"
+    Image.new("RGBA", (1280, 1280), (255, 0, 0, 255)).save(path)
+    artwork = Artwork("blanket-small", path, "Blanket Small", "", [], 1280, 1280)
+    placement = PlacementRequirement("front", 6000, 4800, artwork_fit_mode="cover")
+
+    with pytest.raises(InsufficientArtworkResolutionError) as exc_info:
+        resolve_artwork_for_placement(
+            artwork,
+            placement,
+            template_key="blanket_basic",
+            allow_upscale=False,
+            upscale_method="lanczos",
+            skip_undersized=False,
+        )
+    exc = exc_info.value
+    assert exc.template_key == "blanket_basic"
+    assert exc.placement_name == "front"
+    assert exc.source_size == (1280, 1280)
+    assert exc.required_size == (6000, 4800)
+    assert classify_failure(exc) == "insufficient_artwork_resolution"
+
+
+def test_resolve_artwork_for_blanket_cover_succeeds_when_source_is_large_enough(tmp_path: Path):
+    path = tmp_path / "blanket-large.png"
+    Image.new("RGBA", (8000, 6400), (255, 0, 0, 255)).save(path)
+    artwork = Artwork("blanket-large", path, "Blanket Large", "", [], 8000, 6400)
+    placement = PlacementRequirement("front", 6000, 4800, artwork_fit_mode="cover")
+
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        template_key="blanket_basic",
+        allow_upscale=False,
+        upscale_method="lanczos",
+        skip_undersized=False,
+    )
+    assert result.action == "covered_cropped"
+    assert result.final_size == (6000, 4800)
 
 
 def test_resolve_tote_template_catalog_mapping_fails_for_missing_blueprint():

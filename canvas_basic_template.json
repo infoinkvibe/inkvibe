@@ -9,9 +9,8 @@
   "description_pattern": "<p>{generated_description}</p>",
   "enabled_colors": [],
   "enabled_sizes": [
-    "12\u2033 x 16\u2033",
-    "16\u2033 x 20\u2033",
-    "18\u2033 x 24\u2033"
+    "9\" x 12\" (Vertical)",
+    "11\" x 14\" (Vertical)"
   ],
   "max_enabled_variants": 12,
   "tags": [

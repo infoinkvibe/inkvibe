@@ -482,9 +482,8 @@
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],
     "enabled_sizes": [
-      "12″ x 16″",
-      "16″ x 20″",
-      "18″ x 24″"
+      "9\" x 12\" (Vertical)",
+      "11\" x 14\" (Vertical)"
     ],
     "max_enabled_variants": 12,
     "tags": [
