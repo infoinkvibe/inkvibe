@@ -1602,6 +1602,10 @@ def _template_intended_family(template: ProductTemplate) -> str:
         return "phone_case"
     if "sticker" in hint:
         return "sticker"
+    if "canvas" in hint or "wall art" in hint:
+        return "canvas"
+    if "blanket" in hint or "throw" in hint or "fleece" in hint:
+        return "blanket"
     return "other"
 
 
@@ -1646,6 +1650,24 @@ def _looks_like_phone_model_value(value: str) -> bool:
     if any(token in normalized for token in canonical_tokens):
         return True
     return bool(re.search(r"\b(?:iphone|pixel|galaxy)\s*[a-z]?\d{1,2}(?:\s*(?:pro|max|plus|ultra))?\b", normalized))
+
+
+def _looks_like_canvas_size(value: str) -> bool:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return False
+    if "canvas" in normalized:
+        return True
+    return bool(re.search(r"\d{1,3}\s*(?:\"|″|in)\s*[x×]\s*\d{1,3}\s*(?:\"|″|in)?", normalized))
+
+
+def _looks_like_blanket_size(value: str) -> bool:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return False
+    if "blanket" in normalized or "throw" in normalized:
+        return True
+    return bool(re.search(r"\d{1,3}\s*(?:\"|in)\s*[x×]\s*\d{1,3}\s*(?:\"|in)?", normalized))
 
 
 def validate_catalog_family_schema(
@@ -1716,6 +1738,62 @@ def validate_catalog_family_schema(
                 intended_family=intended_family,
                 plausible=False,
                 reason=f"Sticker schema mismatch: insufficient sticker-like options. option_names={option_names}",
+            )
+        return CatalogFamilyValidationResult(intended_family=intended_family, plausible=True)
+
+    if intended_family == "canvas":
+        has_size_dimension = any(token in option_name_tokens for token in ("size", "dimensions"))
+        size_values = option_values_summary.get("size", []) + option_values_summary.get("dimensions", [])
+        has_canvas_sizes = any(_looks_like_canvas_size(value) for value in size_values)
+        has_title_signal = any(token in title_tokens for token in ("canvas", "framed canvas", "wall art", "gallery wrap"))
+        wrong_family_title = any(token in title_tokens for token in ("blanket", "hoodie", "t-shirt", "sweatshirt", "phone case", "sticker"))
+        has_device_or_apparel_schema = any(token in option_name_tokens for token in ("model", "device", "surface", "color"))
+        if wrong_family_title:
+            return CatalogFamilyValidationResult(
+                intended_family=intended_family,
+                plausible=False,
+                reason="Canvas schema mismatch: blueprint/provider title indicates a different product family.",
+            )
+        if has_device_or_apparel_schema and not has_canvas_sizes:
+            return CatalogFamilyValidationResult(
+                intended_family=intended_family,
+                plausible=False,
+                reason="Canvas schema mismatch: model/device/apparel-style options detected without canvas-like dimensions.",
+            )
+        if not ((has_size_dimension and has_canvas_sizes) or has_title_signal):
+            return CatalogFamilyValidationResult(
+                intended_family=intended_family,
+                plausible=False,
+                reason=f"Canvas schema mismatch: missing canvas-like dimensions/title hints. option_names={option_names}",
+            )
+        return CatalogFamilyValidationResult(intended_family=intended_family, plausible=True)
+
+    if intended_family == "blanket":
+        has_size_dimension = any(token in option_name_tokens for token in ("size", "dimensions"))
+        size_values = option_values_summary.get("size", []) + option_values_summary.get("dimensions", [])
+        has_blanket_sizes = any(_looks_like_blanket_size(value) for value in size_values)
+        has_material_signal = any(token in all_values for token in ("fleece", "mink", "sherpa", "woven", "plush"))
+        has_title_signal = any(token in title_tokens for token in ("blanket", "throw", "fleece", "sherpa"))
+        wrong_family_title = any(token in title_tokens for token in ("hoodie", "t-shirt", "sweatshirt", "phone case", "sticker", "canvas", "poster"))
+        apparel_sizes = {"s", "m", "l", "xl", "2xl", "3xl"}
+        has_only_apparel_sizes = bool(all_values.intersection(apparel_sizes)) and not has_blanket_sizes
+        if wrong_family_title:
+            return CatalogFamilyValidationResult(
+                intended_family=intended_family,
+                plausible=False,
+                reason="Blanket schema mismatch: blueprint/provider title indicates a different product family.",
+            )
+        if has_only_apparel_sizes:
+            return CatalogFamilyValidationResult(
+                intended_family=intended_family,
+                plausible=False,
+                reason="Blanket schema mismatch: only apparel-like sizes present without blanket dimensions.",
+            )
+        if not ((has_size_dimension and has_blanket_sizes) or has_material_signal or has_title_signal):
+            return CatalogFamilyValidationResult(
+                intended_family=intended_family,
+                plausible=False,
+                reason=f"Blanket schema mismatch: missing blanket/throw/fleece-style dimensions or material hints. option_names={option_names}",
             )
         return CatalogFamilyValidationResult(intended_family=intended_family, plausible=True)
 
@@ -1790,6 +1868,8 @@ def _discover_family_catalog_mapping(
     family_queries = {
         "phone_case": ["phone case", "tough case", "slim case"],
         "sticker": ["kiss-cut sticker", "sticker", "die-cut sticker"],
+        "canvas": ["canvas", "framed canvas", "wall art"],
+        "blanket": ["blanket", "throw blanket", "fleece blanket"],
     }
     queries = family_queries.get(intended_family, [])
     blueprints = printify.list_blueprints()
@@ -1844,6 +1924,23 @@ def _discover_family_catalog_mapping(
                     score += 1000
                 if "size" in lowered:
                     score += 500
+            elif intended_family == "canvas":
+                lowered = {name.lower() for name in option_names}
+                if "size" in lowered or "dimensions" in lowered:
+                    score += 800
+                if "canvas" in blueprint_title.lower():
+                    score += 500
+                if "wall art" in blueprint_title.lower():
+                    score += 200
+            elif intended_family == "blanket":
+                lowered = {name.lower() for name in option_names}
+                if "size" in lowered or "dimensions" in lowered:
+                    score += 800
+                title_blob = f"{blueprint_title} {provider_title}".lower()
+                if "blanket" in title_blob or "throw" in title_blob:
+                    score += 500
+                if "fleece" in title_blob or "sherpa" in title_blob:
+                    score += 200
             if _provider_is_printify_choice(provider):
                 score += 200
             if score > best_score:

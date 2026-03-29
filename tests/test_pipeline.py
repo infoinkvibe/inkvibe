@@ -1866,7 +1866,7 @@ def test_default_product_templates_only_include_proven_active_set():
 
 
 def test_production_baseline_template_keys_are_frozen_to_current_validated_set():
-    assert set(PRODUCTION_BASELINE_TEMPLATE_KEYS) == {
+    assert PRODUCTION_BASELINE_TEMPLATE_KEYS == (
         "tshirt_gildan",
         "sweatshirt_gildan",
         "hoodie_gildan",
@@ -1874,7 +1874,7 @@ def test_production_baseline_template_keys_are_frozen_to_current_validated_set()
         "poster_basic",
         "phone_case_basic",
         "sticker_kisscut",
-    }
+    )
 
 
 def test_preflight_classifies_invalid_zero_selected_and_guardrail_failures():
@@ -3565,6 +3565,110 @@ def test_preflight_sticker_remains_inactive_with_correct_family_when_requested_s
     assert issues and issues[0].classification == "zero_variants_selected"
     assert report_rows[0].classification == "zero_variants_selected"
     assert report_rows[0].intended_family == "sticker"
+
+
+def test_validate_catalog_family_schema_rejects_wrong_family_for_canvas():
+    template = ProductTemplate("canvas_basic", 13, 1, "{artwork_title}", "{artwork_title}", product_type_label="Canvas Print")
+    variants = [{"id": 1, "is_available": True, "options": {"Device Model": "iPhone 15", "Finish": "Glossy"}}]
+    result = validate_catalog_family_schema(template=template, variants=variants, blueprint_title="Tough Phone Cases")
+    assert result.intended_family == "canvas"
+    assert result.plausible is False
+    assert "canvas schema mismatch" in (result.reason or "").lower()
+
+
+def test_validate_catalog_family_schema_rejects_wrong_family_for_blanket():
+    template = ProductTemplate("blanket_basic", 50, 1, "{artwork_title}", "{artwork_title}", product_type_label="Blanket")
+    variants = [{"id": 1, "is_available": True, "options": {"Color": "Black", "Size": "M"}}]
+    result = validate_catalog_family_schema(template=template, variants=variants, blueprint_title="Unisex Heavy Blend Hoodie")
+    assert result.intended_family == "blanket"
+    assert result.plausible is False
+    assert "blanket schema mismatch" in (result.reason or "").lower()
+
+
+def test_select_provider_for_template_discovers_canvas_mapping_when_template_hint_is_wrong_family():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [
+                {"id": 9, "title": "Unisex Tee"},
+                {"id": 13, "title": "Matte Canvas, Framed"},
+            ]
+
+        def list_print_providers(self, blueprint_id):
+            if blueprint_id == 9:
+                return [{"id": 99, "title": "Generic"}]
+            if blueprint_id == 13:
+                return [{"id": 7, "title": "Printify Choice"}]
+            return []
+
+        def list_variants(self, blueprint_id, provider_id):
+            if blueprint_id == 9:
+                return [{"id": 1, "is_available": True, "options": {"Color": "Black", "Size": "M"}}]
+            if blueprint_id == 13 and provider_id == 7:
+                return [
+                    {"id": 2, "is_available": True, "cost": 2200, "price": 3000, "options": {"Size": '12" x 16"'}},
+                    {"id": 3, "is_available": True, "cost": 2600, "price": 3400, "options": {"Size": '16" x 20"'}},
+                ]
+            return []
+
+    template = ProductTemplate(
+        "canvas_basic",
+        9,
+        99,
+        "{artwork_title}",
+        "{artwork_title}",
+        active=False,
+        enabled_variant_option_filters={"size": ['12" x 16"', '16" x 20"']},
+        provider_selection_strategy="prefer_printify_choice_then_ranked",
+    )
+    resolved = select_provider_for_template(printify=DummyPrintify(), template=template)
+    assert resolved.printify_blueprint_id == 13
+    assert resolved.printify_print_provider_id == 7
+
+
+def test_preflight_blanket_recovers_to_plausible_mapping_and_stays_inactive():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [
+                {"id": 9, "title": "Unisex Tee"},
+                {"id": 50, "title": "Mink-Cotton Blanket"},
+            ]
+
+        def list_print_providers(self, blueprint_id):
+            if blueprint_id == 9:
+                return [{"id": 99, "title": "Generic"}]
+            return [{"id": 4, "title": "Printify Choice"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            if blueprint_id == 9:
+                return [{"id": 1, "is_available": True, "options": {"Color": "Black", "Size": "M"}}]
+            return [
+                {"id": 11, "is_available": True, "cost": 2800, "price": 3600, "options": {"Size": '50" × 60"', "Material": "Mink"}},
+                {"id": 12, "is_available": True, "cost": 3300, "price": 4300, "options": {"Size": '60" × 80"', "Material": "Mink"}},
+            ]
+
+    template = ProductTemplate(
+        "blanket_basic",
+        9,
+        99,
+        "{artwork_title}",
+        "{artwork_title}",
+        active=False,
+        enabled_sizes=['50" × 60"', '60" × 80"'],
+        provider_selection_strategy="prefer_printify_choice_then_ranked",
+    )
+    passed, issues, rows = preflight_active_templates(printify=DummyPrintify(), templates=[template], explicit_template_keys=[])
+    assert issues == []
+    assert len(passed) == 1
+    assert passed[0].active is False
+    row = rows[0]
+    assert row.template_key == "blanket_basic"
+    assert row.template_hint_blueprint_id == 9
+    assert row.blueprint_id == 50
+    assert row.provider_id == 4
+    assert row.catalog_discovery_used is True
+    assert row.fallback_discovery_triggered is True
+    assert row.intended_family == "blanket"
+    assert row.final_enabled_count > 0
 
 
 def test_upsert_in_printify_recovers_from_stale_product_id(tmp_path: Path):
