@@ -1792,8 +1792,8 @@ def test_template_filtering_defaults_to_active_only():
 def test_default_product_templates_only_include_proven_active_set():
     templates = load_templates(Path("product_templates.json"))
     active_keys = {template.key for template in templates if template.active}
-    assert active_keys == {"mug_new", "poster_basic", "sweatshirt_gildan", "tote_basic"}
-    for key in {"canvas_basic", "blanket_basic", "phone_case_basic", "sticker_kisscut", "tshirt_gildan", "hoodie_gildan"}:
+    assert active_keys == {"mug_new", "poster_basic", "sweatshirt_gildan"}
+    for key in {"canvas_basic", "blanket_basic", "phone_case_basic", "sticker_kisscut", "tshirt_gildan", "hoodie_gildan", "tote_basic"}:
         assert key not in active_keys
 
 
@@ -1828,7 +1828,7 @@ def test_preflight_classifies_invalid_zero_selected_and_guardrail_failures():
         reprice_variants_to_margin_floor=False,
         disable_variants_below_margin_floor=True,
     )
-    passed, issues = preflight_active_templates(
+    passed, issues, report_rows = preflight_active_templates(
         printify=DummyPrintify(),
         templates=[invalid, zero_selected, guardrail_zero],
         explicit_template_keys=[],
@@ -1838,6 +1838,84 @@ def test_preflight_classifies_invalid_zero_selected_and_guardrail_failures():
     assert issue_map["invalid"] == "invalid_template_config"
     assert issue_map["zero_selected"] == "zero_variants_selected"
     assert issue_map["guardrail_zero"] == "zero_enabled_after_guardrails"
+    assert len(report_rows) == 3
+
+
+def test_preflight_applies_provider_strategy_before_invalid_template_classification():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [{"id": 9}]
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 2, "title": "Fallback Provider"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [{"id": 100, "is_available": True, "options": {"color": "Black", "size": "M"}, "cost": 1200, "price": 1200}]
+
+    template = ProductTemplate(
+        "phone_case_basic",
+        9,
+        1,
+        "{artwork_title}",
+        "{artwork_title}",
+        active=True,
+        pinned_provider_id=2,
+        fallback_provider_allowed=True,
+        provider_selection_strategy="prefer_printify_choice_then_ranked",
+    )
+    passed, issues, report_rows = preflight_active_templates(
+        printify=DummyPrintify(),
+        templates=[template],
+        explicit_template_keys=[],
+    )
+    assert len(passed) == 1
+    assert issues == []
+    assert report_rows[0].provider_id == 2
+    assert report_rows[0].preflight_status == "passed"
+
+
+def test_run_audit_mode_does_not_raise_on_explicit_preflight_failures_and_exports_report(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    class DummyPrintifyClient:
+        def __init__(self, *args, **kwargs):
+            self.dry_run = True
+
+        def list_blueprints(self):
+            return [{"id": 1}]
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 2}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [{"id": 11, "is_available": True, "options": {"color": "Black", "size": "M"}, "cost": 1000, "price": 1000}]
+
+    monkeypatch.setattr(pipeline, "PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "load_json", lambda path, default: ensure_state_shape({}))
+    monkeypatch.setattr(pipeline, "load_templates", lambda p: [
+        ProductTemplate("bad", 404, 1, "{artwork_title}", "{artwork_title}", active=True),
+    ])
+    monkeypatch.setattr(pipeline, "select_templates", lambda templates, **kwargs: templates)
+    monkeypatch.setattr(pipeline, "discover_artworks", lambda d: [])
+    monkeypatch.setattr(pipeline, "PrintifyClient", DummyPrintifyClient)
+    monkeypatch.setattr(pipeline, "resolve_shop_id", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "load_r2_config_from_env", lambda: None)
+    monkeypatch.setattr(pipeline, "audit_printify_integration", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "run_catalog_cli", lambda **kwargs: False)
+
+    preflight_report = tmp_path / "preflight.csv"
+    run(
+        tmp_path / "templates.json",
+        image_dir=tmp_path,
+        export_dir=tmp_path / "exp",
+        state_path=tmp_path / "state.json",
+        template_keys=["bad"],
+        allow_preflight_failures=True,
+        export_preflight_report_path=str(preflight_report),
+    )
+    text = preflight_report.read_text(encoding="utf-8")
+    assert "template_key,requested_explicitly,preflight_status,classification" in text
+    assert "bad,True,failed,invalid_template_config" in text
 
 
 def test_seo_metadata_context_and_rendering(tmp_path: Path):

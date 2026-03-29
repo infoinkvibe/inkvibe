@@ -459,7 +459,7 @@
     "pinned_provider_id": 74,
     "pinned_blueprint_id": 609,
     "fallback_provider_allowed": true,
-    "active": true,
+    "active": false,
     "default_price": "24.99",
     "compare_at_price": "29.99",
     "min_margin_after_shipping": "3.00",
