@@ -49,6 +49,7 @@ from printify_shopify_sync_pipeline import (
     save_json_atomic,
     DryRunMutationSkipped,
     NonRetryableRequestError,
+    RetryLimitExceededError,
     CatalogCliUsageError,
     run_catalog_cli,
     RunSummary,
@@ -2519,10 +2520,90 @@ def test_catalog_429_retry_after_sleep_is_capped(monkeypatch):
     client.dry_run = False
     client.session = DummySession()
 
-    with pytest.raises(RuntimeError, match="Request failed for GET"):
+    with pytest.raises(RetryLimitExceededError, match="catalog_rate_limited"):
         client.get("/catalog/blueprints/1658/print_providers/90/variants.json")
     assert sleep_calls
     assert max(sleep_calls) <= 15
+
+
+def test_mutation_429_retry_after_sleep_is_capped_for_interactive(monkeypatch):
+    class DummyResponse:
+        def __init__(self):
+            self.status_code = 429
+            self.headers = {"Retry-After": "958"}
+            self.content = b"{}"
+
+        def json(self):
+            return {}
+
+        @property
+        def text(self):
+            return "{}"
+
+    class DummySession:
+        def __init__(self):
+            self.calls = 0
+            self.headers = {}
+
+        def request(self, **kwargs):
+            self.calls += 1
+            return DummyResponse()
+
+    sleep_calls = []
+    monkeypatch.setattr("printify_shopify_sync_pipeline.time.sleep", lambda seconds: sleep_calls.append(seconds))
+
+    client = BaseApiClient.__new__(BaseApiClient)
+    client.base_url = "https://example.test"
+    client.dry_run = False
+    client.session = DummySession()
+    client.interactive_retry_policy = True
+    client.interactive_retry_cap_seconds = 7
+    client.max_retry_sleep_seconds = 60
+
+    with pytest.raises(RetryLimitExceededError, match="publish_rate_limited"):
+        client.post("/shops/9/products/abc/publish.json", {"title": True})
+    assert sleep_calls
+    assert max(sleep_calls) <= 7
+
+
+def test_retry_logging_includes_endpoint_policy_and_requested_vs_capped(monkeypatch, caplog):
+    class DummyResponse:
+        def __init__(self):
+            self.status_code = 429
+            self.headers = {"Retry-After": "120"}
+            self.content = b"{}"
+
+        def json(self):
+            return {}
+
+        @property
+        def text(self):
+            return "{}"
+
+    class DummySession:
+        def __init__(self):
+            self.calls = 0
+            self.headers = {}
+
+        def request(self, **kwargs):
+            self.calls += 1
+            return DummyResponse()
+
+    monkeypatch.setattr("printify_shopify_sync_pipeline.time.sleep", lambda seconds: None)
+    client = BaseApiClient.__new__(BaseApiClient)
+    client.base_url = "https://example.test"
+    client.dry_run = False
+    client.session = DummySession()
+    client.interactive_retry_policy = True
+    client.interactive_retry_cap_seconds = 9
+    client.max_retry_sleep_seconds = 30
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(RetryLimitExceededError):
+            client.post("/shops/5/products/abc/publish.json", {"images": True})
+    assert "policy_bucket=mutation" in caplog.text
+    assert "endpoint=/shops/5/products/abc/publish.json" in caplog.text
+    assert "requested=120.00s capped=9.00s" in caplog.text
 
 
 def test_catalog_cli_invalid_provider_for_blueprint_has_helpful_error(tmp_path: Path):
@@ -2719,6 +2800,60 @@ def test_publish_skipped_but_verify_counts_warning(tmp_path: Path):
     assert row["publish_attempted"] is False
     assert row["publish_verified"] is False
     assert summary.verification_warnings == 1
+
+
+def test_publish_rate_limited_records_structured_failure_row(tmp_path: Path):
+    class PublishRateLimitedPrintify(DummyPrintify):
+        dry_run = False
+
+        def create_product(self, shop_id, payload):
+            return {"id": "p-new"}
+
+        def publish_product(self, shop_id, product_id, payload):
+            raise RetryLimitExceededError(
+                method="POST",
+                path=f"/shops/{shop_id}/products/{product_id}/publish.json",
+                policy_bucket="mutation",
+                status_code=429,
+                attempts=5,
+                reason_code="publish_rate_limited",
+            )
+
+    artwork = _create_artwork(tmp_path, 1200, 1200)
+    template = ProductTemplate(
+        key="tee",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_colors=["Black"],
+        enabled_sizes=["M"],
+        placements=[PlacementRequirement("front", 1000, 1000)],
+    )
+    state = ensure_state_shape({})
+    failures = []
+    run_rows = []
+    process_artwork(
+        printify=PublishRateLimitedPrintify(),
+        shopify=None,
+        shop_id=111,
+        artwork=artwork,
+        templates=[template],
+        state=state,
+        force=True,
+        export_dir=tmp_path / "exports",
+        state_path=tmp_path / "state.json",
+        artwork_options=ArtworkProcessingOptions(),
+        upload_strategy="auto",
+        r2_config=None,
+        publish_mode="publish",
+        failure_rows=failures,
+        run_rows=run_rows,
+    )
+    assert failures
+    assert failures[0].error_type == "publish_rate_limited"
+    assert failures[0].reason_code == "publish_rate_limited"
+    assert run_rows and run_rows[0].status == "failure"
 
 
 def test_process_artwork_incompatible_update_suggests_rebuild(tmp_path: Path):
@@ -3010,7 +3145,7 @@ def test_run_stop_after_failures_and_fail_fast(tmp_path: Path, monkeypatch):
     def fake_process_artwork(**kwargs):
         calls["n"] += 1
         kwargs["summary"].failures += 1
-        kwargs["failure_rows"].append(pipeline.FailureReportRow("now", "a1.png", "a1", kwargs["templates"][0].key, "create", 1, 1, "auto", "RuntimeError", "boom", "fix"))
+        kwargs["failure_rows"].append(pipeline.FailureReportRow("now", "a1.png", "a1", kwargs["templates"][0].key, "create", 1, 1, "auto", "RuntimeError", "runtime_error", "boom", "fix"))
         kwargs["run_rows"].append(pipeline.RunReportRow("now", "a1.png", "a1", kwargs["templates"][0].key, "failure", "create", 1, 1, "auto", "", False, False, "x"))
 
     monkeypatch.setattr(pipeline, "process_artwork", fake_process_artwork)
