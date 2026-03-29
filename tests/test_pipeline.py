@@ -1857,8 +1857,17 @@ def test_template_filtering_defaults_to_active_only():
 def test_default_product_templates_only_include_proven_active_set():
     templates = load_templates(Path("product_templates.json"))
     active_keys = {template.key for template in templates if template.active}
-    assert active_keys == {"mug_new", "poster_basic", "sweatshirt_gildan", "tshirt_gildan", "hoodie_gildan", "sticker_kisscut"}
-    for key in {"canvas_basic", "blanket_basic", "phone_case_basic", "tote_basic"}:
+    assert active_keys == {
+        "mug_new",
+        "poster_basic",
+        "sweatshirt_gildan",
+        "tshirt_gildan",
+        "hoodie_gildan",
+        "sticker_kisscut",
+        "phone_case_basic",
+    }
+    assert len(active_keys) == 7
+    for key in {"canvas_basic", "blanket_basic", "tote_basic"}:
         assert key not in active_keys
 
 
@@ -3565,8 +3574,19 @@ def test_phone_and_sticker_template_files_stay_in_sync_with_product_templates():
     sticker_standalone = next(t for t in sticker_templates if t.key == "sticker_kisscut")
     assert phone_primary.printify_blueprint_id == phone_standalone.printify_blueprint_id == 421
     assert phone_primary.printify_print_provider_id == phone_standalone.printify_print_provider_id == 23
+    assert phone_primary.active is True
+    assert phone_standalone.active is True
     assert sticker_primary.printify_blueprint_id == sticker_standalone.printify_blueprint_id == 906
     assert sticker_primary.printify_print_provider_id == sticker_standalone.printify_print_provider_id == 36
+    assert sticker_primary.max_enabled_variants == sticker_standalone.max_enabled_variants == 4
+
+
+def test_unresolved_families_remain_inactive():
+    templates = load_templates(Path("product_templates.json"))
+    by_key = {template.key: template for template in templates}
+    assert by_key["canvas_basic"].active is False
+    assert by_key["blanket_basic"].active is False
+    assert by_key["tote_basic"].active is False
 
 
 def test_tote_front_primary_and_publish_only_primary_behavior_preserved():

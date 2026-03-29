@@ -4,7 +4,7 @@
   "printify_print_provider_id": 23,
   "provider_selection_strategy": "prefer_printify_choice_then_ranked",
   "fallback_provider_allowed": true,
-  "active": false,
+  "active": true,
   "title_pattern": "{artwork_title} Phone Case",
   "description_pattern": "<p>{generated_description}</p>",
   "enabled_colors": [],
