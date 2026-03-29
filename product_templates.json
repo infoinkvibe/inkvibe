@@ -92,7 +92,7 @@
     "mark_template_nonviable_if_needed": true,
     "provider_selection_strategy": "prefer_printify_choice_then_ranked",
     "fallback_provider_allowed": true,
-    "active": false,
+    "active": true,
     "default_price": "24.99",
     "compare_at_price": "29.99",
     "max_allowed_price": "34.99"
@@ -276,7 +276,7 @@
     "mark_template_nonviable_if_needed": true,
     "provider_selection_strategy": "prefer_printify_choice_then_ranked",
     "fallback_provider_allowed": true,
-    "active": false,
+    "active": true,
     "max_allowed_price": "54.99"
   },
   {
@@ -350,9 +350,9 @@
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],
     "enabled_sizes": [
-      "11″ x 14″ (Vertical)",
-      "12″ x 16″ (Vertical)",
-      "16″ x 20″ (Vertical)"
+      "11\u2033 x 14\u2033 (Vertical)",
+      "12\u2033 x 16\u2033 (Vertical)",
+      "16\u2033 x 20\u2033 (Vertical)"
     ],
     "placements": [
       {
@@ -482,9 +482,9 @@
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],
     "enabled_sizes": [
-      "12″ x 16″",
-      "16″ x 20″",
-      "18″ x 24″"
+      "12\u2033 x 16\u2033",
+      "16\u2033 x 20\u2033",
+      "18\u2033 x 24\u2033"
     ],
     "max_enabled_variants": 12,
     "tags": [
@@ -536,15 +536,13 @@
   {
     "key": "phone_case_basic",
     "printify_blueprint_id": 9,
-    "printify_print_provider_id": 1,
+    "printify_print_provider_id": 99,
     "provider_selection_strategy": "prefer_printify_choice_then_ranked",
     "fallback_provider_allowed": true,
     "active": false,
     "title_pattern": "{artwork_title} Phone Case",
     "description_pattern": "<p>{generated_description}</p>",
-    "enabled_colors": [
-      "Glossy"
-    ],
+    "enabled_colors": [],
     "enabled_sizes": [],
     "enabled_variant_option_filters": {
       "model": [
@@ -552,6 +550,9 @@
         "iPhone 15 Pro",
         "iPhone 14",
         "Samsung Galaxy S24"
+      ],
+      "finish": [
+        "Glossy"
       ]
     },
     "max_enabled_variants": 12,
@@ -604,17 +605,15 @@
   {
     "key": "sticker_kisscut",
     "printify_blueprint_id": 783,
-    "printify_print_provider_id": 1,
+    "printify_print_provider_id": 90,
     "provider_selection_strategy": "prefer_printify_choice_then_ranked",
     "fallback_provider_allowed": true,
     "active": false,
     "title_pattern": "{artwork_title} Kiss-Cut Sticker",
     "description_pattern": "<p>{generated_description}</p>",
-    "enabled_colors": [
-      "White"
-    ],
+    "enabled_colors": [],
     "enabled_sizes": [
-      "3\" × 3\""
+      "3\" \u00d7 3\""
     ],
     "max_enabled_variants": 4,
     "tags": [
@@ -661,7 +660,13 @@
     "shipping_basis_for_margin": "cost",
     "disable_variants_below_margin_floor": true,
     "reprice_variants_to_margin_floor": true,
-    "mark_template_nonviable_if_needed": true
+    "mark_template_nonviable_if_needed": true,
+    "enabled_variant_option_filters": {
+      "size": [
+        "3\" \u00d7 3\"",
+        "4\" \u00d7 4\""
+      ]
+    }
   },
   {
     "key": "blanket_basic",
@@ -674,8 +679,8 @@
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],
     "enabled_sizes": [
-      "50\" × 60\"",
-      "60\" × 80\""
+      "50\" \u00d7 60\"",
+      "60\" \u00d7 80\""
     ],
     "max_enabled_variants": 6,
     "tags": [
