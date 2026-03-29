@@ -90,6 +90,15 @@ logger = logging.getLogger("inkvibeauto")
 
 DEFAULT_TEMPLATE_PRICE = "29.99"
 DEFAULT_MAX_ENABLED_VARIANTS = int(os.getenv("MAX_ENABLED_VARIANTS_SAFETY_LIMIT", "100"))
+PRODUCTION_BASELINE_TEMPLATE_KEYS = (
+    "tshirt_gildan",
+    "sweatshirt_gildan",
+    "hoodie_gildan",
+    "mug_new",
+    "poster_basic",
+    "phone_case_basic",
+    "sticker_kisscut",
+)
 
 
 # -----------------------------
@@ -1619,6 +1628,26 @@ def _collect_option_names_and_values(variants: List[Dict[str, Any]]) -> Tuple[Li
     return sorted_names, summarized_values
 
 
+def _looks_like_phone_model_value(value: str) -> bool:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return False
+    canonical_tokens = (
+        "iphone",
+        "samsung galaxy",
+        "galaxy s",
+        "galaxy note",
+        "google pixel",
+        "pixel ",
+        "oneplus",
+        "motorola",
+        "moto ",
+    )
+    if any(token in normalized for token in canonical_tokens):
+        return True
+    return bool(re.search(r"\b(?:iphone|pixel|galaxy)\s*[a-z]?\d{1,2}(?:\s*(?:pro|max|plus|ultra))?\b", normalized))
+
+
 def validate_catalog_family_schema(
     *,
     template: ProductTemplate,
@@ -1637,19 +1666,25 @@ def validate_catalog_family_schema(
 
     if intended_family == "phone_case":
         has_model_dimension = any(token in option_name_tokens for token in ("model", "device model", "device", "phone model", "compatibility"))
+        has_surface_dimension = any(token in option_name_tokens for token in ("surface", "finish"))
+        size_values = option_values_summary.get("size", [])
+        has_phone_model_like_size_values = any(_looks_like_phone_model_value(value) for value in size_values)
+        has_size_surface_alias_schema = ("size" in option_name_tokens) and has_surface_dimension and has_phone_model_like_size_values
+        has_model_schema = has_model_dimension or has_size_surface_alias_schema
         has_title_signal = any(token in title_tokens for token in ("phone case", "iphone", "samsung case", "tough case", "slim case"))
         apparel_size_values = {"s", "m", "l", "xl", "2xl", "3xl"}
         mostly_apparel_sizes = bool(all_values.intersection(apparel_size_values))
-        if not (has_model_dimension or has_title_signal):
+        if not (has_model_schema or has_title_signal):
             return CatalogFamilyValidationResult(
                 intended_family=intended_family,
                 plausible=False,
                 reason=(
-                    "Phone case schema mismatch: missing model/device-style options and family-title hints; "
+                    "Phone case schema mismatch: missing model/device-style schema (or size+surface phone-model alias) "
+                    "and family-title hints; "
                     f"option_names={option_names}"
                 ),
             )
-        if mostly_apparel_sizes and not has_model_dimension:
+        if mostly_apparel_sizes and not has_model_schema:
             return CatalogFamilyValidationResult(
                 intended_family=intended_family,
                 plausible=False,

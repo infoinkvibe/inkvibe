@@ -113,6 +113,7 @@ from printify_shopify_sync_pipeline import (
     select_provider_for_template,
     preflight_active_templates,
     validate_catalog_family_schema,
+    PRODUCTION_BASELINE_TEMPLATE_KEYS,
 )
 from artwork_metadata_generator import (
     CompositeArtworkMetadataGenerator,
@@ -1858,18 +1859,22 @@ def test_template_filtering_defaults_to_active_only():
 def test_default_product_templates_only_include_proven_active_set():
     templates = load_templates(Path("product_templates.json"))
     active_keys = {template.key for template in templates if template.active}
-    assert active_keys == {
-        "mug_new",
-        "poster_basic",
-        "sweatshirt_gildan",
-        "tshirt_gildan",
-        "hoodie_gildan",
-        "sticker_kisscut",
-        "phone_case_basic",
-    }
+    assert active_keys == set(PRODUCTION_BASELINE_TEMPLATE_KEYS)
     assert len(active_keys) == 7
     for key in {"canvas_basic", "blanket_basic", "tote_basic"}:
         assert key not in active_keys
+
+
+def test_production_baseline_template_keys_are_frozen_to_current_validated_set():
+    assert set(PRODUCTION_BASELINE_TEMPLATE_KEYS) == {
+        "tshirt_gildan",
+        "sweatshirt_gildan",
+        "hoodie_gildan",
+        "mug_new",
+        "poster_basic",
+        "phone_case_basic",
+        "sticker_kisscut",
+    }
 
 
 def test_preflight_classifies_invalid_zero_selected_and_guardrail_failures():
@@ -3352,6 +3357,9 @@ def test_preflight_classifies_wrong_catalog_family_before_zero_variant_filtering
     assert row.classification == "wrong_catalog_family"
     assert row.intended_family == "phone_case"
     assert "schema mismatch" in row.family_mismatch_reason.lower()
+    assert row.pinned_mapping_attempted_first is True
+    assert row.fallback_discovery_triggered is True
+    assert row.fallback_discovery_reason.startswith("template_mapping_family_mismatch:")
 
 
 def test_select_provider_for_template_discovers_family_matched_catalog_pair():
@@ -3519,6 +3527,12 @@ def test_preflight_phone_case_recovers_with_provider_backed_fallback_models():
     assert issues == []
     assert len(passed) == 1
     row = report_rows[0]
+    assert row.template_hint_blueprint_id == 421
+    assert row.template_hint_provider_id == 23
+    assert row.catalog_discovery_used is False
+    assert row.pinned_mapping_attempted_first is True
+    assert row.fallback_discovery_triggered is False
+    assert row.fallback_discovery_reason == ""
     assert row.resolved_model_dimension == "Size"
     assert row.requested_model_overlap_count == 0
     assert row.fallback_model_set_applied is True
