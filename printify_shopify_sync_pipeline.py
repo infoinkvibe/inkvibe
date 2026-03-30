@@ -241,6 +241,7 @@ class TemplatePreflightReportRow:
     requested_model_overlap_count: int = 0
     fallback_model_set_applied: bool = False
     final_selected_models: str = ""
+    high_resolution_family: bool = False
 
 
 @dataclass
@@ -460,6 +461,13 @@ class ProductTemplate:
     pinned_blueprint_id: Optional[int] = None
     provider_preference_order: List[int] = field(default_factory=list)
     fallback_provider_allowed: bool = True
+    high_resolution_family: bool = False
+    skip_if_artwork_below_threshold: bool = False
+    min_source_width: Optional[int] = None
+    min_source_height: Optional[int] = None
+    min_source_short_edge: Optional[int] = None
+    min_source_long_edge: Optional[int] = None
+    min_effective_cover_ratio: Optional[float] = None
 
 
 @dataclass
@@ -496,6 +504,14 @@ class FailureReportRow:
     suggested_next_action: str
     launch_plan_row: str = ""
     launch_plan_row_id: str = ""
+    source_size: str = ""
+    required_placement_size: str = ""
+    required_fit_mode: str = ""
+    eligibility_high_resolution_family: bool = False
+    eligibility_outcome: str = ""
+    eligibility_reason_code: str = ""
+    eligibility_rule_failed: str = ""
+    eligibility_gate_stage: str = ""
 
 
 @dataclass
@@ -567,6 +583,13 @@ class RunReportRow:
     featured_image_strategy: str = ""
     featured_image_source: str = ""
     tote_scale_strategy: str = ""
+    required_placement_size: str = ""
+    required_fit_mode: str = ""
+    eligibility_high_resolution_family: bool = False
+    eligibility_outcome: str = ""
+    eligibility_reason_code: str = ""
+    eligibility_rule_failed: str = ""
+    eligibility_gate_stage: str = ""
 
 
 @dataclass
@@ -700,6 +723,17 @@ class ArtworkResolution:
     poster_requested_upscale_factor: float = 1.0
     poster_applied_upscale_factor: float = 1.0
     poster_fill_optimization_used: bool = False
+
+
+@dataclass
+class ArtworkEligibilityResult:
+    eligible: bool
+    reason_code: str = ""
+    rule_failed: str = ""
+    source_size: Tuple[int, int] = (0, 0)
+    required_size: Tuple[int, int] = (0, 0)
+    fit_mode: str = ""
+    high_resolution_family: bool = False
 
 
 @dataclass
@@ -4586,6 +4620,66 @@ def _resolve_template_placements(template: ProductTemplate, *, for_publish: bool
     return placements
 
 
+def evaluate_artwork_eligibility_for_template(
+    *,
+    artwork: Artwork,
+    template: ProductTemplate,
+    placement: PlacementRequirement,
+) -> ArtworkEligibilityResult:
+    source_w = int(artwork.image_width or 0)
+    source_h = int(artwork.image_height or 0)
+    required_w = int(placement.width_px or 0)
+    required_h = int(placement.height_px or 0)
+    fit_mode = str(placement.artwork_fit_mode or "contain").strip().lower() or "contain"
+    result = ArtworkEligibilityResult(
+        eligible=True,
+        source_size=(source_w, source_h),
+        required_size=(required_w, required_h),
+        fit_mode=fit_mode,
+        high_resolution_family=bool(template.high_resolution_family),
+    )
+    if not template.skip_if_artwork_below_threshold:
+        return result
+
+    checks: List[Tuple[bool, str]] = []
+    if template.min_source_width is not None:
+        checks.append((source_w >= int(template.min_source_width), "min_source_width"))
+    if template.min_source_height is not None:
+        checks.append((source_h >= int(template.min_source_height), "min_source_height"))
+    short_edge = min(source_w, source_h)
+    long_edge = max(source_w, source_h)
+    if template.min_source_short_edge is not None:
+        checks.append((short_edge >= int(template.min_source_short_edge), "min_source_short_edge"))
+    if template.min_source_long_edge is not None:
+        checks.append((long_edge >= int(template.min_source_long_edge), "min_source_long_edge"))
+    if fit_mode == "cover":
+        required_ratio = float(template.min_effective_cover_ratio) if template.min_effective_cover_ratio is not None else 1.0
+        cover_ratio = min(source_w / required_w, source_h / required_h) if required_w > 0 and required_h > 0 else 0.0
+        checks.append((cover_ratio >= required_ratio, "min_effective_cover_ratio"))
+
+    for passed, rule_name in checks:
+        if not passed:
+            result.eligible = False
+            result.reason_code = "insufficient_artwork_resolution"
+            result.rule_failed = rule_name
+            return result
+    return result
+
+
+def list_eligible_templates_for_artwork(artwork: Artwork, templates: List[ProductTemplate]) -> Dict[str, ArtworkEligibilityResult]:
+    results: Dict[str, ArtworkEligibilityResult] = {}
+    for template in templates:
+        resolved_placements = _resolve_template_placements(template, for_publish=True) or list(template.placements)
+        if not resolved_placements:
+            continue
+        results[template.key] = evaluate_artwork_eligibility_for_template(
+            artwork=artwork,
+            template=template,
+            placement=resolved_placements[0],
+        )
+    return results
+
+
 def _resolve_poster_enhancement_settings(template: ProductTemplate) -> Tuple[float, float, float, bool]:
     max_upscale = (
         float(template.poster_safe_max_upscale_factor)
@@ -5247,6 +5341,17 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
             raise TemplateValidationError(f"Template[{index}] poster_fill_target_pct must be > 0 and <= 1 when provided")
     if row.get("poster_trim_fill_optimization") is not None and not isinstance(row.get("poster_trim_fill_optimization"), bool):
         raise TemplateValidationError(f"Template[{index}] poster_trim_fill_optimization must be boolean when provided")
+    if row.get("high_resolution_family") is not None and not isinstance(row.get("high_resolution_family"), bool):
+        raise TemplateValidationError(f"Template[{index}] high_resolution_family must be boolean when provided")
+    if row.get("skip_if_artwork_below_threshold") is not None and not isinstance(row.get("skip_if_artwork_below_threshold"), bool):
+        raise TemplateValidationError(f"Template[{index}] skip_if_artwork_below_threshold must be boolean when provided")
+    for int_field in ("min_source_width", "min_source_height", "min_source_short_edge", "min_source_long_edge"):
+        if row.get(int_field) is not None and int(row.get(int_field, 0)) <= 0:
+            raise TemplateValidationError(f"Template[{index}] {int_field} must be > 0 when provided")
+    if row.get("min_effective_cover_ratio") is not None:
+        ratio = float(row.get("min_effective_cover_ratio", 0))
+        if ratio <= 0:
+            raise TemplateValidationError(f"Template[{index}] min_effective_cover_ratio must be > 0 when provided")
     if row.get("preferred_featured_image_strategy") is not None:
         strategy = str(row.get("preferred_featured_image_strategy", "")).strip().lower()
         if strategy and strategy not in {"variant_color_then_mockup_type", "mockup_type_then_variant_color"}:
@@ -5346,6 +5451,13 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
                 pinned_blueprint_id=int(row["pinned_blueprint_id"]) if row.get("pinned_blueprint_id") is not None else None,
                 provider_preference_order=[int(v) for v in row.get("provider_preference_order", [])],
                 fallback_provider_allowed=bool(row.get("fallback_provider_allowed", True)),
+                high_resolution_family=bool(row.get("high_resolution_family", False)),
+                skip_if_artwork_below_threshold=bool(row.get("skip_if_artwork_below_threshold", False)),
+                min_source_width=int(row["min_source_width"]) if row.get("min_source_width") is not None else None,
+                min_source_height=int(row["min_source_height"]) if row.get("min_source_height") is not None else None,
+                min_source_short_edge=int(row["min_source_short_edge"]) if row.get("min_source_short_edge") is not None else None,
+                min_source_long_edge=int(row["min_source_long_edge"]) if row.get("min_source_long_edge") is not None else None,
+                min_effective_cover_ratio=float(row["min_effective_cover_ratio"]) if row.get("min_effective_cover_ratio") is not None else None,
                 placements=[PlacementRequirement(**p) for p in row.get("placements", [])],
             )
         )
@@ -5621,6 +5733,7 @@ def _preflight_template(
             requested_model_overlap_count=int(option_diagnostics.requested_model_overlap_count or 0),
             fallback_model_set_applied=bool(option_diagnostics.fallback_model_set_applied),
             final_selected_models=json.dumps(option_diagnostics.final_selected_models, sort_keys=True),
+            high_resolution_family=bool(template.high_resolution_family),
         )
         return issue, row
 
@@ -5804,6 +5917,7 @@ def _preflight_template(
             requested_model_overlap_count=int(option_diagnostics.requested_model_overlap_count or 0),
             fallback_model_set_applied=bool(option_diagnostics.fallback_model_set_applied),
             final_selected_models=json.dumps(option_diagnostics.final_selected_models, sort_keys=True),
+            high_resolution_family=bool(template.high_resolution_family),
         )
     except TemplateValidationError as exc:
         return _failure("invalid_template_config", str(exc))
@@ -7170,6 +7284,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
             prepared_assets: List[PreparedArtwork] = []
             skipped_placements: List[str] = []
             insufficient_artwork_error: Optional[InsufficientArtworkResolutionError] = None
+            eligibility_result: Optional[ArtworkEligibilityResult] = None
+            failed_eligibility_placement_name = ""
             resolved_placements = _resolve_template_placements(resolved_template, for_publish=True) or list(resolved_template.placements)
             if resolved_template.key == "tote_basic":
                 tote_primary_placement_report = str(resolved_template.preferred_primary_placement or "")
@@ -7181,6 +7297,79 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     tote_active_placements_report or "-",
                     resolved_template.publish_only_primary_placement,
                 )
+            for placement in resolved_placements:
+                eligibility_result = evaluate_artwork_eligibility_for_template(
+                    artwork=artwork,
+                    template=resolved_template,
+                    placement=placement,
+                )
+                if not eligibility_result.eligible:
+                    failed_eligibility_placement_name = placement.placement_name
+                    break
+            if eligibility_result is not None and not eligibility_result.eligible:
+                runtime_diag = RuntimeSkipDiagnostics(
+                    template_key=template.key,
+                    blueprint_id=resolved_template.printify_blueprint_id,
+                    provider_id=resolved_template.printify_print_provider_id,
+                    selected_count=len(variant_rows),
+                    final_enabled_count=len(variant_rows),
+                    available_placements=[p.placement_name for p in resolved_placements],
+                    required_placement_name=failed_eligibility_placement_name,
+                    final_reason_code=eligibility_result.reason_code or "artwork_not_eligible_for_template",
+                    payload_build_skip_reason=(
+                        f"source={eligibility_result.source_size[0]}x{eligibility_result.source_size[1]} "
+                        f"required={eligibility_result.required_size[0]}x{eligibility_result.required_size[1]} "
+                        f"fit_mode={eligibility_result.fit_mode} "
+                        f"rule_failed={eligibility_result.rule_failed}"
+                    ).strip(),
+                    resolved_option_dimensions={"model": variant_diagnostics.resolved_model_dimension},
+                    resolved_model_list=list(variant_diagnostics.final_selected_models),
+                )
+                runtime_diag.print_area_available = bool(runtime_diag.required_placement_name)
+                log_runtime_skip_diagnostics(runtime_diag)
+                all_templates_successful = False
+                if summary is not None:
+                    summary.products_skipped += 1
+                result = {
+                    "status": "artwork_not_eligible_for_template",
+                    "failure_classification": eligibility_result.reason_code or "artwork_not_eligible_for_template",
+                    "runtime_skip_reason_code": runtime_diag.final_reason_code,
+                    "runtime_skip_stage": "eligibility_gate",
+                    "runtime_skip_diagnostics": asdict(runtime_diag),
+                    "required_size": f"{eligibility_result.required_size[0]}x{eligibility_result.required_size[1]}",
+                    "source_size": f"{eligibility_result.source_size[0]}x{eligibility_result.source_size[1]}",
+                }
+                record["products"].append({
+                    "template": template.key,
+                    "state_key": state_key,
+                    "last_action": "skip",
+                    "publish_attempted": False,
+                    "publish_verified": False,
+                    "last_verified_at": None,
+                    "verified_title": None,
+                    "verified_variant_count": None,
+                    "title_source": title_info.title_source,
+                    "rendered_title": rendered_title,
+                    "result": result,
+                })
+                if run_rows is not None:
+                    run_rows.append(RunReportRow(
+                        datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip",
+                        resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id, upload_strategy, "", False, False,
+                        rendered_title, f"{eligibility_result.source_size[0]}x{eligibility_result.source_size[1]}", "", "", "", "", "", "", "",
+                        False, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description,
+                        launch_name, campaign, merch_theme,
+                        required_placement_size=f"{eligibility_result.required_size[0]}x{eligibility_result.required_size[1]}",
+                        required_fit_mode=eligibility_result.fit_mode,
+                        eligibility_high_resolution_family=eligibility_result.high_resolution_family,
+                        eligibility_outcome="ineligible",
+                        eligibility_reason_code=eligibility_result.reason_code or "artwork_not_eligible_for_template",
+                        eligibility_rule_failed=eligibility_result.rule_failed,
+                        eligibility_gate_stage="eligibility_gate",
+                    ))
+                log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action="skip", upload_map=upload_map)
+                continue
+
             for placement in resolved_placements:
                 try:
                     prepared = prepare_artwork_export(artwork, resolved_template, placement, export_dir, artwork_options)
@@ -7219,6 +7408,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     "status": "insufficient_artwork_resolution",
                     "failure_classification": "insufficient_artwork_resolution",
                     "runtime_skip_reason_code": runtime_diag.final_reason_code,
+                    "runtime_skip_stage": "runtime_processing",
                     "runtime_skip_diagnostics": asdict(runtime_diag),
                     "required_size": f"{insufficient_artwork_error.required_size[0]}x{insufficient_artwork_error.required_size[1]}",
                     "source_size": f"{insufficient_artwork_error.source_size[0]}x{insufficient_artwork_error.source_size[1]}",
@@ -7237,7 +7427,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     "result": result,
                 })
                 if run_rows is not None:
-                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, f"{insufficient_artwork_error.source_size[0]}x{insufficient_artwork_error.source_size[1]}", "", "", "", "", "", "", "", False, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
+                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, f"{insufficient_artwork_error.source_size[0]}x{insufficient_artwork_error.source_size[1]}", "", "", "", "", "", "", "", False, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme, required_placement_size=f"{insufficient_artwork_error.required_size[0]}x{insufficient_artwork_error.required_size[1]}", required_fit_mode=insufficient_artwork_error.fit_mode, eligibility_high_resolution_family=bool(resolved_template.high_resolution_family), eligibility_outcome="ineligible", eligibility_reason_code="insufficient_artwork_resolution", eligibility_rule_failed="runtime_resolution_check", eligibility_gate_stage="runtime_processing"))
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
@@ -7593,6 +7783,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     suggested_next_action="Inspect state and rerun with --resume after fixing template or artwork",
                     launch_plan_row=launch_plan_row,
                     launch_plan_row_id=launch_plan_row_id,
+                    source_size=source_size_report,
                 ))
             if run_rows is not None:
                 run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "failure", action, resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id, summarize_upload_strategy(upload_map), "", False, False, rendered_title, source_size_report, trimmed_bounds_report, "", exported_canvas_report, placement_scale_report, effective_upscale_factor_report, requested_upscale_factor_report, applied_upscale_factor_report, upscale_capped_report, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
