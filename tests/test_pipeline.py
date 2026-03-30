@@ -120,6 +120,9 @@ from printify_shopify_sync_pipeline import (
     preflight_active_templates,
     validate_catalog_family_schema,
     PRODUCTION_BASELINE_TEMPLATE_KEYS,
+    CatalogCache,
+    PrintifyClient,
+    apply_high_volume_mode_defaults,
 )
 from artwork_metadata_generator import (
     CompositeArtworkMetadataGenerator,
@@ -6337,3 +6340,50 @@ def test_provider_selection_prefers_printify_choice_when_available():
     )
     resolved = select_provider_for_template(printify=StubPrintify(), template=template)
     assert resolved.printify_print_provider_id == 11
+
+
+def test_catalog_cache_persists_hit_miss(tmp_path: Path):
+    cache_dir = tmp_path / "catalog-cache"
+    cache = CatalogCache(cache_dir=cache_dir, ttl_hours=24, enabled=True)
+    assert cache.get("providers:1") is None
+    cache.set("providers:1", [{"id": 11}])
+    assert cache.get("providers:1") == [{"id": 11}]
+    cache_reload = CatalogCache(cache_dir=cache_dir, ttl_hours=24, enabled=True)
+    assert cache_reload.get("providers:1") == [{"id": 11}]
+
+
+def test_printify_client_reuses_cached_variants(tmp_path: Path):
+    import printify_shopify_sync_pipeline as pipeline
+
+    class SessionStub:
+        def __init__(self):
+            self.headers = {}
+
+    cache = CatalogCache(cache_dir=tmp_path / "cache", ttl_hours=24, enabled=True)
+    pipeline.requests.Session = SessionStub  # type: ignore[assignment]
+    client = PrintifyClient("token", dry_run=True, catalog_cache=cache)
+    calls = {"count": 0}
+
+    def fake_get(path, **params):
+        calls["count"] += 1
+        return [{"id": 7, "is_available": True, "options": {"color": "Black", "size": "M"}}]
+
+    client.get = fake_get  # type: ignore[assignment]
+    first = client.list_variants(10, 20)
+    second = client.list_variants(10, 20)
+    assert first == second
+    assert calls["count"] == 1
+
+
+def test_high_volume_mode_sets_safe_defaults():
+    defaults = apply_high_volume_mode_defaults(
+        chunk_size=0,
+        pause_between_chunks_seconds=0,
+        catalog_request_spacing_ms=0,
+        template_spacing_ms=0,
+        artwork_spacing_ms=0,
+        no_catalog_cache=True,
+    )
+    assert defaults["chunk_size"] == 10
+    assert defaults["catalog_request_spacing_ms"] == 150
+    assert defaults["no_catalog_cache"] is False
