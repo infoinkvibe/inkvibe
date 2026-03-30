@@ -2968,6 +2968,74 @@ def test_process_publish_queue_resume_only_without_recreate():
     assert state["publish_queue"][0]["publish_status"] == "completed"
 
 
+def test_run_resume_publish_only_drains_queue_without_artwork_discovery(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    state = ensure_state_shape(
+        {
+            "publish_queue": [
+                {
+                    "artwork_key": "a1",
+                    "template_key": "t1",
+                    "shop_id": 111,
+                    "product_id": "p-existing",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "publish_status": "pending",
+                    "publish_attempts": 0,
+                    "last_error": "",
+                    "reason_code": "",
+                    "next_eligible_publish_at": "",
+                }
+            ]
+        }
+    )
+
+    class DummyPrintifyClient:
+        def __init__(self, *args, **kwargs):
+            self.dry_run = False
+            self.rate_limit_events = {}
+
+        def publish_product(self, shop_id, product_id, payload):
+            assert shop_id == 111
+            assert product_id == "p-existing"
+            return {"status": "published"}
+
+    monkeypatch.setattr(pipeline, "PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "load_json", lambda path, default: state)
+    monkeypatch.setattr(
+        pipeline,
+        "load_templates",
+        lambda p: [ProductTemplate(key="t1", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{artwork_title}", description_pattern="{artwork_title}")],
+    )
+    monkeypatch.setattr(pipeline, "select_templates", lambda templates, **kwargs: templates)
+    monkeypatch.setattr(
+        pipeline,
+        "discover_artworks",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("resume publish-only should not discover artwork")),
+    )
+    monkeypatch.setattr(pipeline, "PrintifyClient", DummyPrintifyClient)
+    monkeypatch.setattr(pipeline, "resolve_shop_id", lambda *args, **kwargs: 111)
+    monkeypatch.setattr(pipeline, "load_r2_config_from_env", lambda: None)
+    monkeypatch.setattr(pipeline, "audit_printify_integration", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "run_catalog_cli", lambda **kwargs: False)
+
+    run_report = tmp_path / "resume_run_report.csv"
+    failure_report = tmp_path / "resume_failure_report.csv"
+    run(
+        tmp_path / "templates.json",
+        image_dir=tmp_path / "missing-images-ok-in-resume-mode",
+        export_dir=tmp_path / "exp",
+        state_path=tmp_path / "state.json",
+        skip_audit=True,
+        resume_publish_only=True,
+        export_run_report=str(run_report),
+        export_failure_report=str(failure_report),
+    )
+    assert state["publish_queue"][0]["publish_status"] == "completed"
+    assert run_report.exists()
+    assert failure_report.exists()
+
+
 def test_process_artwork_incompatible_update_suggests_rebuild(tmp_path: Path):
     class IncompatibleUpdatePrintify(DummyPrintify):
         dry_run = False
