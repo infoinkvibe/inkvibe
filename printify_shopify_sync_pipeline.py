@@ -555,6 +555,7 @@ class RunSummary:
     templates_skipped_catalog_rate_limited: int = 0
     resumed_combinations: int = 0
     products_created_but_not_published: int = 0
+    publish_queue_total_count: int = 0
     publish_queue_pending_count: int = 0
     publish_queue_completed_count: int = 0
     publish_queue_failed_count: int = 0
@@ -605,6 +606,10 @@ class RunReportRow:
     rendered_title: str
     publish_outcome: str = ""
     publish_queue_status: str = ""
+    publish_queue_status_before: str = ""
+    publish_queue_status_after: str = ""
+    reason_code: str = ""
+    resume_only_queue_processing: bool = False
     source_size: str = ""
     trimmed_bounds_size: str = ""
     trim_skip_reason: str = ""
@@ -2440,6 +2445,7 @@ def format_run_summary(summary: RunSummary) -> str:
         f"publish_attempts={summary.publish_attempts} "
         f"publish_verified={summary.publish_verified} "
         f"products_created_but_not_published={summary.products_created_but_not_published} "
+        f"publish_queue_total_count={summary.publish_queue_total_count} "
         f"publish_queue_pending_count={summary.publish_queue_pending_count} "
         f"publish_queue_completed_count={summary.publish_queue_completed_count} "
         f"publish_queue_failed_count={summary.publish_queue_failed_count} "
@@ -3081,6 +3087,23 @@ def enqueue_publish_pending(
     }
     queue.append(new_row)
     return new_row
+
+
+def summarize_publish_queue(state: Dict[str, Any]) -> Dict[str, int]:
+    queue = get_publish_queue(state)
+    counts = {"total": 0, "pending": 0, "completed": 0, "failed": 0}
+    for row in queue:
+        if not isinstance(row, dict):
+            continue
+        counts["total"] += 1
+        status = str(row.get("publish_status") or "").strip().lower()
+        if status.startswith("pending"):
+            counts["pending"] += 1
+        elif status == "completed":
+            counts["completed"] += 1
+        elif status == "failed":
+            counts["failed"] += 1
+    return counts
 
 
 def write_csv_report(path: pathlib.Path, rows: List[Dict[str, Any]]) -> None:
@@ -8506,10 +8529,26 @@ def process_publish_queue(
     pause_between_publish_batches_seconds: float,
 ) -> Dict[str, int]:
     queue = get_publish_queue(state)
-    stats = {"pending": 0, "completed": 0, "failed": 0, "rate_limited": 0, "processed": 0}
+    initial_counts = summarize_publish_queue(state)
+    stats = {"total": initial_counts["total"], "pending": initial_counts["pending"], "completed": initial_counts["completed"], "failed": initial_counts["failed"], "rate_limited": 0, "processed": 0}
     pending_rows = [row for row in queue if isinstance(row, dict) and str(row.get("publish_status") or "").startswith("pending")]
-    stats["pending"] = len(pending_rows)
+    logger.info(
+        "Resume publish queue start total=%s pending=%s completed=%s failed=%s rows_processed_this_run=%s",
+        initial_counts["total"],
+        initial_counts["pending"],
+        initial_counts["completed"],
+        initial_counts["failed"],
+        0,
+    )
     if not pending_rows:
+        logger.info(
+            "Resume publish queue end total=%s pending=%s completed=%s failed=%s rows_processed_this_run=%s",
+            initial_counts["total"],
+            initial_counts["pending"],
+            initial_counts["completed"],
+            initial_counts["failed"],
+            0,
+        )
         return stats
     batch_size = max(1, int(publish_batch_size))
     for index in range(0, len(pending_rows), batch_size):
@@ -8552,6 +8591,19 @@ def process_publish_queue(
             stats["processed"] += 1
         if pause_between_publish_batches_seconds > 0 and (index + batch_size) < len(pending_rows):
             time.sleep(max(0.0, float(pause_between_publish_batches_seconds)))
+    final_counts = summarize_publish_queue(state)
+    stats["total"] = final_counts["total"]
+    stats["pending"] = final_counts["pending"]
+    stats["completed"] = final_counts["completed"]
+    stats["failed"] = final_counts["failed"]
+    logger.info(
+        "Resume publish queue end total=%s pending=%s completed=%s failed=%s rows_processed_this_run=%s",
+        final_counts["total"],
+        final_counts["pending"],
+        final_counts["completed"],
+        final_counts["failed"],
+        stats["processed"],
+    )
     return stats
 
 
@@ -8896,6 +8948,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
     run_rows: List[RunReportRow] = []
     templates_by_key = {template.key: template for template in templates}
     if resume_publish_only:
+        queue_before = [dict(row) for row in get_publish_queue(state) if isinstance(row, dict)]
         publish_stats = process_publish_queue(
             printify=printify,
             state=state,
@@ -8905,6 +8958,78 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         )
         if publish_stats["pending"] == 0:
             logger.info("Publish queue is empty; nothing to resume.")
+        queue_after = [row for row in get_publish_queue(state) if isinstance(row, dict)]
+        queue_after_lookup = {
+            (
+                str(row.get("artwork_key") or ""),
+                str(row.get("template_key") or ""),
+                str(row.get("shop_id") or ""),
+            ): row
+            for row in queue_after
+        }
+        for before_row in queue_before:
+            key = (
+                str(before_row.get("artwork_key") or ""),
+                str(before_row.get("template_key") or ""),
+                str(before_row.get("shop_id") or ""),
+            )
+            before_status = str(before_row.get("publish_status") or "")
+            if not before_status.startswith("pending"):
+                continue
+            after_row = queue_after_lookup.get(key, before_row)
+            after_status = str(after_row.get("publish_status") or "")
+            if after_status == before_status:
+                continue
+            reason_code = str(after_row.get("reason_code") or "")
+            row_status = "success" if after_status == "completed" else "failure"
+            action = "resume_publish_queue"
+            run_rows.append(
+                RunReportRow(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    artwork_filename="",
+                    artwork_slug=str(after_row.get("artwork_key") or ""),
+                    template_key=str(after_row.get("template_key") or ""),
+                    status=row_status,
+                    action=action,
+                    blueprint_id=0,
+                    provider_id=0,
+                    upload_strategy="resume-publish-only",
+                    product_id=str(after_row.get("product_id") or ""),
+                    publish_attempted=True,
+                    publish_verified=False,
+                    rendered_title="",
+                    publish_outcome=after_status,
+                    publish_queue_status=after_status,
+                    publish_queue_status_before=before_status,
+                    publish_queue_status_after=after_status,
+                    reason_code=reason_code,
+                    resume_only_queue_processing=True,
+                )
+            )
+            if row_status == "failure":
+                failure_rows.append(
+                    FailureReportRow(
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        artwork_filename="",
+                        artwork_slug=str(after_row.get("artwork_key") or ""),
+                        template_key=str(after_row.get("template_key") or ""),
+                        action_attempted=action,
+                        blueprint_id=0,
+                        provider_id=0,
+                        upload_strategy="resume-publish-only",
+                        error_type="publish_resume_failure",
+                        reason_code=reason_code or str(after_row.get("publish_status") or "publish_resume_failure"),
+                        error_message=str(after_row.get("last_error") or ""),
+                        suggested_next_action="Inspect publish queue failure and retry resume publish-only after remediation",
+                    )
+                )
+        summary.publish_attempts += publish_stats["processed"]
+        summary.resumed_combinations += publish_stats["processed"]
+        summary.combinations_processed = len(run_rows)
+        summary.combinations_success = sum(1 for row in run_rows if row.status == "success")
+        summary.combinations_failed = sum(1 for row in run_rows if row.status == "failure")
+        summary.combinations_skipped = sum(1 for row in run_rows if row.status == "skipped")
+        summary.publish_queue_total_count = publish_stats["total"]
         summary.publish_queue_pending_count = publish_stats["pending"]
         summary.publish_queue_completed_count = publish_stats["completed"]
         summary.publish_queue_failed_count = publish_stats["failed"]
@@ -9162,7 +9287,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             if stop_requested:
                 break
 
-    publish_stats = {"pending": 0, "completed": 0, "failed": 0, "rate_limited": 0, "processed": 0}
+    publish_stats = {"total": 0, "pending": 0, "completed": 0, "failed": 0, "rate_limited": 0, "processed": 0}
     if not defer_publish:
         publish_stats = process_publish_queue(
             printify=printify,
@@ -9172,7 +9297,11 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             pause_between_publish_batches_seconds=pause_between_publish_batches_seconds,
         )
     else:
-        publish_stats["pending"] = len([row for row in get_publish_queue(state) if isinstance(row, dict) and str(row.get("publish_status") or "").startswith("pending")])
+        queue_counts = summarize_publish_queue(state)
+        publish_stats["total"] = queue_counts["total"]
+        publish_stats["pending"] = queue_counts["pending"]
+        publish_stats["completed"] = queue_counts["completed"]
+        publish_stats["failed"] = queue_counts["failed"]
 
     summary.combinations_processed = len(run_rows)
     summary.combinations_success = sum(1 for row in run_rows if row.status == "success")
@@ -9182,6 +9311,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         summary.catalog_cache_hits = printify.catalog_cache.stats.hits
         summary.catalog_cache_misses = printify.catalog_cache.stats.misses
         summary.catalog_requests_avoided = printify.catalog_cache.stats.requests_avoided
+    summary.publish_queue_total_count = publish_stats.get("total", 0)
     summary.publish_queue_pending_count = publish_stats["pending"]
     summary.publish_queue_completed_count = publish_stats["completed"]
     summary.publish_queue_failed_count = publish_stats["failed"]

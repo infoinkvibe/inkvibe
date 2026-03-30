@@ -1,4 +1,5 @@
 import base64
+import csv
 import json
 import logging
 import sys
@@ -49,6 +50,7 @@ from printify_shopify_sync_pipeline import (
     normalize_catalog_variants_response,
     prepare_artwork_export,
     process_artwork,
+    process_publish_queue,
     save_json_atomic,
     DryRunMutationSkipped,
     NonRetryableRequestError,
@@ -82,6 +84,7 @@ from printify_shopify_sync_pipeline import (
     _row_status,
     write_csv_report,
     run,
+    summarize_publish_queue,
     format_run_summary,
     template_blueprint_type_warning,
     generate_mug_template_snippet,
@@ -123,7 +126,6 @@ from printify_shopify_sync_pipeline import (
     CatalogCache,
     PrintifyClient,
     apply_high_volume_mode_defaults,
-    process_publish_queue,
 )
 from artwork_metadata_generator import (
     CompositeArtworkMetadataGenerator,
@@ -2965,7 +2967,25 @@ def test_process_publish_queue_resume_only_without_recreate():
     )
     assert client.calls == [(111, "p-existing")]
     assert stats["completed"] == 1
+    assert stats["processed"] == 1
     assert state["publish_queue"][0]["publish_status"] == "completed"
+    assert state["publish_queue"][0]["publish_attempts"] == 1
+
+
+def test_summarize_publish_queue_counts_completed_history_as_not_pending():
+    state = ensure_state_shape(
+        {
+            "publish_queue": [
+                {"publish_status": "completed"},
+                {"publish_status": "pending"},
+                {"publish_status": "pending_retry"},
+                {"publish_status": "failed"},
+                {"publish_status": "unknown"},
+            ]
+        }
+    )
+    counts = summarize_publish_queue(state)
+    assert counts == {"total": 5, "pending": 2, "completed": 1, "failed": 1}
 
 
 def test_run_resume_publish_only_drains_queue_without_artwork_discovery(tmp_path: Path, monkeypatch):
@@ -3021,6 +3041,9 @@ def test_run_resume_publish_only_drains_queue_without_artwork_discovery(tmp_path
 
     run_report = tmp_path / "resume_run_report.csv"
     failure_report = tmp_path / "resume_failure_report.csv"
+    captured_summaries = []
+    monkeypatch.setattr(pipeline, "log_run_summary", lambda summary: captured_summaries.append(summary))
+
     run(
         tmp_path / "templates.json",
         image_dir=tmp_path / "missing-images-ok-in-resume-mode",
@@ -3034,6 +3057,93 @@ def test_run_resume_publish_only_drains_queue_without_artwork_discovery(tmp_path
     assert state["publish_queue"][0]["publish_status"] == "completed"
     assert run_report.exists()
     assert failure_report.exists()
+    assert captured_summaries
+    summary = captured_summaries[-1]
+    assert summary.publish_queue_total_count == 1
+    assert summary.publish_queue_pending_count == 0
+    assert summary.publish_queue_completed_count == 1
+    assert summary.publish_queue_failed_count == 0
+    assert summary.publish_attempts == 1
+    assert summary.resumed_combinations == 1
+
+    with run_report.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 1
+    assert rows[0]["artwork_slug"] == "a1"
+    assert rows[0]["template_key"] == "t1"
+    assert rows[0]["product_id"] == "p-existing"
+    assert rows[0]["publish_queue_status_before"] == "pending"
+    assert rows[0]["publish_queue_status_after"] == "completed"
+    assert rows[0]["resume_only_queue_processing"] == "True"
+
+    with failure_report.open(newline="", encoding="utf-8") as handle:
+        assert list(csv.DictReader(handle)) == []
+
+
+def test_run_resume_publish_only_empty_queue_reports_zero_processed(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    state = ensure_state_shape(
+        {
+            "publish_queue": [
+                {
+                    "artwork_key": "old",
+                    "template_key": "old-template",
+                    "shop_id": 111,
+                    "product_id": "p-old",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "publish_status": "completed",
+                    "publish_attempts": 2,
+                    "last_error": "",
+                    "reason_code": "",
+                    "next_eligible_publish_at": "",
+                }
+            ]
+        }
+    )
+
+    class NoopPrintifyClient:
+        def __init__(self, *args, **kwargs):
+            self.dry_run = False
+            self.rate_limit_events = {}
+
+        def publish_product(self, *_a, **_k):
+            raise AssertionError("should not publish when no pending rows")
+
+    monkeypatch.setattr(pipeline, "PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "load_json", lambda path, default: state)
+    monkeypatch.setattr(
+        pipeline,
+        "load_templates",
+        lambda p: [ProductTemplate(key="old-template", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{artwork_title}", description_pattern="{artwork_title}")],
+    )
+    monkeypatch.setattr(pipeline, "select_templates", lambda templates, **kwargs: templates)
+    monkeypatch.setattr(pipeline, "discover_artworks", lambda *_a, **_k: [])
+    monkeypatch.setattr(pipeline, "PrintifyClient", NoopPrintifyClient)
+    monkeypatch.setattr(pipeline, "resolve_shop_id", lambda *args, **kwargs: 111)
+    monkeypatch.setattr(pipeline, "load_r2_config_from_env", lambda: None)
+    monkeypatch.setattr(pipeline, "audit_printify_integration", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "run_catalog_cli", lambda **kwargs: False)
+    captured_summaries = []
+    monkeypatch.setattr(pipeline, "log_run_summary", lambda summary: captured_summaries.append(summary))
+
+    run_report = tmp_path / "empty_resume_run_report.csv"
+    run(
+        tmp_path / "templates.json",
+        image_dir=tmp_path / "missing-images-ok-in-resume-mode",
+        export_dir=tmp_path / "exp",
+        state_path=tmp_path / "state.json",
+        skip_audit=True,
+        resume_publish_only=True,
+        export_run_report=str(run_report),
+    )
+    summary = captured_summaries[-1]
+    assert summary.publish_queue_total_count == 1
+    assert summary.publish_queue_pending_count == 0
+    assert summary.publish_queue_completed_count == 1
+    assert summary.publish_attempts == 0
+    assert summary.resumed_combinations == 0
+    assert run_report.read_text(encoding="utf-8") == ""
 
 
 def test_process_artwork_incompatible_update_suggests_rebuild(tmp_path: Path):
@@ -4051,6 +4161,7 @@ def test_format_run_summary_includes_all_fields():
     assert "artworks_scanned=1" in rendered
     assert "templates_processed=2" in rendered
     assert "verification_warnings=0" in rendered
+    assert "publish_queue_total_count=0" in rendered
 
 
 def test_template_blueprint_type_warning_detects_mismatch():
