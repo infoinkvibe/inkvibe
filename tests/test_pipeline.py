@@ -56,6 +56,7 @@ from printify_shopify_sync_pipeline import (
     CatalogCliUsageError,
     run_catalog_cli,
     RunSummary,
+    RunReportRow,
     list_state_keys,
     inspect_state_key,
     load_artwork_metadata,
@@ -93,6 +94,8 @@ from printify_shopify_sync_pipeline import (
     build_printify_product_payload,
     normalize_printify_transform,
     resolve_artwork_for_placement,
+    evaluate_artwork_eligibility_for_template,
+    list_eligible_templates_for_artwork,
     _resolve_trim_bounds_settings,
     build_shopify_product_options,
     validate_storefront_title,
@@ -2981,6 +2984,39 @@ def test_write_csv_report_outputs_rows(tmp_path: Path):
     assert "1,x" in text
 
 
+def test_run_report_export_includes_eligibility_gate_columns(tmp_path: Path):
+    out = tmp_path / "run.csv"
+    row = RunReportRow(
+        timestamp="2026-01-01T00:00:00+00:00",
+        artwork_filename="art.png",
+        artwork_slug="art",
+        template_key="canvas_basic",
+        status="skipped",
+        action="skip",
+        blueprint_id=944,
+        provider_id=105,
+        upload_strategy="direct",
+        product_id="",
+        publish_attempted=False,
+        publish_verified=False,
+        rendered_title="Art",
+        source_size="1280x1280",
+        required_placement_size="4500x5400",
+        required_fit_mode="cover",
+        eligibility_high_resolution_family=True,
+        eligibility_outcome="ineligible",
+        eligibility_reason_code="insufficient_artwork_resolution",
+        eligibility_rule_failed="min_source_width",
+        eligibility_gate_stage="eligibility_gate",
+    )
+    write_csv_report(out, [row.__dict__])
+    text = out.read_text(encoding="utf-8")
+    assert "eligibility_reason_code" in text
+    assert "required_placement_size" in text
+    assert "eligibility_gate_stage" in text
+    assert "insufficient_artwork_resolution" in text
+
+
 def test_run_batch_size_and_resume_and_reporting(tmp_path: Path, monkeypatch):
     import printify_shopify_sync_pipeline as pipeline
 
@@ -4384,6 +4420,102 @@ def test_resolve_artwork_for_blanket_cover_succeeds_when_source_is_large_enough(
     )
     assert result.action == "covered_cropped"
     assert result.final_size == (6000, 4800)
+
+
+def test_canvas_and_blanket_template_policies_marked_as_high_resolution():
+    templates = load_templates(Path("product_templates.json"))
+    by_key = {template.key: template for template in templates}
+    canvas = by_key["canvas_basic"]
+    blanket = by_key["blanket_basic"]
+    assert canvas.high_resolution_family is True
+    assert blanket.high_resolution_family is True
+    assert canvas.skip_if_artwork_below_threshold is True
+    assert blanket.skip_if_artwork_below_threshold is True
+
+
+def test_canvas_artwork_below_threshold_is_ineligible_early(tmp_path: Path):
+    art = tmp_path / "canvas-small.png"
+    Image.new("RGBA", (1280, 1280), (1, 2, 3, 255)).save(art)
+    artwork = Artwork("a", art, "A", "", [], 1280, 1280)
+    template = ProductTemplate(
+        key="canvas_basic",
+        printify_blueprint_id=944,
+        printify_print_provider_id=105,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        high_resolution_family=True,
+        skip_if_artwork_below_threshold=True,
+        min_source_width=4500,
+        min_source_height=5400,
+        min_effective_cover_ratio=1.0,
+        placements=[PlacementRequirement("front", 4500, 5400, artwork_fit_mode="cover")],
+    )
+    result = evaluate_artwork_eligibility_for_template(artwork=artwork, template=template, placement=template.placements[0])
+    assert result.eligible is False
+    assert result.reason_code == "insufficient_artwork_resolution"
+    assert result.source_size == (1280, 1280)
+    assert result.required_size == (4500, 5400)
+    assert result.fit_mode == "cover"
+
+
+def test_blanket_artwork_below_threshold_is_ineligible_early(tmp_path: Path):
+    art = tmp_path / "blanket-small.png"
+    Image.new("RGBA", (1280, 1280), (1, 2, 3, 255)).save(art)
+    artwork = Artwork("a", art, "A", "", [], 1280, 1280)
+    template = ProductTemplate(
+        key="blanket_basic",
+        printify_blueprint_id=238,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        high_resolution_family=True,
+        skip_if_artwork_below_threshold=True,
+        min_source_width=6000,
+        min_source_height=4800,
+        min_effective_cover_ratio=1.0,
+        placements=[PlacementRequirement("front", 6000, 4800, artwork_fit_mode="cover")],
+    )
+    result = evaluate_artwork_eligibility_for_template(artwork=artwork, template=template, placement=template.placements[0])
+    assert result.eligible is False
+    assert result.reason_code == "insufficient_artwork_resolution"
+    assert result.source_size == (1280, 1280)
+    assert result.required_size == (6000, 4800)
+    assert result.fit_mode == "cover"
+
+
+def test_large_artwork_remains_eligible_for_high_resolution_templates(tmp_path: Path):
+    art = tmp_path / "large.png"
+    Image.new("RGBA", (8000, 6400), (1, 2, 3, 255)).save(art)
+    artwork = Artwork("a", art, "A", "", [], 8000, 6400)
+    canvas = ProductTemplate(
+        key="canvas_basic",
+        printify_blueprint_id=944,
+        printify_print_provider_id=105,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        high_resolution_family=True,
+        skip_if_artwork_below_threshold=True,
+        min_source_width=4500,
+        min_source_height=5400,
+        min_effective_cover_ratio=1.0,
+        placements=[PlacementRequirement("front", 4500, 5400, artwork_fit_mode="cover")],
+    )
+    blanket = ProductTemplate(
+        key="blanket_basic",
+        printify_blueprint_id=238,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        high_resolution_family=True,
+        skip_if_artwork_below_threshold=True,
+        min_source_width=6000,
+        min_source_height=4800,
+        min_effective_cover_ratio=1.0,
+        placements=[PlacementRequirement("front", 6000, 4800, artwork_fit_mode="cover")],
+    )
+    matrix = list_eligible_templates_for_artwork(artwork, [canvas, blanket])
+    assert matrix["canvas_basic"].eligible is True
+    assert matrix["blanket_basic"].eligible is True
 
 
 def test_resolve_tote_template_catalog_mapping_fails_for_missing_blueprint():
