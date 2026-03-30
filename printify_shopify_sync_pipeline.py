@@ -2455,6 +2455,10 @@ def format_run_summary(summary: RunSummary) -> str:
     )
 
 
+def log_run_summary(summary: RunSummary) -> None:
+    logger.info(format_run_summary(summary))
+
+
 def build_generic_description_html(artwork_title: str) -> str:
     return (
         f"<p><strong>{artwork_title}</strong> adds an easy style upgrade to your everyday wardrobe.</p>"
@@ -8654,7 +8658,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             print(f"{key}\t{str((row.get('result', {}) or {}).get('error', ''))[:120]}")
         return
 
-    if not image_dir.exists():
+    if not resume_publish_only and not image_dir.exists():
         raise RuntimeError(f"Missing image directory: {image_dir}")
 
     templates = load_templates(config_path)
@@ -8752,38 +8756,40 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         )
         logger.info("Launch-plan CSV exported from images path=%s rows=%s", export_launch_plan_from_images_path, exported_count)
         return
-    try:
-        artworks = discover_artworks(
-            image_dir,
-            candidate_paths=generated_paths,
-            source_hygiene=source_hygiene,
-            auto_generate_missing_metadata=auto_generate_missing_metadata,
-            auto_write_generated_sidecars=auto_write_generated_sidecars,
-            metadata_inline_generator=metadata_inline_generator,
-            metadata_inline_only_when_weak=metadata_inline_only_when_weak,
-            metadata_inline_overwrite_weak_sidecars=metadata_inline_overwrite_weak_sidecars,
-            metadata_openai_model=metadata_openai_model,
-            metadata_openai_timeout=metadata_openai_timeout,
-        )
-    except TypeError:
-        artworks = discover_artworks(image_dir)
-    if max_artworks > 0:
-        artworks = artworks[:max_artworks]
-    if high_volume_mode and len(artworks) >= 25 and publish_mode != "publish":
-        defer_publish = True
-    if preview_listing_copy_only:
-        preview_listing_copy(artworks=artworks, templates=templates)
-        return
+    artworks: List[Artwork] = []
+    if not resume_publish_only:
+        try:
+            artworks = discover_artworks(
+                image_dir,
+                candidate_paths=generated_paths,
+                source_hygiene=source_hygiene,
+                auto_generate_missing_metadata=auto_generate_missing_metadata,
+                auto_write_generated_sidecars=auto_write_generated_sidecars,
+                metadata_inline_generator=metadata_inline_generator,
+                metadata_inline_only_when_weak=metadata_inline_only_when_weak,
+                metadata_inline_overwrite_weak_sidecars=metadata_inline_overwrite_weak_sidecars,
+                metadata_openai_model=metadata_openai_model,
+                metadata_openai_timeout=metadata_openai_timeout,
+            )
+        except TypeError:
+            artworks = discover_artworks(image_dir)
+        if max_artworks > 0:
+            artworks = artworks[:max_artworks]
+        if high_volume_mode and len(artworks) >= 25 and publish_mode != "publish":
+            defer_publish = True
+        if preview_listing_copy_only:
+            preview_listing_copy(artworks=artworks, templates=templates)
+            return
 
-    if list_pending_only:
-        index = latest_rows_by_state_key(state)
-        for artwork in artworks:
-            for template in templates:
-                state_key = f"{artwork.slug}:{template.key}"
-                row = index.get(state_key)
-                if row is None or _row_status(row) != "success":
-                    print(state_key)
-        return
+        if list_pending_only:
+            index = latest_rows_by_state_key(state)
+            for artwork in artworks:
+                for template in templates:
+                    state_key = f"{artwork.slug}:{template.key}"
+                    row = index.get(state_key)
+                    if row is None or _row_status(row) != "success":
+                        print(state_key)
+            return
 
     if not PRINTIFY_API_TOKEN:
         raise RuntimeError("Missing PRINTIFY_API_TOKEN")
@@ -8897,10 +8903,19 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             publish_batch_size=publish_batch_size,
             pause_between_publish_batches_seconds=pause_between_publish_batches_seconds,
         )
+        if publish_stats["pending"] == 0:
+            logger.info("Publish queue is empty; nothing to resume.")
         summary.publish_queue_pending_count = publish_stats["pending"]
         summary.publish_queue_completed_count = publish_stats["completed"]
         summary.publish_queue_failed_count = publish_stats["failed"]
         summary.publish_rate_limit_events = publish_stats["rate_limited"]
+        summary.rate_limit_events = dict(getattr(printify, "rate_limit_events", {}))
+        if export_failure_report:
+            write_csv_report(pathlib.Path(export_failure_report), [row.__dict__ for row in failure_rows])
+            logger.info("Failure report exported path=%s rows=%s", export_failure_report, len(failure_rows))
+        if export_run_report:
+            write_csv_report(pathlib.Path(export_run_report), [row.__dict__ for row in run_rows])
+            logger.info("Run report exported path=%s rows=%s", export_run_report, len(run_rows))
         save_json_atomic(state_path, state)
         log_run_summary(summary)
         return
@@ -9181,7 +9196,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         logger.info("Run report exported path=%s rows=%s", export_run_report, len(run_rows))
 
     save_json_atomic(state_path, state)
-    logger.info(format_run_summary(summary))
+    log_run_summary(summary)
     if failure_rows:
         logger.info("Failures encountered (showing up to 5):")
         for row in failure_rows[:5]:
