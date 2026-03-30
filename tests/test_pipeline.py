@@ -123,6 +123,7 @@ from printify_shopify_sync_pipeline import (
     CatalogCache,
     PrintifyClient,
     apply_high_volume_mode_defaults,
+    process_publish_queue,
 )
 from artwork_metadata_generator import (
     CompositeArtworkMetadataGenerator,
@@ -2697,6 +2698,7 @@ def test_catalog_cli_auto_provider_selects_best(tmp_path: Path, capsys):
 def test_state_shape_backward_compatible_with_new_fields():
     state = ensure_state_shape({"processed": {"art": {"products": [{"state_key": "art:tee"}]}}})
     assert "processed" in state
+    assert "publish_queue" in state
     assert list_state_keys(state) == ["art:tee"]
 
 
@@ -2864,10 +2866,106 @@ def test_publish_rate_limited_records_structured_failure_row(tmp_path: Path):
         failure_rows=failures,
         run_rows=run_rows,
     )
-    assert failures
-    assert failures[0].error_type == "publish_rate_limited"
-    assert failures[0].reason_code == "publish_rate_limited"
-    assert run_rows and run_rows[0].status == "failure"
+    assert not failures
+    assert run_rows and run_rows[0].status == "success"
+    assert run_rows[0].publish_outcome == "create_success_publish_rate_limited"
+    assert state["publish_queue"]
+    queue_row = state["publish_queue"][0]
+    assert queue_row["publish_status"] == "pending_retry"
+    assert queue_row["product_id"] == "p-new"
+
+
+def test_process_artwork_defer_publish_enqueues_pending(tmp_path: Path):
+    class DeferPrintify(DummyPrintify):
+        dry_run = False
+
+        def create_product(self, shop_id, payload):
+            return {"id": "p-new"}
+
+        def publish_product(self, shop_id, product_id, payload):
+            raise AssertionError("publish should be deferred")
+
+    artwork = _create_artwork(tmp_path, 1200, 1200)
+    template = ProductTemplate(
+        key="tee",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_colors=["Black"],
+        enabled_sizes=["M"],
+        placements=[PlacementRequirement("front", 1000, 1000)],
+    )
+    state = ensure_state_shape({})
+    run_rows = []
+    process_artwork(
+        printify=DeferPrintify(),
+        shopify=None,
+        shop_id=111,
+        artwork=artwork,
+        templates=[template],
+        state=state,
+        force=True,
+        export_dir=tmp_path / "exports",
+        state_path=tmp_path / "state.json",
+        artwork_options=ArtworkProcessingOptions(),
+        upload_strategy="auto",
+        r2_config=None,
+        defer_publish=True,
+        run_rows=run_rows,
+    )
+    assert run_rows[0].publish_outcome == "create_success_publish_deferred"
+    assert state["publish_queue"][0]["publish_status"] == "pending"
+
+
+def test_process_publish_queue_resume_only_without_recreate():
+    class ResumePrintify(DummyPrintify):
+        def __init__(self):
+            self.calls = []
+
+        def publish_product(self, shop_id, product_id, payload):
+            self.calls.append((shop_id, product_id))
+            return {"status": "published"}
+
+    template = ProductTemplate(
+        key="tee",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_colors=["Black"],
+        enabled_sizes=["M"],
+        placements=[PlacementRequirement("front", 1000, 1000)],
+    )
+    state = ensure_state_shape(
+        {
+            "publish_queue": [
+                {
+                    "artwork_key": "art",
+                    "template_key": "tee",
+                    "shop_id": 111,
+                    "product_id": "p-existing",
+                    "created_at": "2025-01-01T00:00:00+00:00",
+                    "publish_status": "pending",
+                    "publish_attempts": 0,
+                    "last_error": "",
+                    "reason_code": "",
+                    "next_eligible_publish_at": "",
+                }
+            ]
+        }
+    )
+    client = ResumePrintify()
+    stats = process_publish_queue(
+        printify=client,
+        state=state,
+        templates_by_key={"tee": template},
+        publish_batch_size=1,
+        pause_between_publish_batches_seconds=0,
+    )
+    assert client.calls == [(111, "p-existing")]
+    assert stats["completed"] == 1
+    assert state["publish_queue"][0]["publish_status"] == "completed"
 
 
 def test_process_artwork_incompatible_update_suggests_rebuild(tmp_path: Path):
@@ -6383,7 +6481,11 @@ def test_high_volume_mode_sets_safe_defaults():
         template_spacing_ms=0,
         artwork_spacing_ms=0,
         no_catalog_cache=True,
+        publish_batch_size=0,
+        pause_between_publish_batches_seconds=0,
+        defer_publish=False,
     )
     assert defaults["chunk_size"] == 10
     assert defaults["catalog_request_spacing_ms"] == 150
     assert defaults["no_catalog_cache"] is False
+    assert defaults["publish_batch_size"] == 5

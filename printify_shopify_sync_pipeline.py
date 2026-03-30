@@ -554,6 +554,11 @@ class RunSummary:
     total_chunks: int = 0
     templates_skipped_catalog_rate_limited: int = 0
     resumed_combinations: int = 0
+    products_created_but_not_published: int = 0
+    publish_queue_pending_count: int = 0
+    publish_queue_completed_count: int = 0
+    publish_queue_failed_count: int = 0
+    publish_rate_limit_events: int = 0
     rate_limit_events: Dict[str, int] = field(default_factory=dict)
 
 
@@ -598,6 +603,8 @@ class RunReportRow:
     publish_attempted: bool
     publish_verified: bool
     rendered_title: str
+    publish_outcome: str = ""
+    publish_queue_status: str = ""
     source_size: str = ""
     trimmed_bounds_size: str = ""
     trim_skip_reason: str = ""
@@ -2432,6 +2439,11 @@ def format_run_summary(summary: RunSummary) -> str:
         f"template_failures={summary.failures} "
         f"publish_attempts={summary.publish_attempts} "
         f"publish_verified={summary.publish_verified} "
+        f"products_created_but_not_published={summary.products_created_but_not_published} "
+        f"publish_queue_pending_count={summary.publish_queue_pending_count} "
+        f"publish_queue_completed_count={summary.publish_queue_completed_count} "
+        f"publish_queue_failed_count={summary.publish_queue_failed_count} "
+        f"publish_rate_limit_events={summary.publish_rate_limit_events} "
         f"verification_warnings={summary.verification_warnings} "
         f"catalog_cache_hits={summary.catalog_cache_hits} "
         f"catalog_cache_misses={summary.catalog_cache_misses} "
@@ -3008,6 +3020,63 @@ def is_state_key_successful(state: Dict[str, Any], state_key: str) -> bool:
 
 def row_completion_label(row: Dict[str, Any]) -> str:
     return state_store.row_completion_label(row)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def get_publish_queue(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    queue = state.setdefault("publish_queue", [])
+    if not isinstance(queue, list):
+        queue = []
+        state["publish_queue"] = queue
+    return queue
+
+
+def enqueue_publish_pending(
+    *,
+    state: Dict[str, Any],
+    artwork_key: str,
+    template_key: str,
+    shop_id: int,
+    product_id: str,
+    publish_status: str,
+    reason_code: str = "",
+    last_error: str = "",
+    next_eligible_publish_at: str = "",
+) -> Dict[str, Any]:
+    queue = get_publish_queue(state)
+    now = _utc_now_iso()
+    for row in queue:
+        if not isinstance(row, dict):
+            continue
+        if row.get("artwork_key") == artwork_key and row.get("template_key") == template_key and str(row.get("shop_id")) == str(shop_id):
+            row["product_id"] = product_id
+            row["publish_status"] = publish_status
+            row["reason_code"] = reason_code
+            row["last_error"] = last_error
+            row["updated_at"] = now
+            if next_eligible_publish_at:
+                row["next_eligible_publish_at"] = next_eligible_publish_at
+            row.setdefault("created_at", now)
+            row.setdefault("publish_attempts", 0)
+            return row
+    new_row = {
+        "artwork_key": artwork_key,
+        "template_key": template_key,
+        "shop_id": int(shop_id),
+        "product_id": product_id,
+        "created_at": now,
+        "updated_at": now,
+        "publish_status": publish_status,
+        "publish_attempts": 0,
+        "last_error": last_error,
+        "reason_code": reason_code,
+        "next_eligible_publish_at": next_eligible_publish_at,
+    }
+    queue.append(new_row)
+    return new_row
 
 
 def write_csv_report(path: pathlib.Path, rows: List[Dict[str, Any]]) -> None:
@@ -7034,6 +7103,8 @@ def upsert_in_printify(
     action: str,
     publish_mode: str,
     verify_publish: bool,
+    defer_publish: bool = False,
+    state: Optional[Dict[str, Any]] = None,
     auto_rebuild_on_incompatible_update: bool = False,
 ) -> Dict[str, Any]:
     def _execute_create() -> Tuple[str, Dict[str, Any]]:
@@ -7151,16 +7222,49 @@ def upsert_in_printify(
 
     logger.info("Printify product action=%s product_id=%s title=%s enabled_variants=%s", action, product_id, payload.get("title", ""), len(payload.get("variants", [])))
     should_publish = (template.publish_after_create if publish_mode == "default" else publish_mode == "publish") and bool(product_id)
+    should_publish = should_publish and not defer_publish
     result["publish_attempted"] = False
     result["publish_verified"] = False
+    result["publish_outcome"] = "create_success_publish_deferred" if defer_publish else "create_success_publish_success"
+    result["publish_queue_status"] = ""
 
-    if should_publish:
+    if defer_publish and product_id and state is not None:
+        enqueue_publish_pending(
+            state=state,
+            artwork_key=artwork.slug,
+            template_key=template.key,
+            shop_id=shop_id,
+            product_id=product_id,
+            publish_status="pending",
+            reason_code="deferred_publish",
+        )
+        result["publish_queue_status"] = "pending"
+    elif should_publish:
         result["publish_attempted"] = True
         try:
             result["published"] = printify.publish_product(shop_id, product_id, build_printify_publish_payload(template))
             logger.info("Printify publish completed product_id=%s", product_id)
+            result["publish_outcome"] = "create_success_publish_success"
+            result["publish_queue_status"] = "completed"
         except DryRunMutationSkipped:
             result["published"] = {"status": "dry-run"}
+        except RetryLimitExceededError as exc:
+            if exc.reason_code == "publish_rate_limited" and state is not None:
+                enqueue_publish_pending(
+                    state=state,
+                    artwork_key=artwork.slug,
+                    template_key=template.key,
+                    shop_id=shop_id,
+                    product_id=product_id,
+                    publish_status="pending_retry",
+                    reason_code=exc.reason_code,
+                    last_error=str(exc),
+                )
+                result["publish_outcome"] = "create_success_publish_rate_limited"
+                result["publish_queue_status"] = "pending_retry"
+                result["publish_error"] = str(exc)
+            else:
+                raise
 
     if verify_publish and product_id:
         try:
@@ -7185,7 +7289,7 @@ def upsert_in_printify(
     return result
 
 
-def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, verify_collections: bool = False, summary: Optional[RunSummary] = None, failure_rows: Optional[List[FailureReportRow]] = None, run_rows: Optional[List[RunReportRow]] = None, launch_plan_row: str = "", launch_plan_row_id: str = "", collection_handle: str = "", collection_title: str = "", collection_description: str = "", launch_name: str = "", campaign: str = "", merch_theme: str = "", routed_asset_family: str = "", routed_asset_mode: str = "", enforce_family_collection_membership: bool = True, collection_removal_mode: str = "conservative", collection_sort_order: str = "", collection_image_src: str = "", secondary_collection_handles: str = "") -> None:
+def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, defer_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, verify_collections: bool = False, summary: Optional[RunSummary] = None, failure_rows: Optional[List[FailureReportRow]] = None, run_rows: Optional[List[RunReportRow]] = None, launch_plan_row: str = "", launch_plan_row_id: str = "", collection_handle: str = "", collection_title: str = "", collection_description: str = "", launch_name: str = "", campaign: str = "", merch_theme: str = "", routed_asset_family: str = "", routed_asset_mode: str = "", enforce_family_collection_membership: bool = True, collection_removal_mode: str = "conservative", collection_sort_order: str = "", collection_image_src: str = "", secondary_collection_handles: str = "") -> None:
     processed = state.setdefault("processed", {})
     existing = processed.get(artwork.slug, {})
     existing_products = existing.get("products", []) if isinstance(existing.get("products", []), list) else []
@@ -7681,6 +7785,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 action=action,
                 publish_mode=publish_mode,
                 verify_publish=verify_publish,
+                defer_publish=defer_publish,
+                state=state,
                 auto_rebuild_on_incompatible_update=auto_rebuild_on_incompatible_update,
             ) if (resolved_template.push_via_printify and shop_id is not None) else {"status": "prepared_only", "action": action, "publish_attempted": False, "publish_verified": False}
             printify_result_for_skip = result.get("printify", {}) if isinstance(result.get("printify"), dict) else {}
@@ -7776,6 +7882,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 "last_action": printify_result.get("action", action),
                 "publish_attempted": bool(printify_result.get("publish_attempted", False)),
                 "publish_verified": bool(printify_result.get("publish_verified", False)),
+                "publish_outcome": str(printify_result.get("publish_outcome") or ""),
+                "publish_queue_status": str(printify_result.get("publish_queue_status") or ""),
                 "last_verified_at": datetime.now(timezone.utc).isoformat() if verification else None,
                 "verified_title": verification.get("verified_title"),
                 "verified_variant_count": verification.get("verified_variant_count"),
@@ -7825,6 +7933,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     publish_attempted=bool(row.get("publish_attempted")),
                     publish_verified=bool(row.get("publish_verified")),
                     rendered_title=rendered_title,
+                    publish_outcome=str(row.get("publish_outcome") or ""),
+                    publish_queue_status=str(row.get("publish_queue_status") or ""),
                     source_size=source_size_report,
                     trimmed_bounds_size=trimmed_bounds_report,
                     trim_skip_reason=trim_skip_reason_report,
@@ -7894,6 +8004,10 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     summary.publish_attempts += 1
                 if row.get("publish_verified"):
                     summary.publish_verified += 1
+                if str(row.get("publish_queue_status") or "").startswith("pending"):
+                    summary.products_created_but_not_published += 1
+                    if row.get("publish_outcome") == "create_success_publish_rate_limited":
+                        summary.publish_rate_limit_events += 1
                 if verification_warnings:
                     summary.verification_warnings += 1
             log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=True, result=result, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action=(result.get("printify", {}) or {}).get("action", action), upload_map=upload_map)
@@ -8041,6 +8155,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auto-rebuild-on-incompatible-update", action="store_true", help="Automatically rebuild when update preflight detects blueprint/provider/variant incompatibility")
     parser.add_argument("--publish", action="store_true", help="Force publish after create/update/rebuild")
     parser.add_argument("--skip-publish", action="store_true", help="Skip publish after create/update/rebuild")
+    parser.add_argument("--defer-publish", action="store_true", help="Create/update products now and enqueue publish for later")
+    parser.add_argument("--resume-publish-only", action="store_true", help="Skip create/update and only drain persisted publish queue")
+    parser.add_argument("--publish-batch-size", type=int, default=5, help="Maximum queued publish operations per batch")
+    parser.add_argument("--pause-between-publish-batches-seconds", type=float, default=2.0, help="Pause duration between publish batches")
     parser.add_argument("--verify-publish", action="store_true", help="Read back created/updated product and verify basic storefront indicators")
     parser.add_argument(
         "--max-retry-sleep-seconds",
@@ -8375,6 +8493,64 @@ def run_catalog_cli(
     return False
 
 
+def process_publish_queue(
+    *,
+    printify: PrintifyClient,
+    state: Dict[str, Any],
+    templates_by_key: Dict[str, ProductTemplate],
+    publish_batch_size: int,
+    pause_between_publish_batches_seconds: float,
+) -> Dict[str, int]:
+    queue = get_publish_queue(state)
+    stats = {"pending": 0, "completed": 0, "failed": 0, "rate_limited": 0, "processed": 0}
+    pending_rows = [row for row in queue if isinstance(row, dict) and str(row.get("publish_status") or "").startswith("pending")]
+    stats["pending"] = len(pending_rows)
+    if not pending_rows:
+        return stats
+    batch_size = max(1, int(publish_batch_size))
+    for index in range(0, len(pending_rows), batch_size):
+        batch = pending_rows[index:index + batch_size]
+        for row in batch:
+            template = templates_by_key.get(str(row.get("template_key") or ""))
+            if template is None:
+                row["publish_status"] = "failed"
+                row["last_error"] = "template_not_found_for_publish_resume"
+                row["updated_at"] = _utc_now_iso()
+                stats["failed"] += 1
+                continue
+            row["publish_attempts"] = int(row.get("publish_attempts") or 0) + 1
+            try:
+                printify.publish_product(int(row["shop_id"]), str(row["product_id"]), build_printify_publish_payload(template))
+                row["publish_status"] = "completed"
+                row["reason_code"] = ""
+                row["last_error"] = ""
+                row["updated_at"] = _utc_now_iso()
+                stats["completed"] += 1
+            except RetryLimitExceededError as exc:
+                if exc.reason_code == "publish_rate_limited":
+                    row["publish_status"] = "pending_retry"
+                    row["reason_code"] = exc.reason_code
+                    row["last_error"] = str(exc)
+                    row["updated_at"] = _utc_now_iso()
+                    stats["rate_limited"] += 1
+                else:
+                    row["publish_status"] = "failed"
+                    row["reason_code"] = exc.reason_code
+                    row["last_error"] = str(exc)
+                    row["updated_at"] = _utc_now_iso()
+                    stats["failed"] += 1
+            except Exception as exc:
+                row["publish_status"] = "failed"
+                row["reason_code"] = classify_failure(exc)
+                row["last_error"] = str(exc)
+                row["updated_at"] = _utc_now_iso()
+                stats["failed"] += 1
+            stats["processed"] += 1
+        if pause_between_publish_batches_seconds > 0 and (index + batch_size) < len(pending_rows):
+            time.sleep(max(0.0, float(pause_between_publish_batches_seconds)))
+    return stats
+
+
 def apply_high_volume_mode_defaults(
     *,
     chunk_size: int,
@@ -8383,6 +8559,9 @@ def apply_high_volume_mode_defaults(
     template_spacing_ms: int,
     artwork_spacing_ms: int,
     no_catalog_cache: bool,
+    publish_batch_size: int,
+    pause_between_publish_batches_seconds: float,
+    defer_publish: bool,
 ) -> Dict[str, Any]:
     return {
         "no_catalog_cache": False if no_catalog_cache else no_catalog_cache,
@@ -8391,10 +8570,13 @@ def apply_high_volume_mode_defaults(
         "catalog_request_spacing_ms": catalog_request_spacing_ms if catalog_request_spacing_ms > 0 else 150,
         "template_spacing_ms": template_spacing_ms if template_spacing_ms > 0 else 100,
         "artwork_spacing_ms": artwork_spacing_ms if artwork_spacing_ms > 0 else 150,
+        "publish_batch_size": publish_batch_size if publish_batch_size > 0 else 5,
+        "pause_between_publish_batches_seconds": pause_between_publish_batches_seconds if pause_between_publish_batches_seconds > 0 else 3.0,
+        "defer_publish": defer_publish,
     }
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", export_preflight_report_path: str = "", allow_preflight_failures: bool = False, preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "", max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS, interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS, catalog_cache_dir: str = CATALOG_CACHE_DIR_DEFAULT, catalog_cache_ttl_hours: int = CACHE_TTL_HOURS_DEFAULT, no_catalog_cache: bool = False, chunk_size: int = 0, pause_between_chunks_seconds: float = 0.0, catalog_request_spacing_ms: int = 0, template_spacing_ms: int = 0, artwork_spacing_ms: int = 0, resume_only_pending: bool = False, high_volume_mode: bool = False) -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", export_preflight_report_path: str = "", allow_preflight_failures: bool = False, preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "", max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS, interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS, catalog_cache_dir: str = CATALOG_CACHE_DIR_DEFAULT, catalog_cache_ttl_hours: int = CACHE_TTL_HOURS_DEFAULT, no_catalog_cache: bool = False, chunk_size: int = 0, pause_between_chunks_seconds: float = 0.0, catalog_request_spacing_ms: int = 0, template_spacing_ms: int = 0, artwork_spacing_ms: int = 0, resume_only_pending: bool = False, high_volume_mode: bool = False, publish_batch_size: int = 5, pause_between_publish_batches_seconds: float = 2.0, defer_publish: bool = False, resume_publish_only: bool = False) -> None:
     max_retry_sleep_seconds = max(0.0, float(max_retry_sleep_seconds))
     interactive_retry_cap_seconds = max(0.0, float(interactive_retry_cap_seconds))
     if resume_only_pending:
@@ -8407,6 +8589,9 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             template_spacing_ms=template_spacing_ms,
             artwork_spacing_ms=artwork_spacing_ms,
             no_catalog_cache=no_catalog_cache,
+            publish_batch_size=publish_batch_size,
+            pause_between_publish_batches_seconds=pause_between_publish_batches_seconds,
+            defer_publish=defer_publish,
         )
         no_catalog_cache = bool(hv_defaults["no_catalog_cache"])
         chunk_size = int(hv_defaults["chunk_size"])
@@ -8414,6 +8599,8 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         catalog_request_spacing_ms = int(hv_defaults["catalog_request_spacing_ms"])
         template_spacing_ms = int(hv_defaults["template_spacing_ms"])
         artwork_spacing_ms = int(hv_defaults["artwork_spacing_ms"])
+        publish_batch_size = int(hv_defaults["publish_batch_size"])
+        pause_between_publish_batches_seconds = float(hv_defaults["pause_between_publish_batches_seconds"])
     if publish_mode not in {"default", "publish", "skip"}:
         raise RuntimeError(f"Unsupported publish mode: {publish_mode}")
 
@@ -8582,6 +8769,8 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         artworks = discover_artworks(image_dir)
     if max_artworks > 0:
         artworks = artworks[:max_artworks]
+    if high_volume_mode and len(artworks) >= 25 and publish_mode != "publish":
+        defer_publish = True
     if preview_listing_copy_only:
         preview_listing_copy(artworks=artworks, templates=templates)
         return
@@ -8699,6 +8888,22 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
     summary.templates_skipped_catalog_rate_limited = int(summary_catalog_rate_limited)
     failure_rows: List[FailureReportRow] = []
     run_rows: List[RunReportRow] = []
+    templates_by_key = {template.key: template for template in templates}
+    if resume_publish_only:
+        publish_stats = process_publish_queue(
+            printify=printify,
+            state=state,
+            templates_by_key=templates_by_key,
+            publish_batch_size=publish_batch_size,
+            pause_between_publish_batches_seconds=pause_between_publish_batches_seconds,
+        )
+        summary.publish_queue_pending_count = publish_stats["pending"]
+        summary.publish_queue_completed_count = publish_stats["completed"]
+        summary.publish_queue_failed_count = publish_stats["failed"]
+        summary.publish_rate_limit_events = publish_stats["rate_limited"]
+        save_json_atomic(state_path, state)
+        log_run_summary(summary)
+        return
     artwork_options = ArtworkProcessingOptions(allow_upscale=allow_upscale, upscale_method=upscale_method, skip_undersized=skip_undersized, placement_preview=placement_preview, preview_dir=export_dir / "previews")
     combinations_processed = 0
     stop_requested = False
@@ -8793,6 +8998,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                 rebuild_product=rebuild_product,
                 publish_mode=publish_mode,
                 verify_publish=verify_publish,
+                defer_publish=defer_publish,
                 auto_rebuild_on_incompatible_update=auto_rebuild_on_incompatible_update,
                 sync_collections=collection_sync_enabled,
                 verify_collections=verify_collections,
@@ -8858,6 +9064,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                     rebuild_product=rebuild_product,
                     publish_mode=publish_mode,
                     verify_publish=verify_publish,
+                    defer_publish=defer_publish,
                     auto_rebuild_on_incompatible_update=auto_rebuild_on_incompatible_update,
                     sync_collections=collection_sync_enabled,
                     verify_collections=verify_collections,
@@ -8910,6 +9117,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                         rebuild_product=rebuild_product,
                         publish_mode=publish_mode,
                         verify_publish=verify_publish,
+                        defer_publish=defer_publish,
                         auto_rebuild_on_incompatible_update=auto_rebuild_on_incompatible_update,
                         sync_collections=collection_sync_enabled,
                         verify_collections=verify_collections,
@@ -8939,6 +9147,18 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             if stop_requested:
                 break
 
+    publish_stats = {"pending": 0, "completed": 0, "failed": 0, "rate_limited": 0, "processed": 0}
+    if not defer_publish:
+        publish_stats = process_publish_queue(
+            printify=printify,
+            state=state,
+            templates_by_key=templates_by_key,
+            publish_batch_size=publish_batch_size,
+            pause_between_publish_batches_seconds=pause_between_publish_batches_seconds,
+        )
+    else:
+        publish_stats["pending"] = len([row for row in get_publish_queue(state) if isinstance(row, dict) and str(row.get("publish_status") or "").startswith("pending")])
+
     summary.combinations_processed = len(run_rows)
     summary.combinations_success = sum(1 for row in run_rows if row.status == "success")
     summary.combinations_failed = sum(1 for row in run_rows if row.status == "failure")
@@ -8947,6 +9167,10 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         summary.catalog_cache_hits = printify.catalog_cache.stats.hits
         summary.catalog_cache_misses = printify.catalog_cache.stats.misses
         summary.catalog_requests_avoided = printify.catalog_cache.stats.requests_avoided
+    summary.publish_queue_pending_count = publish_stats["pending"]
+    summary.publish_queue_completed_count = publish_stats["completed"]
+    summary.publish_queue_failed_count = publish_stats["failed"]
+    summary.publish_rate_limit_events += publish_stats["rate_limited"]
     summary.rate_limit_events = dict(getattr(printify, "rate_limit_events", {}))
 
     if export_failure_report:
@@ -8971,6 +9195,8 @@ if __name__ == "__main__":
     publish_mode = "default"
     if args.publish and args.skip_publish:
         raise SystemExit("--publish and --skip-publish cannot be used together")
+    if args.defer_publish and args.publish:
+        raise SystemExit("--defer-publish and --publish cannot be used together")
     if args.publish:
         publish_mode = "publish"
     elif args.skip_publish:
@@ -9103,6 +9329,10 @@ if __name__ == "__main__":
             artwork_spacing_ms=args.artwork_spacing_ms,
             resume_only_pending=args.resume_only_pending,
             high_volume_mode=args.high_volume_mode,
+            publish_batch_size=args.publish_batch_size,
+            pause_between_publish_batches_seconds=args.pause_between_publish_batches_seconds,
+            defer_publish=args.defer_publish,
+            resume_publish_only=args.resume_publish_only,
         )
     except CatalogCliUsageError as exc:
         print(f"Catalog CLI error: {exc}")
