@@ -10,6 +10,7 @@ def ensure_state_shape(state: Dict[str, Any]) -> Dict[str, Any]:
     state.setdefault("shopify", {})
     state.setdefault("printify", {})
     state.setdefault("debug_runs", {})
+    state.setdefault("publish_queue", [])
     return state
 
 

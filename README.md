@@ -457,6 +457,10 @@ Publish controls:
 - default behavior stays backward compatible (`template.publish_after_create` controls publish).
 - `--publish`: force publish after create/update/rebuild.
 - `--skip-publish`: skip publish after create/update/rebuild.
+- `--defer-publish`: create/update now, persist publish work into `state.publish_queue`, and skip immediate publish.
+- `--resume-publish-only`: skip create/update and drain only pending publish queue rows.
+- `--publish-batch-size <n>`: max queued publish operations per batch.
+- `--pause-between-publish-batches-seconds <n>`: pause between publish batches to reduce throttling risk.
 - `--verify-publish`: read product back and log concise verification warnings/success signals.
 - `--auto-rebuild-on-incompatible-update`: on update-only incompatibility, automatically switch to rebuild (delete+recreate) for that product.
 
@@ -483,6 +487,7 @@ Bulk safety controls:
 - `--template-spacing-ms <n>`: spacing between template operations.
 - `--artwork-spacing-ms <n>`: spacing between artworks.
 - `--high-volume-mode`: convenience mode for large runs (cache + chunking + safer spacing defaults).
+  - Also applies conservative publish batching defaults and can auto-defer publish on large artwork volumes.
 
 Reporting exports:
 - `--export-failure-report <path>`: CSV report for failed combinations.
@@ -497,6 +502,12 @@ Examples:
 ```bash
 # Create/update without publish
 python printify_shopify_sync_pipeline.py --template-key hoodie_gildan --skip-publish
+
+# Create/update and defer publish into durable queue
+python printify_shopify_sync_pipeline.py --max-artworks 100 --high-volume-mode --defer-publish
+
+# Later resume publish only from persisted queue
+python printify_shopify_sync_pipeline.py --resume-publish-only --publish-batch-size 5 --pause-between-publish-batches-seconds 3
 
 # Create/update and force publish
 python printify_shopify_sync_pipeline.py --template-key hoodie_gildan --publish
