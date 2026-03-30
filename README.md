@@ -473,6 +473,16 @@ Bulk safety controls:
 - `--stop-after-failures <n>`: stop when N failures are reached.
 - `--fail-fast`: stop on first failure.
 - `--resume`: skip combinations already successful in **real** (non-dry-run) state and continue pending rows.
+- `--resume-only-pending`: explicit alias for resume behavior (only pending combinations are processed).
+- `--chunk-size <n>`: process artworks in internal chunks and checkpoint between chunks.
+- `--pause-between-chunks-seconds <n>`: pause between chunks to reduce catalog pressure.
+- `--catalog-cache-dir <path>`: persistent on-disk catalog cache location.
+- `--catalog-cache-ttl-hours <n>`: TTL for cached catalog entries.
+- `--no-catalog-cache`: bypass persistent catalog cache.
+- `--catalog-request-spacing-ms <n>`: spacing between catalog GET requests.
+- `--template-spacing-ms <n>`: spacing between template operations.
+- `--artwork-spacing-ms <n>`: spacing between artworks.
+- `--high-volume-mode`: convenience mode for large runs (cache + chunking + safer spacing defaults).
 
 Reporting exports:
 - `--export-failure-report <path>`: CSV report for failed combinations.
@@ -501,6 +511,7 @@ python printify_shopify_sync_pipeline.py --inspect-state-key cool-cat:hoodie_gil
 # Batch-size examples
 python printify_shopify_sync_pipeline.py --batch-size 10 --resume
 python printify_shopify_sync_pipeline.py --max-artworks 5 --batch-size 20
+python printify_shopify_sync_pipeline.py --max-artworks 100 --high-volume-mode --resume-only-pending
 
 # Failure controls
 python printify_shopify_sync_pipeline.py --fail-fast

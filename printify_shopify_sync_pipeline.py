@@ -85,6 +85,8 @@ MUTATION_RETRY_BACKOFF_CAP_SECONDS = float(os.getenv("MUTATION_RETRY_BACKOFF_CAP
 INTERACTIVE_RETRY_CAP_SECONDS = float(os.getenv("INTERACTIVE_RETRY_CAP_SECONDS", "12"))
 MAX_RETRY_SLEEP_SECONDS = float(os.getenv("MAX_RETRY_SLEEP_SECONDS", "45"))
 PRINTIFY_DIRECT_UPLOAD_LIMIT_BYTES = 5 * 1024 * 1024
+CACHE_TTL_HOURS_DEFAULT = int(os.getenv("CATALOG_CACHE_TTL_HOURS", "24"))
+CATALOG_CACHE_DIR_DEFAULT = os.getenv("CATALOG_CACHE_DIR", "./.inkvibe_cache/catalog")
 
 logger = logging.getLogger("inkvibeauto")
 
@@ -167,6 +169,65 @@ class TemplateSkipGuardrail(RuntimeError):
         self.status = status
         self.reason = reason
         self.margin_report = margin_report or {}
+
+
+@dataclass
+class CatalogCacheStats:
+    hits: int = 0
+    misses: int = 0
+    writes: int = 0
+    requests_avoided: int = 0
+
+
+class CatalogCache:
+    def __init__(self, *, cache_dir: pathlib.Path, ttl_hours: int = CACHE_TTL_HOURS_DEFAULT, enabled: bool = True):
+        self.cache_dir = cache_dir
+        self.ttl_seconds = max(0, int(ttl_hours) * 3600)
+        self.enabled = bool(enabled)
+        self.stats = CatalogCacheStats()
+        if self.enabled:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _entry_path(self, cache_key: str) -> pathlib.Path:
+        digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
+        return self.cache_dir / f"{digest}.json"
+
+    def get(self, cache_key: str) -> Optional[Any]:
+        if not self.enabled:
+            return None
+        path = self._entry_path(cache_key)
+        if not path.exists():
+            self.stats.misses += 1
+            logger.info("Catalog cache miss key=%s", cache_key)
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            expires_at = float(payload.get("expires_at", 0))
+            if self.ttl_seconds > 0 and time.time() > expires_at:
+                self.stats.misses += 1
+                logger.info("Catalog cache stale key=%s", cache_key)
+                return None
+            self.stats.hits += 1
+            self.stats.requests_avoided += 1
+            logger.info("Catalog cache hit key=%s", cache_key)
+            return payload.get("value")
+        except Exception:
+            self.stats.misses += 1
+            logger.info("Catalog cache unreadable key=%s", cache_key)
+            return None
+
+    def set(self, cache_key: str, value: Any) -> None:
+        if not self.enabled:
+            return
+        payload = {
+            "cached_at": datetime.now(timezone.utc).isoformat(),
+            "expires_at": time.time() + self.ttl_seconds if self.ttl_seconds > 0 else time.time() + (365 * 24 * 3600),
+            "value": value,
+        }
+        path = self._entry_path(cache_key)
+        save_json_atomic(path, payload)
+        self.stats.writes += 1
+        logger.info("Catalog cache write key=%s", cache_key)
 
 
 @dataclass
@@ -486,6 +547,14 @@ class RunSummary:
     combinations_success: int = 0
     combinations_failed: int = 0
     combinations_skipped: int = 0
+    catalog_cache_hits: int = 0
+    catalog_cache_misses: int = 0
+    catalog_requests_avoided: int = 0
+    chunks_completed: int = 0
+    total_chunks: int = 0
+    templates_skipped_catalog_rate_limited: int = 0
+    resumed_combinations: int = 0
+    rate_limit_events: Dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -1929,6 +1998,13 @@ def _discover_family_catalog_mapping(
         "blanket": ["blanket", "throw blanket", "fleece blanket"],
     }
     queries = family_queries.get(intended_family, [])
+    discovery_cache_key = f"family_discovery:{template.key}:{intended_family}:{template.printify_blueprint_id}:{template.printify_print_provider_id}"
+    if getattr(printify, "catalog_cache", None):
+        cached_discovery = printify.catalog_cache.get(discovery_cache_key)
+        if isinstance(cached_discovery, list) and len(cached_discovery) == 2:
+            return int(cached_discovery[0]), int(cached_discovery[1])
+        if isinstance(cached_discovery, tuple) and len(cached_discovery) == 2:
+            return int(cached_discovery[0]), int(cached_discovery[1])
     blueprints = printify.list_blueprints()
     seen_blueprint_ids: set[int] = set()
     candidates: List[Dict[str, Any]] = []
@@ -2003,6 +2079,8 @@ def _discover_family_catalog_mapping(
             if score > best_score:
                 best_score = score
                 best_pair = (blueprint_id, provider_id)
+    if getattr(printify, "catalog_cache", None) and best_pair is not None:
+        printify.catalog_cache.set(discovery_cache_key, [int(best_pair[0]), int(best_pair[1])])
     return best_pair
 
 
@@ -2013,6 +2091,14 @@ def _mapping_is_plausible_for_template(
     blueprint_id: int,
     provider_id: int,
 ) -> Tuple[bool, str]:
+    plausibility_cache_key = (
+        f"mapping_plausibility:{template.key}:{blueprint_id}:{provider_id}:"
+        f"{template.pinned_blueprint_id}:{template.pinned_provider_id}"
+    )
+    if getattr(printify, "catalog_cache", None):
+        cached = printify.catalog_cache.get(plausibility_cache_key)
+        if isinstance(cached, dict):
+            return bool(cached.get("plausible", False)), str(cached.get("reason", "cached"))
     if blueprint_id <= 0 or provider_id <= 0:
         return False, "template_mapping_ids_missing"
     intended_family = _template_intended_family(template)
@@ -2026,8 +2112,12 @@ def _mapping_is_plausible_for_template(
         return False, "template_mapping_zero_variants"
     validation = validate_catalog_family_schema(template=template, variants=variants)
     if validation.plausible:
-        return True, "template_mapping_family_plausible"
-    return False, f"template_mapping_family_mismatch:{validation.reason or 'unknown'}"
+        result = (True, "template_mapping_family_plausible")
+    else:
+        result = (False, f"template_mapping_family_mismatch:{validation.reason or 'unknown'}")
+    if getattr(printify, "catalog_cache", None):
+        printify.catalog_cache.set(plausibility_cache_key, {"plausible": result[0], "reason": result[1]})
+    return result
 
 
 def select_provider_for_template(
@@ -2342,7 +2432,14 @@ def format_run_summary(summary: RunSummary) -> str:
         f"template_failures={summary.failures} "
         f"publish_attempts={summary.publish_attempts} "
         f"publish_verified={summary.publish_verified} "
-        f"verification_warnings={summary.verification_warnings}"
+        f"verification_warnings={summary.verification_warnings} "
+        f"catalog_cache_hits={summary.catalog_cache_hits} "
+        f"catalog_cache_misses={summary.catalog_cache_misses} "
+        f"catalog_requests_avoided={summary.catalog_requests_avoided} "
+        f"chunks_completed={summary.chunks_completed}/{summary.total_chunks or 1} "
+        f"templates_skipped_catalog_rate_limited={summary.templates_skipped_catalog_rate_limited} "
+        f"resumed_combinations={summary.resumed_combinations} "
+        f"rate_limit_events={summary.rate_limit_events}"
     )
 
 
@@ -3221,12 +3318,17 @@ class BaseApiClient:
         interactive_retry_policy: bool = True,
         interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS,
         max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS,
+        catalog_request_spacing_ms: int = 0,
     ):
         self.base_url = base_url.rstrip("/")
         self.dry_run = dry_run
         self.interactive_retry_policy = bool(interactive_retry_policy)
         self.interactive_retry_cap_seconds = max(0.0, float(interactive_retry_cap_seconds))
         self.max_retry_sleep_seconds = max(0.0, float(max_retry_sleep_seconds))
+        self.catalog_request_spacing_ms = max(0, int(catalog_request_spacing_ms))
+        self.last_catalog_request_at = 0.0
+        self.consecutive_catalog_rate_limits = 0
+        self.rate_limit_events: Counter[str] = Counter()
         self.session = requests.Session()
         self.session.headers.update(headers)
 
@@ -3252,8 +3354,18 @@ class BaseApiClient:
 
         for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
             try:
+                if method.upper() == "GET" and _is_catalog_discovery_path(path) and self.catalog_request_spacing_ms > 0:
+                    elapsed = (time.time() - self.last_catalog_request_at) * 1000.0
+                    if elapsed < self.catalog_request_spacing_ms:
+                        wait_ms = self.catalog_request_spacing_ms - elapsed
+                        jitter_ms = random.uniform(0, max(1.0, self.catalog_request_spacing_ms * 0.15))
+                        time.sleep((wait_ms + jitter_ms) / 1000.0)
                 response = self.session.request(method=method.upper(), url=url, params=params, json=payload, timeout=120)
+                if method.upper() == "GET" and _is_catalog_discovery_path(path):
+                    self.last_catalog_request_at = time.time()
                 if response.status_code in expected_statuses:
+                    if _is_catalog_discovery_path(path):
+                        self.consecutive_catalog_rate_limits = 0
                     return response.json() if response.content else {}
 
                 if response.status_code in {429, 500, 502, 503, 504}:
@@ -3280,6 +3392,21 @@ class BaseApiClient:
                         requested_sleep_seconds,
                         sleep_seconds,
                     )
+                    if response.status_code == 429:
+                        endpoint_label = "catalog_other"
+                        if "variants.json" in path:
+                            endpoint_label = "catalog_variants"
+                        elif "print_providers" in path:
+                            endpoint_label = "catalog_providers"
+                        elif "blueprints.json" in path:
+                            endpoint_label = "catalog_blueprints"
+                        self.rate_limit_events[endpoint_label] += 1
+                        if _is_catalog_discovery_path(path):
+                            self.consecutive_catalog_rate_limits += 1
+                            sleep_seconds = min(
+                                max_retry_sleep_seconds,
+                                sleep_seconds + min(8.0, self.consecutive_catalog_rate_limits * 1.25),
+                            )
                     if attempt >= RETRY_MAX_ATTEMPTS:
                         raise RetryLimitExceededError(
                             method=method,
@@ -3360,6 +3487,8 @@ class PrintifyClient(BaseApiClient):
         interactive_retry_policy: bool = True,
         interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS,
         max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS,
+        catalog_request_spacing_ms: int = 0,
+        catalog_cache: Optional[CatalogCache] = None,
     ):
         super().__init__(
             base_url=PRINTIFY_API_BASE,
@@ -3373,23 +3502,53 @@ class PrintifyClient(BaseApiClient):
             interactive_retry_policy=interactive_retry_policy,
             interactive_retry_cap_seconds=interactive_retry_cap_seconds,
             max_retry_sleep_seconds=max_retry_sleep_seconds,
+            catalog_request_spacing_ms=catalog_request_spacing_ms,
         )
+        self.catalog_cache = catalog_cache
+
+    def _catalog_cache_get(self, endpoint: str, *, blueprint_id: int = 0, provider_id: int = 0, extra: str = "") -> Optional[Any]:
+        if not self.catalog_cache:
+            return None
+        key = f"{endpoint}:blueprint={blueprint_id}:provider={provider_id}:extra={extra}"
+        return self.catalog_cache.get(key)
+
+    def _catalog_cache_set(self, endpoint: str, value: Any, *, blueprint_id: int = 0, provider_id: int = 0, extra: str = "") -> None:
+        if not self.catalog_cache:
+            return
+        key = f"{endpoint}:blueprint={blueprint_id}:provider={provider_id}:extra={extra}"
+        self.catalog_cache.set(key, value)
 
     def list_shops(self) -> List[Dict[str, Any]]:
         return self.get("/shops.json")
 
     def list_blueprints(self) -> List[Dict[str, Any]]:
-        return self.get("/catalog/blueprints.json")
+        cached = self._catalog_cache_get("blueprints")
+        if cached is not None:
+            return cached
+        payload = self.get("/catalog/blueprints.json")
+        self._catalog_cache_set("blueprints", payload)
+        return payload
 
     def list_print_providers(self, blueprint_id: int) -> List[Dict[str, Any]]:
-        return self.get(f"/catalog/blueprints/{blueprint_id}/print_providers.json")
+        cached = self._catalog_cache_get("providers", blueprint_id=blueprint_id)
+        if cached is not None:
+            return cached
+        payload = self.get(f"/catalog/blueprints/{blueprint_id}/print_providers.json")
+        self._catalog_cache_set("providers", payload, blueprint_id=blueprint_id)
+        return payload
 
     def list_variants(self, blueprint_id: int, print_provider_id: int, show_out_of_stock: bool = True) -> List[Dict[str, Any]]:
+        cache_extra = f"show_oos={1 if show_out_of_stock else 0}"
+        cached = self._catalog_cache_get("variants", blueprint_id=blueprint_id, provider_id=print_provider_id, extra=cache_extra)
+        if cached is not None:
+            return normalize_catalog_variants_response(cached)
         response = self.get(
             f"/catalog/blueprints/{blueprint_id}/print_providers/{print_provider_id}/variants.json",
             **{"show-out-of-stock": 1 if show_out_of_stock else 0},
         )
-        return normalize_catalog_variants_response(response)
+        normalized = normalize_catalog_variants_response(response)
+        self._catalog_cache_set("variants", normalized, blueprint_id=blueprint_id, provider_id=print_provider_id, extra=cache_extra)
+        return normalized
 
     def upload_image(self, *, file_path: Optional[pathlib.Path] = None, image_url: Optional[str] = None) -> Dict[str, Any]:
         if file_path is None and image_url is None:
@@ -7855,6 +8014,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stop-after-failures", type=int, default=0, help="Stop run after N combination failures (0 = no limit)")
     parser.add_argument("--fail-fast", action="store_true", help="Stop immediately after the first combination failure")
     parser.add_argument("--resume", action="store_true", help="Skip combinations already successful in state and continue pending work")
+    parser.add_argument("--resume-only-pending", action="store_true", help="Alias for --resume with explicit pending-only behavior")
+    parser.add_argument("--chunk-size", type=int, default=0, help="Process artworks in chunks (0 = no chunking)")
+    parser.add_argument("--pause-between-chunks-seconds", type=float, default=0.0, help="Pause between chunks to reduce API pressure")
     parser.add_argument("--template-key", action="append", default=[], help="Only process matching template key(s); can be repeated")
     parser.add_argument("--limit-templates", type=int, default=0, help="Limit number of templates after filtering (0 = no limit)")
     parser.add_argument("--list-templates", action="store_true", help="List templates from config and exit")
@@ -7892,6 +8054,13 @@ def parse_args() -> argparse.Namespace:
         default=INTERACTIVE_RETRY_CAP_SECONDS,
         help="Extra retry sleep cap for interactive mutation endpoints (publish/create/update).",
     )
+    parser.add_argument("--catalog-cache-dir", default=CATALOG_CACHE_DIR_DEFAULT, help="Persistent catalog cache directory")
+    parser.add_argument("--catalog-cache-ttl-hours", type=int, default=CACHE_TTL_HOURS_DEFAULT, help="Catalog cache TTL in hours")
+    parser.add_argument("--no-catalog-cache", action="store_true", help="Disable persistent catalog cache")
+    parser.add_argument("--catalog-request-spacing-ms", type=int, default=0, help="Minimum spacing between catalog GET requests")
+    parser.add_argument("--template-spacing-ms", type=int, default=0, help="Sleep after each template processing step")
+    parser.add_argument("--artwork-spacing-ms", type=int, default=0, help="Sleep after each artwork processing step")
+    parser.add_argument("--high-volume-mode", action="store_true", help="Enable conservative defaults for high-volume runs")
     parser.add_argument("--inspect-state-key", default="", help="Read-only inspect state entry by key (artwork_slug:template_key)")
     parser.add_argument("--list-state-keys", action="store_true", help="List known state keys from state.json and exit")
     parser.add_argument("--list-failures", action="store_true", help="List failed combinations from state and exit")
@@ -8206,9 +8375,45 @@ def run_catalog_cli(
     return False
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", export_preflight_report_path: str = "", allow_preflight_failures: bool = False, preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "", max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS, interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS) -> None:
+def apply_high_volume_mode_defaults(
+    *,
+    chunk_size: int,
+    pause_between_chunks_seconds: float,
+    catalog_request_spacing_ms: int,
+    template_spacing_ms: int,
+    artwork_spacing_ms: int,
+    no_catalog_cache: bool,
+) -> Dict[str, Any]:
+    return {
+        "no_catalog_cache": False if no_catalog_cache else no_catalog_cache,
+        "chunk_size": chunk_size if chunk_size > 0 else 10,
+        "pause_between_chunks_seconds": pause_between_chunks_seconds if pause_between_chunks_seconds > 0 else 2.0,
+        "catalog_request_spacing_ms": catalog_request_spacing_ms if catalog_request_spacing_ms > 0 else 150,
+        "template_spacing_ms": template_spacing_ms if template_spacing_ms > 0 else 100,
+        "artwork_spacing_ms": artwork_spacing_ms if artwork_spacing_ms > 0 else 150,
+    }
+
+
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", export_preflight_report_path: str = "", allow_preflight_failures: bool = False, preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "", max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS, interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS, catalog_cache_dir: str = CATALOG_CACHE_DIR_DEFAULT, catalog_cache_ttl_hours: int = CACHE_TTL_HOURS_DEFAULT, no_catalog_cache: bool = False, chunk_size: int = 0, pause_between_chunks_seconds: float = 0.0, catalog_request_spacing_ms: int = 0, template_spacing_ms: int = 0, artwork_spacing_ms: int = 0, resume_only_pending: bool = False, high_volume_mode: bool = False) -> None:
     max_retry_sleep_seconds = max(0.0, float(max_retry_sleep_seconds))
     interactive_retry_cap_seconds = max(0.0, float(interactive_retry_cap_seconds))
+    if resume_only_pending:
+        resume = True
+    if high_volume_mode:
+        hv_defaults = apply_high_volume_mode_defaults(
+            chunk_size=chunk_size,
+            pause_between_chunks_seconds=pause_between_chunks_seconds,
+            catalog_request_spacing_ms=catalog_request_spacing_ms,
+            template_spacing_ms=template_spacing_ms,
+            artwork_spacing_ms=artwork_spacing_ms,
+            no_catalog_cache=no_catalog_cache,
+        )
+        no_catalog_cache = bool(hv_defaults["no_catalog_cache"])
+        chunk_size = int(hv_defaults["chunk_size"])
+        pause_between_chunks_seconds = float(hv_defaults["pause_between_chunks_seconds"])
+        catalog_request_spacing_ms = int(hv_defaults["catalog_request_spacing_ms"])
+        template_spacing_ms = int(hv_defaults["template_spacing_ms"])
+        artwork_spacing_ms = int(hv_defaults["artwork_spacing_ms"])
     if publish_mode not in {"default", "publish", "skip"}:
         raise RuntimeError(f"Unsupported publish mode: {publish_mode}")
 
@@ -8395,6 +8600,11 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         raise RuntimeError("Missing PRINTIFY_API_TOKEN")
 
     interactive_retry_policy = not any([resume, launch_plan_path, batch_size > 0, stop_after_failures > 0])
+    catalog_cache = CatalogCache(
+        cache_dir=pathlib.Path(catalog_cache_dir),
+        ttl_hours=max(1, int(catalog_cache_ttl_hours)),
+        enabled=not no_catalog_cache,
+    )
     try:
         printify = PrintifyClient(
             PRINTIFY_API_TOKEN,
@@ -8402,6 +8612,8 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             interactive_retry_policy=interactive_retry_policy,
             interactive_retry_cap_seconds=interactive_retry_cap_seconds,
             max_retry_sleep_seconds=max_retry_sleep_seconds,
+            catalog_request_spacing_ms=catalog_request_spacing_ms,
+            catalog_cache=catalog_cache,
         )
     except TypeError:
         # Backward-compatible path for tests/mocks that monkeypatch PrintifyClient with legacy signature.
@@ -8439,6 +8651,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         export_preflight_report(preflight_report_path, preflight_rows)
         logger.info("Preflight report exported path=%s rows=%s", preflight_report_path, len(preflight_rows))
     explicit_failures = [issue for issue in preflight_issues if issue.requested_explicitly]
+    summary_catalog_rate_limited = sum(1 for issue in preflight_issues if issue.classification == "catalog_rate_limited")
     if explicit_failures and not allow_preflight_failures:
         rendered = "; ".join(
             f"{issue.template_key}:{issue.classification}:{issue.message}" for issue in explicit_failures
@@ -8483,11 +8696,17 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
 
     logger.info("Loaded %s template(s) and %s artwork file(s)", len(templates), len(artworks))
     summary = RunSummary(artworks_scanned=len(artworks))
+    summary.templates_skipped_catalog_rate_limited = int(summary_catalog_rate_limited)
     failure_rows: List[FailureReportRow] = []
     run_rows: List[RunReportRow] = []
     artwork_options = ArtworkProcessingOptions(allow_upscale=allow_upscale, upscale_method=upscale_method, skip_undersized=skip_undersized, placement_preview=placement_preview, preview_dir=export_dir / "previews")
     combinations_processed = 0
     stop_requested = False
+    effective_chunk_size = max(0, int(chunk_size))
+    artwork_chunks: List[List[Artwork]] = [artworks]
+    if effective_chunk_size > 0 and artworks:
+        artwork_chunks = [artworks[i:i + effective_chunk_size] for i in range(0, len(artworks), effective_chunk_size)]
+    summary.total_chunks = len(artwork_chunks)
 
     if launch_plan_path:
         template_by_key = {template.key: template for template in templates}
@@ -8657,54 +8876,66 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                     if stop_after_failures > 0 and summary.failures >= stop_after_failures:
                         stop_requested = True
                         break
-        for artwork in artworks:
-            if generated_template_routing:
-                break
-            templates_for_artwork: List[ProductTemplate] = []
-            for template in templates:
-                if batch_size > 0 and combinations_processed >= batch_size:
-                    stop_requested = True
+        for chunk_index, artwork_chunk in enumerate(artwork_chunks, start=1):
+            for artwork in artwork_chunk:
+                if generated_template_routing:
                     break
-                if resume and is_state_key_successful(state, f"{artwork.slug}:{template.key}"):
-                    continue
-                templates_for_artwork.append(template)
-                combinations_processed += 1
-            for template in templates_for_artwork:
-                before_failures = summary.failures
-                process_artwork(
-                    printify=printify,
-                    shopify=shopify,
-                    shop_id=shop_id,
-                    artwork=artwork,
-                    templates=[template],
-                    state=state,
-                    force=force,
-                    export_dir=export_dir,
-                    state_path=state_path,
-                    artwork_options=artwork_options,
-                    upload_strategy=upload_strategy,
-                    r2_config=r2_config,
-                    create_only=create_only,
-                    update_only=update_only,
-                    rebuild_product=rebuild_product,
-                    publish_mode=publish_mode,
-                    verify_publish=verify_publish,
-                    auto_rebuild_on_incompatible_update=auto_rebuild_on_incompatible_update,
-                    sync_collections=collection_sync_enabled,
-                    verify_collections=verify_collections,
-                    enforce_family_collection_membership=enforce_family_collection_membership,
-                    collection_removal_mode=collection_removal_mode,
-                    summary=summary,
-                    failure_rows=failure_rows,
-                    run_rows=run_rows,
-                )
-                if summary.failures > before_failures:
-                    if fail_fast:
+                templates_for_artwork: List[ProductTemplate] = []
+                for template in templates:
+                    if batch_size > 0 and combinations_processed >= batch_size:
                         stop_requested = True
                         break
-                    if stop_after_failures > 0 and summary.failures >= stop_after_failures:
-                        stop_requested = True
-                        break
+                    if resume and is_state_key_successful(state, f"{artwork.slug}:{template.key}"):
+                        summary.resumed_combinations += 1
+                        continue
+                    templates_for_artwork.append(template)
+                    combinations_processed += 1
+                for template in templates_for_artwork:
+                    before_failures = summary.failures
+                    process_artwork(
+                        printify=printify,
+                        shopify=shopify,
+                        shop_id=shop_id,
+                        artwork=artwork,
+                        templates=[template],
+                        state=state,
+                        force=force,
+                        export_dir=export_dir,
+                        state_path=state_path,
+                        artwork_options=artwork_options,
+                        upload_strategy=upload_strategy,
+                        r2_config=r2_config,
+                        create_only=create_only,
+                        update_only=update_only,
+                        rebuild_product=rebuild_product,
+                        publish_mode=publish_mode,
+                        verify_publish=verify_publish,
+                        auto_rebuild_on_incompatible_update=auto_rebuild_on_incompatible_update,
+                        sync_collections=collection_sync_enabled,
+                        verify_collections=verify_collections,
+                        enforce_family_collection_membership=enforce_family_collection_membership,
+                        collection_removal_mode=collection_removal_mode,
+                        summary=summary,
+                        failure_rows=failure_rows,
+                        run_rows=run_rows,
+                    )
+                    if template_spacing_ms > 0:
+                        time.sleep(template_spacing_ms / 1000.0)
+                    if summary.failures > before_failures:
+                        if fail_fast:
+                            stop_requested = True
+                            break
+                        if stop_after_failures > 0 and summary.failures >= stop_after_failures:
+                            stop_requested = True
+                            break
+                if artwork_spacing_ms > 0:
+                    time.sleep(artwork_spacing_ms / 1000.0)
+                if stop_requested:
+                    break
+            summary.chunks_completed = chunk_index
+            save_json_atomic(state_path, state)
+            if pause_between_chunks_seconds > 0 and chunk_index < len(artwork_chunks):
+                time.sleep(max(0.0, float(pause_between_chunks_seconds)))
             if stop_requested:
                 break
 
@@ -8712,6 +8943,11 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
     summary.combinations_success = sum(1 for row in run_rows if row.status == "success")
     summary.combinations_failed = sum(1 for row in run_rows if row.status == "failure")
     summary.combinations_skipped = sum(1 for row in run_rows if row.status == "skipped")
+    if getattr(printify, "catalog_cache", None):
+        summary.catalog_cache_hits = printify.catalog_cache.stats.hits
+        summary.catalog_cache_misses = printify.catalog_cache.stats.misses
+        summary.catalog_requests_avoided = printify.catalog_cache.stats.requests_avoided
+    summary.rate_limit_events = dict(getattr(printify, "rate_limit_events", {}))
 
     if export_failure_report:
         write_csv_report(pathlib.Path(export_failure_report), [row.__dict__ for row in failure_rows])
@@ -8857,6 +9093,16 @@ if __name__ == "__main__":
             strict_storefront_qa=args.strict_storefront_qa,
             export_storefront_qa_report=args.export_storefront_qa_report,
             export_storefront_qa_json=args.export_storefront_qa_json,
+            catalog_cache_dir=args.catalog_cache_dir,
+            catalog_cache_ttl_hours=args.catalog_cache_ttl_hours,
+            no_catalog_cache=args.no_catalog_cache,
+            chunk_size=args.chunk_size,
+            pause_between_chunks_seconds=args.pause_between_chunks_seconds,
+            catalog_request_spacing_ms=args.catalog_request_spacing_ms,
+            template_spacing_ms=args.template_spacing_ms,
+            artwork_spacing_ms=args.artwork_spacing_ms,
+            resume_only_pending=args.resume_only_pending,
+            high_volume_mode=args.high_volume_mode,
         )
     except CatalogCliUsageError as exc:
         print(f"Catalog CLI error: {exc}")
