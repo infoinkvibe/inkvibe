@@ -128,6 +128,7 @@ from printify_shopify_sync_pipeline import (
     PRODUCTION_BASELINE_TEMPLATE_KEYS,
     CatalogCache,
     PrintifyClient,
+    should_enable_progress,
     apply_high_volume_mode_defaults,
     configure_ai_product_copy,
 )
@@ -1432,6 +1433,86 @@ def test_apparel_guardrails_preserve_original_cost_when_price_is_repriced():
     diag = report["variant_diagnostics"][0]
     assert diag["printify_cost_minor"] == 1200
     assert diag["after_shipping_margin_after_reprice_minor"] == 500
+
+
+def test_guardrails_use_min_profit_after_shipping_alias_and_us_cheapest_shipping_rows():
+    tee = ProductTemplate(
+        key="tshirt_gildan",
+        printify_blueprint_id=6,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        base_price="19.99",
+        markup_type="fixed",
+        markup_value="0.00",
+        min_profit_after_shipping="4.00",
+        target_margin_after_shipping="5.00",
+        reprice_variants_to_margin_floor=True,
+        disable_variants_below_margin_floor=True,
+    )
+    adjusted, report = apply_variant_margin_guardrails(
+        tee,
+        [{
+            "id": 301,
+            "price": 2000,
+            "cost": 1800,
+            "is_available": True,
+            "shipping": [
+                {"country": "CA", "first_item": 1200},
+                {"country": "US", "first_item": 600},
+                {"country": "US", "first_item": 500},
+            ],
+        }],
+    )
+    assert adjusted and adjusted[0]["price"] == 2800
+    assert report["repriced_count"] == 1
+    diag = report["variant_diagnostics"][0]
+    assert diag["shipping_minor"] == 500
+    assert diag["min_margin_after_shipping_minor"] == 400
+    assert diag["target_margin_after_shipping_minor"] == 500
+
+
+def test_color_expansion_uses_curated_allowlist_and_reports_unavailable():
+    template = ProductTemplate(
+        key="tshirt_gildan",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_colors=["Black", "White"],
+        expanded_enabled_colors=["Dark Heather", "Military Green"],
+        enabled_sizes=["M"],
+        max_enabled_variants=10,
+    )
+    variants = [
+        {"id": 1, "is_available": True, "options": {"color": "Black", "size": "M"}},
+        {"id": 2, "is_available": True, "options": {"color": "Dark Heather", "size": "M"}},
+    ]
+    chosen, diagnostics = choose_variants_from_catalog_with_diagnostics(variants, template)
+    assert [row["id"] for row in chosen] == [1, 2]
+    assert diagnostics.selected_additional_colors == ["Dark Heather"]
+    assert diagnostics.unavailable_additional_colors == ["Military Green"]
+
+
+def test_sticker_template_remains_without_expanded_colors():
+    templates = load_templates(Path("product_templates.json"))
+    sticker = next(template for template in templates if template.key == "sticker_kisscut")
+    assert sticker.expanded_enabled_colors == []
+
+
+def test_should_enable_progress_respects_tty_and_overrides(monkeypatch: pytest.MonkeyPatch):
+    class _Stream:
+        def __init__(self, is_tty: bool):
+            self._is_tty = is_tty
+
+        def isatty(self):
+            return self._is_tty
+
+    monkeypatch.delenv("CI", raising=False)
+    assert should_enable_progress(force_enable=None, stream=_Stream(True)) == (True, "interactive_tty")
+    assert should_enable_progress(force_enable=None, stream=_Stream(False)) == (False, "non_tty")
+    assert should_enable_progress(force_enable=True, stream=_Stream(False)) == (True, "forced_on")
+    assert should_enable_progress(force_enable=False, stream=_Stream(True)) == (False, "forced_off")
 
 def test_uuid_noisy_filename_detection():
     assert filename_title_quality_reason("8f6f45d4-c95f-4f68-9cf9-f022f5197a18") == "uuid_like"

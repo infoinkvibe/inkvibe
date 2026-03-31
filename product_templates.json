@@ -20,7 +20,7 @@
       "2XL",
       "3XL"
     ],
-    "max_enabled_variants": 30,
+    "max_enabled_variants": 42,
     "tags": [
       "t-shirt",
       "tee",
@@ -95,7 +95,12 @@
     "active": true,
     "default_price": "24.99",
     "compare_at_price": "29.99",
-    "max_allowed_price": "34.99"
+    "max_allowed_price": "34.99",
+    "expanded_enabled_colors": [
+      "Dark Heather",
+      "Military Green"
+    ],
+    "min_profit_after_shipping": "3.00"
   },
   {
     "key": "sweatshirt_gildan",
@@ -118,7 +123,7 @@
       "2XL",
       "3XL"
     ],
-    "max_enabled_variants": 30,
+    "max_enabled_variants": 42,
     "tags": [
       "sweatshirt",
       "graphic",
@@ -179,7 +184,12 @@
     "fallback_provider_allowed": true,
     "active": true,
     "default_price": "36.99",
-    "compare_at_price": "42.99"
+    "compare_at_price": "42.99",
+    "expanded_enabled_colors": [
+      "Dark Heather",
+      "Maroon"
+    ],
+    "min_profit_after_shipping": "3.00"
   },
   {
     "key": "hoodie_gildan",
@@ -202,7 +212,7 @@
       "2XL",
       "3XL"
     ],
-    "max_enabled_variants": 36,
+    "max_enabled_variants": 42,
     "tags": [
       "hoodie",
       "graphic",
@@ -277,7 +287,12 @@
     "provider_selection_strategy": "prefer_printify_choice_then_ranked",
     "fallback_provider_allowed": true,
     "active": true,
-    "max_allowed_price": "54.99"
+    "max_allowed_price": "54.99",
+    "expanded_enabled_colors": [
+      "Dark Heather",
+      "Maroon"
+    ],
+    "min_profit_after_shipping": "3.00"
   },
   {
     "key": "mug_new",
@@ -340,7 +355,11 @@
     "fallback_provider_allowed": true,
     "active": true,
     "default_price": "17.99",
-    "compare_at_price": "21.99"
+    "compare_at_price": "21.99",
+    "min_profit_after_shipping": "4.00",
+    "target_margin_after_shipping": "6.00",
+    "disable_variants_below_margin_floor": true,
+    "reprice_variants_to_margin_floor": true
   },
   {
     "key": "poster_basic",
@@ -350,9 +369,9 @@
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],
     "enabled_sizes": [
-      "11″ x 14″ (Vertical)",
-      "12″ x 16″ (Vertical)",
-      "16″ x 20″ (Vertical)"
+      "11\u2033 x 14\u2033 (Vertical)",
+      "12\u2033 x 16\u2033 (Vertical)",
+      "16\u2033 x 20\u2033 (Vertical)"
     ],
     "placements": [
       {
@@ -665,8 +684,8 @@
     "mark_template_nonviable_if_needed": true,
     "enabled_variant_option_filters": {
       "size": [
-        "3\" × 3\"",
-        "4\" × 4\""
+        "3\" \u00d7 3\"",
+        "4\" \u00d7 4\""
       ]
     }
   },
@@ -686,8 +705,8 @@
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],
     "enabled_sizes": [
-      "50\" × 60\"",
-      "60\" × 80\""
+      "50\" \u00d7 60\"",
+      "60\" \u00d7 80\""
     ],
     "max_enabled_variants": 6,
     "tags": [
