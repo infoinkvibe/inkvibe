@@ -15,6 +15,7 @@ sys.modules.setdefault("dotenv", types.SimpleNamespace(load_dotenv=lambda: None)
 import pytest
 from PIL import Image
 
+import product_copy_generator
 from r2_uploader import build_r2_public_url
 
 from printify_shopify_sync_pipeline import (
@@ -126,6 +127,7 @@ from printify_shopify_sync_pipeline import (
     CatalogCache,
     PrintifyClient,
     apply_high_volume_mode_defaults,
+    configure_ai_product_copy,
 )
 from artwork_metadata_generator import (
     CompositeArtworkMetadataGenerator,
@@ -1740,6 +1742,65 @@ def test_choose_best_theme_signal_prefers_specific_searchable_phrase():
         existing_tags=["fox", "poster"],
     )
     assert selected == "wildlife portrait"
+
+
+def test_ai_product_copy_disabled_falls_back_to_deterministic(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    art.metadata = {"title": "Cozy Wolf", "description": "Warm mountain wolf art.", "tags": ["wolf", "mountain"]}
+    template = _template_for_variant_tests()
+    template.key = "mug_new"
+    template.product_type_label = "Mug"
+    template.shopify_product_type = "Mugs"
+    configure_ai_product_copy(enabled=False, model="gpt-4.1-mini", api_key="test")
+    title = render_product_title(template, art)
+    description = render_product_description(template, art)
+    tags = _render_listing_tags(template, art)
+    assert "Cozy Wolf" in title
+    assert "<p>" in description
+    assert isinstance(tags, list) and tags
+
+
+def test_ai_product_copy_applies_for_hoodie_and_mug(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    template = _template_for_variant_tests()
+    template.key = "hoodie_gildan"
+    template.product_type_label = "Hoodie"
+    template.shopify_product_type = "Hoodies"
+    generated = product_copy_generator.GeneratedProductCopy(
+        title="Trail Glow Hoodie",
+        title_alternatives=["Golden Trail Hoodie"],
+        short_description="A cozy expressive layer for everyday wear.",
+        long_description="A soft, expressive hoodie look designed for layering and gifting moments.",
+        seo_title="Trail Glow Hoodie | InkVibe",
+        meta_description="Cozy wearable-art hoodie with everyday personality.",
+        tags=["hoodie", "wearable art", "gift idea"],
+        chosen_angle="cozy_giftable",
+    )
+    monkeypatch.setattr(product_copy_generator, "maybe_generate_product_copy", lambda **kwargs: generated)
+    configure_ai_product_copy(enabled=True, model="gpt-4.1-mini", api_key="test")
+    assert render_product_title(template, art) == "Trail Glow Hoodie"
+    assert "expressive hoodie" in render_product_description(template, art).lower()
+    assert "wearable art" in _render_listing_tags(template, art)
+
+
+def test_ai_product_copy_not_used_for_other_families(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    art.metadata = {"title": "Fox Poster", "description": "A fox poster.", "tags": ["fox", "wall art"]}
+    template = _template_for_variant_tests()
+    template.key = "poster_basic"
+    template.product_type_label = "Poster"
+    template.shopify_product_type = "Posters"
+    calls = {"count": 0}
+
+    def _stub(**kwargs):
+        calls["count"] += 1
+        return None
+
+    monkeypatch.setattr(product_copy_generator, "maybe_generate_product_copy", _stub)
+    configure_ai_product_copy(enabled=True, model="gpt-4.1-mini", api_key="test")
+    title = render_product_title(template, art)
+    assert "Fox Poster" in title
+    assert calls["count"] >= 1
 
 
 def test_normalize_theme_tag_rejects_generic_filler():
