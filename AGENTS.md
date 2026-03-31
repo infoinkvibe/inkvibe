@@ -1,5 +1,5 @@
 # AGENTS.md
-
+On the first run after introducing new rerun-state metadata, seeding that metadata is acceptable; after that, unchanged reruns should prefer skip/update over rebuild.
 
 ## Current rerun/update priority
 
