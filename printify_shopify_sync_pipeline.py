@@ -1368,6 +1368,29 @@ def _metadata_alias_candidates(entry: Dict[str, Any]) -> set[str]:
     return candidates
 
 
+def _resolve_unique_alias_match(
+    metadata_map: Dict[str, Dict[str, Any]],
+    *,
+    normalized_aliases: set[str],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], List[str]]:
+    matched_keys: List[str] = []
+    matched_entry: Optional[Dict[str, Any]] = None
+    for key, entry in metadata_map.items():
+        if not isinstance(entry, dict):
+            continue
+        entry_aliases = _metadata_alias_candidates(entry)
+        if not entry_aliases.intersection(normalized_aliases):
+            continue
+        matched_keys.append(key)
+        if matched_entry is None:
+            matched_entry = dict(entry)
+    if len(matched_keys) == 1 and matched_entry is not None:
+        return matched_entry, matched_keys[0], []
+    if len(matched_keys) > 1:
+        return None, None, sorted(matched_keys)
+    return None, None, []
+
+
 def resolve_artwork_metadata_with_source(
     path: pathlib.Path,
     metadata_map: Dict[str, Dict[str, Any]],
@@ -1413,12 +1436,21 @@ def resolve_artwork_metadata_with_source(
         alias_values.extend([slugify(alias) for alias in persisted_aliases if slugify(alias)])
     normalized_aliases = {slugify(value) for value in alias_values if slugify(value)}
     if normalized_aliases:
-        for key, entry in metadata_map.items():
-            if not isinstance(entry, dict):
-                continue
-            entry_aliases = _metadata_alias_candidates(entry)
-            if entry_aliases.intersection(normalized_aliases):
-                return dict(entry), {"source": "alias", "key": key}
+        matched_entry, matched_key, ambiguous_keys = _resolve_unique_alias_match(
+            metadata_map,
+            normalized_aliases=normalized_aliases,
+        )
+        if matched_entry is not None and matched_key is not None:
+            return matched_entry, {"source": "alias", "key": matched_key}
+        if ambiguous_keys:
+            logger.warning(
+                "Content metadata ambiguous alias artwork=%s aliases=%s candidates=%s",
+                path.name,
+                ",".join(sorted(normalized_aliases)),
+                ",".join(ambiguous_keys[:5]),
+            )
+            fallback_key = normalized_stem or canonical_slug or slugify(path.name) or "unknown"
+            return {}, {"source": "ambiguous_alias", "key": fallback_key}
 
     fallback_key = normalized_stem or canonical_slug or slugify(path.name) or "unknown"
     return {}, {"source": "fallback", "key": fallback_key}
