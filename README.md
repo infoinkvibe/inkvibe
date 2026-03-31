@@ -661,6 +661,9 @@ OpenAI mode notes:
 - Optional `OPENAI_MODEL` env var sets the default model (unless overridden by `--metadata-openai-model`).
 - `auto` mode now prefers `openai`, then local `vision`, then `heuristic` fallback.
 - Missing key / API errors gracefully fall back and are surfaced in preview `sources:` output.
+- Product-copy phase 1 supports hoodie/mug families only and is opt-in via `ENABLE_AI_PRODUCT_COPY=true` or `--enable-ai-product-copy`.
+- Optional `--ai-product-copy-model <model>` overrides `OPENAI_MODEL` for listing-copy generation.
+- Generated product copy is cached in artwork sidecar JSON under `ai_product_copy` and deterministic copy remains the fallback on errors.
 
 Preview listing copy without creating/updating products:
 

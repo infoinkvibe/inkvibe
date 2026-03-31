@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 from PIL import Image, ImageOps
 from r2_uploader import R2Config, build_r2_public_url, load_r2_config_from_env, upload_file_to_r2
 import content_engine
+import product_copy_generator
 import state_store
 from artwork_metadata_generator import (
     MetadataGeneratorMode,
@@ -101,6 +102,20 @@ PRODUCTION_BASELINE_TEMPLATE_KEYS = (
     "phone_case_basic",
     "sticker_kisscut",
 )
+
+AI_PRODUCT_COPY_MODEL_DEFAULT = os.getenv("OPENAI_MODEL", product_copy_generator.DEFAULT_COPY_MODEL)
+ENABLE_AI_PRODUCT_COPY_DEFAULT = os.getenv("ENABLE_AI_PRODUCT_COPY", "").strip().lower() in {"1", "true", "yes", "on"}
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+
+@dataclass
+class AiProductCopySettings:
+    enabled: bool = ENABLE_AI_PRODUCT_COPY_DEFAULT
+    model: str = AI_PRODUCT_COPY_MODEL_DEFAULT
+    api_key: str = OPENAI_API_KEY
+
+
+AI_PRODUCT_COPY_SETTINGS = AiProductCopySettings()
 
 
 # -----------------------------
@@ -899,6 +914,21 @@ def configure_logging(level: str = "INFO") -> None:
     )
 
 
+def configure_ai_product_copy(*, enabled: Optional[bool] = None, model: str = "", api_key: str = "") -> None:
+    resolved_enabled = ENABLE_AI_PRODUCT_COPY_DEFAULT if enabled is None else bool(enabled)
+    resolved_model = (model or os.getenv("OPENAI_MODEL") or AI_PRODUCT_COPY_MODEL_DEFAULT).strip()
+    resolved_api_key = (api_key or os.getenv("OPENAI_API_KEY") or "").strip()
+    AI_PRODUCT_COPY_SETTINGS.enabled = resolved_enabled
+    AI_PRODUCT_COPY_SETTINGS.model = resolved_model
+    AI_PRODUCT_COPY_SETTINGS.api_key = resolved_api_key
+    logger.info(
+        "AI product copy settings enabled=%s model=%s key_present=%s",
+        AI_PRODUCT_COPY_SETTINGS.enabled,
+        AI_PRODUCT_COPY_SETTINGS.model,
+        bool(AI_PRODUCT_COPY_SETTINGS.api_key),
+    )
+
+
 def slugify(value: str) -> str:
     value = value.lower().strip()
     value = re.sub(r"[^a-z0-9]+", "-", value)
@@ -1261,11 +1291,14 @@ def load_artwork_metadata(sidecar_path: pathlib.Path) -> Dict[str, Any]:
         "inline_upgrade_fingerprint": "",
         "inline_upgrade_timestamp": "",
         "inline_upgrade_reasons": [],
+        "ai_product_copy": {},
     }
     for field_name in fields:
         value = payload.get(field_name)
         if field_name in {"tags", "seo_keywords", "style_keywords", "inline_upgrade_reasons"}:
             fields[field_name] = _split_keywords(value)
+        elif field_name == "ai_product_copy":
+            fields[field_name] = value if isinstance(value, dict) else {}
         elif isinstance(value, str):
             fields[field_name] = value.strip()
         elif value is None:
@@ -2492,8 +2525,28 @@ def build_seo_context(template: ProductTemplate, artwork: Artwork) -> Dict[str, 
     return context
 
 
+def _maybe_render_ai_product_copy(template: ProductTemplate, artwork: Artwork, context: Dict[str, Any]) -> Optional[product_copy_generator.GeneratedProductCopy]:
+    family = content_engine.infer_product_family(template)
+    return product_copy_generator.maybe_generate_product_copy(
+        template=template,
+        artwork=artwork,
+        context=context,
+        family=family,
+        enabled=AI_PRODUCT_COPY_SETTINGS.enabled,
+        model=AI_PRODUCT_COPY_SETTINGS.model,
+        api_key=AI_PRODUCT_COPY_SETTINGS.api_key,
+    )
+
+
 def render_product_title(template: ProductTemplate, artwork: Artwork) -> str:
     context = build_seo_context(template, artwork)
+    ai_copy = _maybe_render_ai_product_copy(template, artwork, context)
+    if ai_copy and ai_copy.title:
+        return _refine_rendered_title(
+            artwork_title=context.get("artwork_title", ""),
+            rendered_title=ai_copy.title.strip(),
+            product_label=_title_product_signal_label(template),
+        )
     product_label = _title_product_signal_label(template)
     if product_label and title_semantically_includes_product_label(context.get("artwork_title", ""), product_label):
         context = dict(context)
@@ -2509,6 +2562,20 @@ def render_product_title(template: ProductTemplate, artwork: Artwork) -> str:
 def _render_listing_tags(template: ProductTemplate, artwork: Artwork) -> List[str]:
     metadata = artwork.metadata or {}
     context = build_seo_context(template, artwork)
+    ai_copy = _maybe_render_ai_product_copy(template, artwork, context)
+    if ai_copy and ai_copy.tags:
+        merged: List[str] = []
+        seen: set[str] = set()
+        for row in [*ai_copy.tags, *content_engine.family_tags(template)]:
+            cleaned = normalize_theme_tag(row)
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            merged.append(cleaned)
+            if len(merged) >= 14:
+                break
+        if merged:
+            return merged
     family = content_engine.infer_product_family(template)
     family_label = str(context.get("family_label", "")).strip().lower()
     family_bucket = [family_label, template.product_type_label, template.shopify_product_type, *content_engine.family_tags(template)]
@@ -2598,6 +2665,9 @@ def _render_listing_tags(template: ProductTemplate, artwork: Artwork) -> List[st
 
 def render_product_description(template: ProductTemplate, artwork: Artwork) -> str:
     context = build_seo_context(template, artwork)
+    ai_copy = _maybe_render_ai_product_copy(template, artwork, context)
+    if ai_copy and ai_copy.long_description:
+        return f"<p>{sanitize_description_text(ai_copy.long_description)}</p>"
     generated = content_engine.build_branded_description(
         artwork_title=context["artwork_title"],
         short_description=str((artwork.metadata or {}).get("description", "")).strip(),
@@ -8274,6 +8344,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow inline-generated metadata to overwrite existing weak sidecars (default off)",
     )
+    parser.add_argument(
+        "--enable-ai-product-copy",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable OpenAI-assisted product copy for hoodie/mug families only (default from ENABLE_AI_PRODUCT_COPY env var).",
+    )
+    parser.add_argument(
+        "--ai-product-copy-model",
+        default="",
+        help="Optional model override for AI product copy (defaults to OPENAI_MODEL).",
+    )
     parser.add_argument("--generate-artwork-from-prompt", action="store_true", help="Generate artwork source image(s) from a text prompt before normal pipeline processing")
     parser.add_argument("--art-prompt", default="", help="Prompt used for artwork generation mode")
     parser.add_argument("--art-count", type=int, default=1, help="Number of concept sets to generate")
@@ -8632,7 +8713,7 @@ def apply_high_volume_mode_defaults(
     }
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", export_preflight_report_path: str = "", allow_preflight_failures: bool = False, preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "", max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS, interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS, catalog_cache_dir: str = CATALOG_CACHE_DIR_DEFAULT, catalog_cache_ttl_hours: int = CACHE_TTL_HOURS_DEFAULT, no_catalog_cache: bool = False, chunk_size: int = 0, pause_between_chunks_seconds: float = 0.0, catalog_request_spacing_ms: int = 0, template_spacing_ms: int = 0, artwork_spacing_ms: int = 0, resume_only_pending: bool = False, high_volume_mode: bool = False, publish_batch_size: int = 5, pause_between_publish_batches_seconds: float = 2.0, defer_publish: bool = False, resume_publish_only: bool = False) -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", export_preflight_report_path: str = "", allow_preflight_failures: bool = False, preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, enable_ai_product_copy: Optional[bool] = None, ai_product_copy_model: str = "", generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "", max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS, interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS, catalog_cache_dir: str = CATALOG_CACHE_DIR_DEFAULT, catalog_cache_ttl_hours: int = CACHE_TTL_HOURS_DEFAULT, no_catalog_cache: bool = False, chunk_size: int = 0, pause_between_chunks_seconds: float = 0.0, catalog_request_spacing_ms: int = 0, template_spacing_ms: int = 0, artwork_spacing_ms: int = 0, resume_only_pending: bool = False, high_volume_mode: bool = False, publish_batch_size: int = 5, pause_between_publish_batches_seconds: float = 2.0, defer_publish: bool = False, resume_publish_only: bool = False) -> None:
     max_retry_sleep_seconds = max(0.0, float(max_retry_sleep_seconds))
     interactive_retry_cap_seconds = max(0.0, float(interactive_retry_cap_seconds))
     if resume_only_pending:
@@ -8659,6 +8740,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         pause_between_publish_batches_seconds = float(hv_defaults["pause_between_publish_batches_seconds"])
     if publish_mode not in {"default", "publish", "skip"}:
         raise RuntimeError(f"Unsupported publish mode: {publish_mode}")
+    configure_ai_product_copy(enabled=enable_ai_product_copy, model=ai_product_copy_model)
 
     if export_launch_plan_template:
         write_launch_plan_template(pathlib.Path(export_launch_plan_template))
@@ -9425,6 +9507,8 @@ if __name__ == "__main__":
             metadata_inline_generator=args.metadata_inline_generator,
             metadata_inline_only_when_weak=args.metadata_inline_only_when_weak,
             metadata_inline_overwrite_weak_sidecars=args.metadata_inline_overwrite_weak_sidecars,
+            enable_ai_product_copy=args.enable_ai_product_copy,
+            ai_product_copy_model=args.ai_product_copy_model,
             generate_artwork_from_prompt=args.generate_artwork_from_prompt,
             art_prompt=args.art_prompt,
             art_count=args.art_count,
