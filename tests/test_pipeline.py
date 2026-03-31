@@ -1118,6 +1118,27 @@ def test_sidecar_still_wins_over_alias_match(tmp_path: Path):
     assert match["source"] == "sidecar"
 
 
+def test_artwork_metadata_ambiguous_alias_falls_back_safely(tmp_path: Path):
+    image = tmp_path / "wolf-scene.png"
+    Image.new("RGBA", (900, 900), (0, 0, 0, 255)).save(image)
+    metadata_map = {
+        "wolf-entry-a": {
+            "title": "Wolf A",
+            "tags": ["wolf"],
+            "aliases": ["wolf-scene"],
+        },
+        "wolf-entry-b": {
+            "title": "Wolf B",
+            "tags": ["wolf"],
+            "aliases": ["wolf-scene"],
+        },
+    }
+    resolved, match = resolve_artwork_metadata_with_source(image, metadata_map, artwork_slug="wolf-scene")
+    assert resolved == {}
+    assert match["source"] == "ambiguous_alias"
+    assert match["key"] == "wolf-scene"
+
+
 def test_inline_metadata_helpers_detect_sluglike_and_generic_fallbacks(tmp_path: Path):
     image = tmp_path / "ai-generated-9228632.png"
     Image.new("RGBA", (900, 900), (80, 80, 80, 255)).save(image)
@@ -1926,6 +1947,129 @@ def test_ai_product_copy_cache_hit_skips_second_generation(monkeypatch: pytest.M
     assert calls["count"] == 1
     sidecar = json.loads(art.src_path.with_suffix(".json").read_text(encoding="utf-8"))
     assert "ai_product_copy" in sidecar and sidecar["ai_product_copy"]
+
+
+def test_ai_product_copy_cache_identity_prevents_cross_artwork_reuse(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir(parents=True, exist_ok=True)
+    dir_b.mkdir(parents=True, exist_ok=True)
+    art_a = _create_artwork(dir_a, 1000, 1000)
+    art_b = _create_artwork(dir_b, 1000, 1000)
+    art_a.slug = "art-a"
+    art_b.slug = "art-b"
+    art_a.metadata = {"title": "Forest Wolf", "description": "First artwork"}
+    art_b.metadata = {"title": "Forest Wolf", "description": "First artwork"}
+    template = _template_for_variant_tests()
+    template.key = "poster_basic"
+    template.product_type_label = "Poster"
+    template.shopify_product_type = "Posters"
+    calls = {"count": 0}
+
+    class _StubClient:
+        def __init__(self, *_args, **_kwargs):
+            self.responses = self
+
+        def create(self, **_kwargs):
+            calls["count"] += 1
+            return types.SimpleNamespace(
+                output_text=json.dumps(
+                    {
+                        "title": f"Poster Title {calls['count']}",
+                        "title_alternatives": ["Poster Alt"],
+                        "short_description": "Short poster copy",
+                        "long_description": "Long poster copy describing wall decor mood and centerpiece energy.",
+                        "seo_title": "Poster SEO",
+                        "meta_description": "Poster metadata description",
+                        "tags": ["poster", "wall decor", "gift idea"],
+                        "chosen_angle": "wall_decor_mood",
+                    }
+                )
+            )
+
+    monkeypatch.setattr(product_copy_generator, "OpenAI", _StubClient)
+    context_a = build_seo_context(template, art_a)
+    first = product_copy_generator.maybe_generate_product_copy(
+        template=template,
+        artwork=art_a,
+        context=context_a,
+        family="poster",
+        enabled=True,
+        model="gpt-4.1-mini",
+        api_key="test",
+    )
+    sidecar_a = json.loads(art_a.src_path.with_suffix(".json").read_text(encoding="utf-8"))
+    art_b_sidecar_path = art_b.src_path.with_suffix(".json")
+    art_b_sidecar_path.write_text(json.dumps({"ai_product_copy": sidecar_a["ai_product_copy"]}), encoding="utf-8")
+    art_b.metadata["ai_product_copy"] = sidecar_a["ai_product_copy"]
+    context_b = build_seo_context(template, art_b)
+    second = product_copy_generator.maybe_generate_product_copy(
+        template=template,
+        artwork=art_b,
+        context=context_b,
+        family="poster",
+        enabled=True,
+        model="gpt-4.1-mini",
+        api_key="test",
+    )
+    assert first is not None and second is not None
+    assert first.title != second.title
+    assert calls["count"] == 2
+
+
+def test_ai_product_copy_cache_identity_invalidates_on_metadata_change(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    art.metadata = {"title": "Wolf Dawn", "description": "Original description"}
+    template = _template_for_variant_tests()
+    template.key = "poster_basic"
+    template.product_type_label = "Poster"
+    template.shopify_product_type = "Posters"
+    calls = {"count": 0}
+
+    class _StubClient:
+        def __init__(self, *_args, **_kwargs):
+            self.responses = self
+
+        def create(self, **_kwargs):
+            calls["count"] += 1
+            return types.SimpleNamespace(
+                output_text=json.dumps(
+                    {
+                        "title": f"Poster Title {calls['count']}",
+                        "title_alternatives": ["Poster Alt"],
+                        "short_description": "Short poster copy",
+                        "long_description": "Long poster copy describing wall decor mood and centerpiece energy.",
+                        "seo_title": "Poster SEO",
+                        "meta_description": "Poster metadata description",
+                        "tags": ["poster", "wall decor", "gift idea"],
+                        "chosen_angle": "wall_decor_mood",
+                    }
+                )
+            )
+
+    monkeypatch.setattr(product_copy_generator, "OpenAI", _StubClient)
+    first = product_copy_generator.maybe_generate_product_copy(
+        template=template,
+        artwork=art,
+        context=build_seo_context(template, art),
+        family="poster",
+        enabled=True,
+        model="gpt-4.1-mini",
+        api_key="test",
+    )
+    art.metadata["description"] = "Updated artwork description"
+    second = product_copy_generator.maybe_generate_product_copy(
+        template=template,
+        artwork=art,
+        context=build_seo_context(template, art),
+        family="poster",
+        enabled=True,
+        model="gpt-4.1-mini",
+        api_key="test",
+    )
+    assert first is not None and second is not None
+    assert first.title != second.title
+    assert calls["count"] == 2
 
 
 def test_normalize_theme_tag_rejects_generic_filler():

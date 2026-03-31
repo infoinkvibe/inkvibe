@@ -5,6 +5,7 @@ import logging
 import os
 import pathlib
 import re
+import hashlib
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -182,20 +183,59 @@ def _cache_key(*, template_key: str, family: str, model: str) -> str:
     return f"{COPY_CACHE_VERSION}:{family}:{template_key}:{model}"
 
 
-def _load_cached_copy(metadata: Dict[str, Any], *, key: str) -> Optional[GeneratedProductCopy]:
+def _cache_identity(*, artwork: Any, metadata: Dict[str, Any]) -> Dict[str, str]:
+    safe_metadata = {
+        "title": _as_text(metadata.get("title")),
+        "description": _as_text(metadata.get("description")),
+        "theme": _as_text(metadata.get("theme")),
+        "collection": _as_text(metadata.get("collection")),
+        "audience": _as_text(metadata.get("audience")),
+        "occasion": _as_text(metadata.get("occasion")),
+        "color_story": _as_text(metadata.get("color_story")),
+        "style_keywords": [_as_text(v) for v in metadata.get("style_keywords", []) if _as_text(v)],
+        "seo_keywords": [_as_text(v) for v in metadata.get("seo_keywords", []) if _as_text(v)],
+        "tags": [_as_text(v) for v in metadata.get("tags", []) if _as_text(v)],
+    }
+    digest_input = json.dumps(safe_metadata, sort_keys=True, ensure_ascii=False)
+    return {
+        "artwork_slug": _as_text(getattr(artwork, "slug", "")),
+        "artwork_filename": _as_text(getattr(getattr(artwork, "src_path", None), "name", "")),
+        "metadata_hash": hashlib.sha256(digest_input.encode("utf-8")).hexdigest(),
+    }
+
+
+def _load_cached_copy(
+    metadata: Dict[str, Any],
+    *,
+    key: str,
+    expected_identity: Dict[str, str],
+) -> tuple[Optional[GeneratedProductCopy], str]:
     bucket = metadata.get(COPY_CACHE_FIELD)
     if not isinstance(bucket, dict):
-        return None
+        return None, "cache_bucket_missing"
     entry = bucket.get(key)
     if not isinstance(entry, dict):
-        return None
+        return None, "cache_entry_missing"
+    identity = entry.get("identity")
+    if not isinstance(identity, dict):
+        return None, "cache_identity_missing"
+    for field in ("artwork_slug", "artwork_filename", "metadata_hash"):
+        if _as_text(identity.get(field)) != _as_text(expected_identity.get(field)):
+            return None, f"cache_identity_mismatch_{field}"
     try:
-        return _validate_generated_copy(entry)
+        return _validate_generated_copy(entry), "cache_hit_identity_verified"
     except Exception:
-        return None
+        return None, "cache_entry_invalid"
 
 
-def _persist_cached_copy(*, artwork_path: pathlib.Path, metadata: Dict[str, Any], key: str, generated: GeneratedProductCopy) -> None:
+def _persist_cached_copy(
+    *,
+    artwork_path: pathlib.Path,
+    metadata: Dict[str, Any],
+    key: str,
+    generated: GeneratedProductCopy,
+    identity: Dict[str, str],
+) -> None:
     sidecar_path = artwork_path.with_suffix(".json")
     raw_sidecar: Dict[str, Any] = {}
     if sidecar_path.exists():
@@ -213,6 +253,7 @@ def _persist_cached_copy(*, artwork_path: pathlib.Path, metadata: Dict[str, Any]
         "cache_version": COPY_CACHE_VERSION,
         "model": key.split(":")[-1],
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "identity": identity,
     }
     raw_sidecar[COPY_CACHE_FIELD] = cache_bucket
     sidecar_path.write_text(json.dumps(raw_sidecar, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -244,10 +285,23 @@ def maybe_generate_product_copy(
 
     resolved_model = (model or os.getenv("OPENAI_MODEL") or DEFAULT_COPY_MODEL).strip()
     key = _cache_key(template_key=_as_text(getattr(template, "key", "")), family=family, model=resolved_model)
-    cached = _load_cached_copy(artwork.metadata or {}, key=key)
+    expected_identity = _cache_identity(artwork=artwork, metadata=artwork.metadata or {})
+    cached, cache_reason = _load_cached_copy(artwork.metadata or {}, key=key, expected_identity=expected_identity)
     if cached:
-        logger.info("AI product copy cache hit artwork=%s template=%s", getattr(artwork, "slug", ""), getattr(template, "key", ""))
+        logger.info(
+            "AI product copy cache hit artwork=%s template=%s reason=%s",
+            getattr(artwork, "slug", ""),
+            getattr(template, "key", ""),
+            cache_reason,
+        )
         return cached
+    if cache_reason.startswith("cache_identity_"):
+        logger.info(
+            "AI product copy cache bypass artwork=%s template=%s reason=%s",
+            getattr(artwork, "slug", ""),
+            getattr(template, "key", ""),
+            cache_reason,
+        )
 
     payload = _build_payload(template=template, artwork=artwork, context=context, family=family)
     prompt = _build_prompt(payload)
@@ -295,7 +349,13 @@ def maybe_generate_product_copy(
         if not generated.title or not generated.long_description:
             logger.info("AI product copy fallback: incomplete response artwork=%s", getattr(artwork, "slug", ""))
             return None
-        _persist_cached_copy(artwork_path=artwork.src_path, metadata=artwork.metadata, key=key, generated=generated)
+        _persist_cached_copy(
+            artwork_path=artwork.src_path,
+            metadata=artwork.metadata,
+            key=key,
+            generated=generated,
+            identity=expected_identity,
+        )
         logger.info("AI product copy cache miss->write artwork=%s template=%s", getattr(artwork, "slug", ""), getattr(template, "key", ""))
         return generated
     except Exception as exc:
