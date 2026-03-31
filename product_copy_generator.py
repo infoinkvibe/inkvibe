@@ -17,7 +17,7 @@ except Exception:  # pragma: no cover - optional dependency for non-AI runs.
 
 logger = logging.getLogger("inkvibeauto")
 
-SUPPORTED_FAMILIES = {"hoodie", "mug"}
+SUPPORTED_FAMILIES = {"hoodie", "mug", "tshirt", "sweatshirt", "poster", "phone_case"}
 COPY_CACHE_VERSION = "v1"
 DEFAULT_COPY_MODEL = "gpt-4.1-mini"
 COPY_CACHE_FIELD = "ai_product_copy"
@@ -28,7 +28,38 @@ _ANGLE_CHOICES = [
     "everyday_lifestyle",
     "morning_ritual",
     "desk_home",
+    "wearable_everyday_art",
+    "cozy_layering",
+    "wall_decor_mood",
+    "expressive_utility",
 ]
+
+_FAMILY_COPY_GUIDANCE: Dict[str, Dict[str, Any]] = {
+    "hoodie": {
+        "prioritize": ["comfort", "layering", "everyday wear", "giftability", "expressive wearable art"],
+        "avoid": ["perfect for any occasion", "elevate your style", "must-have", "high-quality design"],
+    },
+    "mug": {
+        "prioritize": ["morning routine", "desk or home use", "cozy giftability", "daily usefulness", "artistic personality"],
+        "avoid": ["perfect for any occasion", "elevate your style", "must-have", "high-quality design"],
+    },
+    "tshirt": {
+        "prioritize": ["wearable everyday art", "easy styling", "giftable"],
+        "avoid": ["perfect for any occasion", "elevate your style", "must-have", "high-quality design"],
+    },
+    "sweatshirt": {
+        "prioritize": ["comfort", "cozy layering", "casual warmth"],
+        "avoid": ["perfect for any occasion", "elevate your style", "must-have", "high-quality design"],
+    },
+    "poster": {
+        "prioritize": ["wall decor", "room mood", "visual centerpiece"],
+        "avoid": ["perfect for any occasion", "elevate your style", "must-have", "high-quality design"],
+    },
+    "phone_case": {
+        "prioritize": ["everyday carry", "expressive utility", "giftable accessory"],
+        "avoid": ["perfect for any occasion", "elevate your style", "must-have", "high-quality design"],
+    },
+}
 
 
 @dataclass
@@ -85,6 +116,7 @@ def _sanitize_tags(rows: Any) -> List[str]:
 
 def _build_payload(*, template: Any, artwork: Any, context: Dict[str, Any], family: str) -> Dict[str, Any]:
     metadata = artwork.metadata or {}
+    guidance = _FAMILY_COPY_GUIDANCE.get(family, {})
     return {
         "family": family,
         "template_key": _as_text(getattr(template, "key", "")),
@@ -100,6 +132,7 @@ def _build_payload(*, template: Any, artwork: Any, context: Dict[str, Any], fami
         "seo_keywords": context.get("seo_keywords_list") or [],
         "product_type_label": _as_text(getattr(template, "product_type_label", "") or getattr(template, "shopify_product_type", "")),
         "angles": list(_ANGLE_CHOICES),
+        "family_copy_guidance": guidance,
     }
 
 
@@ -109,6 +142,7 @@ def _build_prompt(payload: Dict[str, Any]) -> str:
         "Only use facts from INPUT. Never invent material specs, shipping promises, care instructions, "
         "or compliance claims.\n"
         "Tone should be natural and varied (not templated).\n"
+        "Avoid awkward tag fragments; each tag should be readable and complete.\n"
         "Return JSON only with keys: "
         "title, title_alternatives, short_description, long_description, seo_title, meta_description, tags, chosen_angle.\n"
         f"INPUT: {json.dumps(payload, ensure_ascii=False)}"

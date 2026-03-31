@@ -8388,7 +8388,7 @@ def parse_args() -> argparse.Namespace:
         "--enable-ai-product-copy",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Enable OpenAI-assisted product copy for hoodie/mug families only (default from ENABLE_AI_PRODUCT_COPY env var).",
+        help="Enable OpenAI-assisted product copy for hoodie/mug/tshirt/sweatshirt/poster/phone_case families (default from ENABLE_AI_PRODUCT_COPY env var).",
     )
     parser.add_argument(
         "--ai-product-copy-model",
