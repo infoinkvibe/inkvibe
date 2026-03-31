@@ -1784,24 +1784,147 @@ def test_ai_product_copy_applies_for_hoodie_and_mug(monkeypatch: pytest.MonkeyPa
     assert "wearable art" in _render_listing_tags(template, art)
 
 
-def test_ai_product_copy_not_used_for_other_families(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+@pytest.mark.parametrize(
+    ("template_key", "product_type", "shopify_type", "family"),
+    [
+        ("tshirt_gildan", "T-Shirt", "T-Shirts", "tshirt"),
+        ("sweatshirt_gildan", "Sweatshirt", "Sweatshirts", "sweatshirt"),
+        ("poster_basic", "Poster", "Posters", "poster"),
+        ("phone_case_basic", "Phone Case", "Phone Cases", "phone_case"),
+    ],
+)
+def test_ai_product_copy_enabled_for_new_supported_families(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    template_key: str,
+    product_type: str,
+    shopify_type: str,
+    family: str,
+):
     art = _create_artwork(tmp_path, 1000, 1000)
-    art.metadata = {"title": "Fox Poster", "description": "A fox poster.", "tags": ["fox", "wall art"]}
+    art.metadata = {"title": "Fox Glow", "description": "A vivid fox artwork.", "tags": ["fox", "art"]}
+    template = _template_for_variant_tests()
+    template.key = template_key
+    template.product_type_label = product_type
+    template.shopify_product_type = shopify_type
+
+    class _StubClient:
+        def __init__(self, *_args, **_kwargs):
+            self.responses = self
+
+        def create(self, **_kwargs):
+            return types.SimpleNamespace(
+                output_text=json.dumps(
+                    {
+                        "title": f"{product_type} Test",
+                        "title_alternatives": [f"{product_type} Alt"],
+                        "short_description": "Short copy",
+                        "long_description": "Long conversion-focused copy for this listing.",
+                        "seo_title": f"{product_type} SEO",
+                        "meta_description": "Meta copy for listing previews.",
+                        "tags": [family, "gift idea", "art"],
+                        "chosen_angle": "everyday_lifestyle",
+                    }
+                )
+            )
+
+    monkeypatch.setattr(product_copy_generator, "OpenAI", _StubClient)
+    configure_ai_product_copy(enabled=True, model="gpt-4.1-mini", api_key="test")
+    generated = product_copy_generator.maybe_generate_product_copy(
+        template=template,
+        artwork=art,
+        context=build_seo_context(template, art),
+        family=family,
+        enabled=True,
+        model="gpt-4.1-mini",
+        api_key="test",
+    )
+    assert generated is not None
+    assert generated.title.endswith("Test")
+    expected_tag = family.replace("_", "")
+    assert expected_tag in [tag.replace(" ", "").replace("-", "") for tag in generated.tags]
+
+
+def test_ai_product_copy_unsupported_family_falls_back(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    template = _template_for_variant_tests()
+    template.key = "sticker_kisscut"
+    template.product_type_label = "Sticker"
+    template.shopify_product_type = "Stickers"
+
+    class _ExplodingClient:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("OpenAI client should not be constructed for unsupported family")
+
+    monkeypatch.setattr(product_copy_generator, "OpenAI", _ExplodingClient)
+    configure_ai_product_copy(enabled=True, model="gpt-4.1-mini", api_key="test")
+    generated = product_copy_generator.maybe_generate_product_copy(
+        template=template,
+        artwork=art,
+        context=build_seo_context(template, art),
+        family="default",
+        enabled=True,
+        model="gpt-4.1-mini",
+        api_key="test",
+    )
+    assert generated is None
+
+
+def test_ai_product_copy_cache_hit_skips_second_generation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    art.metadata = {}
     template = _template_for_variant_tests()
     template.key = "poster_basic"
     template.product_type_label = "Poster"
     template.shopify_product_type = "Posters"
     calls = {"count": 0}
 
-    def _stub(**kwargs):
-        calls["count"] += 1
-        return None
+    class _StubClient:
+        def __init__(self, *_args, **_kwargs):
+            self.responses = self
 
-    monkeypatch.setattr(product_copy_generator, "maybe_generate_product_copy", _stub)
-    configure_ai_product_copy(enabled=True, model="gpt-4.1-mini", api_key="test")
-    title = render_product_title(template, art)
-    assert "Fox Poster" in title
-    assert calls["count"] >= 1
+        def create(self, **_kwargs):
+            calls["count"] += 1
+            return types.SimpleNamespace(
+                output_text=json.dumps(
+                    {
+                        "title": "Poster Title",
+                        "title_alternatives": ["Poster Alt"],
+                        "short_description": "Short poster copy",
+                        "long_description": "Long poster copy describing wall decor mood and centerpiece energy.",
+                        "seo_title": "Poster SEO",
+                        "meta_description": "Poster metadata description",
+                        "tags": ["poster", "wall decor", "gift idea"],
+                        "chosen_angle": "wall_decor_mood",
+                    }
+                )
+            )
+
+    monkeypatch.setattr(product_copy_generator, "OpenAI", _StubClient)
+    context = build_seo_context(template, art)
+    first = product_copy_generator.maybe_generate_product_copy(
+        template=template,
+        artwork=art,
+        context=context,
+        family="poster",
+        enabled=True,
+        model="gpt-4.1-mini",
+        api_key="test",
+    )
+    second = product_copy_generator.maybe_generate_product_copy(
+        template=template,
+        artwork=art,
+        context=context,
+        family="poster",
+        enabled=True,
+        model="gpt-4.1-mini",
+        api_key="test",
+    )
+    assert first is not None and second is not None
+    assert first.title == second.title
+    assert calls["count"] == 1
+    sidecar = json.loads(art.src_path.with_suffix(".json").read_text(encoding="utf-8"))
+    assert "ai_product_copy" in sidecar and sidecar["ai_product_copy"]
 
 
 def test_normalize_theme_tag_rejects_generic_filler():

@@ -188,6 +188,11 @@ _FAMILY_CONFIG: Dict[str, Dict[str, Any]] = {
         "tags": ["poster", "gift idea", "wall art"],
         "description_closing": "A simple way to add personality to your wall and space.",
     },
+    "phone_case": {
+        "suffix": "Phone Case",
+        "tags": ["phone case", "gift idea", "everyday accessory"],
+        "description_closing": "A practical daily accessory with expressive visual personality.",
+    },
     "mug": {
         "suffix": "Mug",
         "tags": ["mug", "gift idea", "drinkware"],
@@ -221,6 +226,8 @@ def infer_product_family(template: Any) -> str:
         return "tote"
     if "poster" in hint:
         return "poster"
+    if "phone_case" in hint or "phone case" in hint:
+        return "phone_case"
     if "mug" in hint or "drinkware" in hint:
         return "mug"
     return "default"
@@ -252,6 +259,7 @@ def build_branded_description(*, artwork_title: str, short_description: str, tem
         "tshirt": "Designed for everyday rotation, casual hangs, and weekend plans.",
         "tote": "Perfect for books, errands, market runs, and daily carry.",
         "poster": "Works beautifully in offices, bedrooms, studios, and gallery-style walls.",
+        "phone_case": "Made for everyday carry with practical protection and expressive style.",
         "mug": "Made for coffee rituals, tea breaks, and desk-side personality.",
         "default": "Made for everyday use with bold visual personality.",
     }
