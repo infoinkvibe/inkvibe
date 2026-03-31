@@ -85,6 +85,8 @@ CATALOG_RETRY_BACKOFF_CAP_SECONDS = float(os.getenv("CATALOG_RETRY_BACKOFF_CAP_S
 MUTATION_RETRY_BACKOFF_CAP_SECONDS = float(os.getenv("MUTATION_RETRY_BACKOFF_CAP_SECONDS", "20"))
 INTERACTIVE_RETRY_CAP_SECONDS = float(os.getenv("INTERACTIVE_RETRY_CAP_SECONDS", "12"))
 MAX_RETRY_SLEEP_SECONDS = float(os.getenv("MAX_RETRY_SLEEP_SECONDS", "45"))
+PRINTIFY_UPDATE_DISABLED_RETRY_ATTEMPTS = max(0, int(os.getenv("PRINTIFY_UPDATE_DISABLED_RETRY_ATTEMPTS", "1")))
+PRINTIFY_UPDATE_DISABLED_RETRY_SLEEP_SECONDS = max(0.0, float(os.getenv("PRINTIFY_UPDATE_DISABLED_RETRY_SLEEP_SECONDS", "0.75")))
 PRINTIFY_DIRECT_UPLOAD_LIMIT_BYTES = 5 * 1024 * 1024
 CACHE_TTL_HOURS_DEFAULT = int(os.getenv("CATALOG_CACHE_TTL_HOURS", "24"))
 CATALOG_CACHE_DIR_DEFAULT = os.getenv("CATALOG_CACHE_DIR", "./.inkvibe_cache/catalog")
@@ -5868,6 +5870,16 @@ def _is_printify_update_incompatible_error(exc: Exception) -> bool:
     )
 
 
+def _is_printify_product_edit_disabled_error(exc: Exception) -> bool:
+    if not isinstance(exc, NonRetryableRequestError):
+        return False
+    message = str(exc)
+    if "HTTP 400" not in message:
+        return False
+    lowered = message.lower()
+    return ("code" in lowered and "8252" in lowered) or ("product is disabled for editing" in lowered)
+
+
 def normalize_catalog_variants_response(raw_variants: Any) -> List[Dict[str, Any]]:
     response_type = type(raw_variants).__name__
     logger.debug("Printify variants response top-level type: %s", response_type)
@@ -7224,6 +7236,22 @@ def upsert_in_printify(
         new_product_id = str(created_resp.get("id") or created_resp.get("data", {}).get("id") or "")
         return new_product_id, {"action": "create", "printify_product_id": new_product_id, "created": created_resp}
 
+    def _execute_rebuild(*, previous_product_id: str) -> Tuple[str, Dict[str, Any]]:
+        try:
+            printify.delete_product(shop_id, previous_product_id)
+        except DryRunMutationSkipped:
+            raise
+        except Exception:
+            logger.warning("Delete existing product failed during rebuild product_id=%s", previous_product_id)
+        new_product_id, create_result = _execute_create()
+        rebuilt = {
+            "action": "rebuild",
+            "previous_product_id": previous_product_id,
+            "printify_product_id": new_product_id,
+            "created": create_result["created"],
+        }
+        return new_product_id, rebuilt
+
     try:
         payload = build_printify_product_payload(artwork, template, variant_rows, upload_map)
     except TemplateSkipGuardrail as exc:
@@ -7298,49 +7326,89 @@ def upsert_in_printify(
                 action = "rebuild"
 
             if action == "update":
+                disabled_edit_retry_count = 0
                 try:
-                    updated = printify.update_product(shop_id, existing_product_id, payload)
+                    while True:
+                        try:
+                            updated = printify.update_product(shop_id, existing_product_id, payload)
+                            break
+                        except NonRetryableRequestError as exc:
+                            if _is_printify_product_edit_disabled_error(exc):
+                                logger.warning(
+                                    "Update blocked by Printify edit lock; classifying as temporary disabled-edit state "
+                                    "product_id=%s template=%s code_hint=8252 retry=%s/%s",
+                                    existing_product_id,
+                                    template.key,
+                                    disabled_edit_retry_count + 1,
+                                    PRINTIFY_UPDATE_DISABLED_RETRY_ATTEMPTS + 1,
+                                )
+                                if disabled_edit_retry_count < PRINTIFY_UPDATE_DISABLED_RETRY_ATTEMPTS:
+                                    disabled_edit_retry_count += 1
+                                    logger.info(
+                                        "Retrying Printify update after disabled-edit classification product_id=%s template=%s "
+                                        "retry_attempt=%s wait_seconds=%.2f",
+                                        existing_product_id,
+                                        template.key,
+                                        disabled_edit_retry_count,
+                                        PRINTIFY_UPDATE_DISABLED_RETRY_SLEEP_SECONDS,
+                                    )
+                                    if PRINTIFY_UPDATE_DISABLED_RETRY_SLEEP_SECONDS > 0:
+                                        time.sleep(PRINTIFY_UPDATE_DISABLED_RETRY_SLEEP_SECONDS)
+                                    continue
+                                logger.warning(
+                                    "Disabled-edit update remained blocked after retry; rebuild fallback activated "
+                                    "product_id=%s template=%s fallback_action=rebuild retries=%s",
+                                    existing_product_id,
+                                    template.key,
+                                    disabled_edit_retry_count,
+                                )
+                                action = "rebuild"
+                                try:
+                                    product_id, result = _execute_rebuild(previous_product_id=existing_product_id)
+                                except DryRunMutationSkipped:
+                                    return {
+                                        "status": "dry-run",
+                                        "action": "rebuild",
+                                        "payload_preview": payload,
+                                        "printify_product_id": existing_product_id,
+                                    }
+                                break
+                            if not _is_printify_update_incompatible_error(exc):
+                                raise
+                            coverage_gap = max(0, payload_stats["enabled_variant_count"] - payload_stats["print_area_variant_count"])
+                            logger.warning(
+                                "Update rejected as incompatible by Printify; classifying as update incompatibility "
+                                "product_id=%s template=%s code_hint=8251 enabled_variant_count=%s print_area_variant_count=%s coverage_gap=%s",
+                                existing_product_id,
+                                template.key,
+                                payload_stats["enabled_variant_count"],
+                                payload_stats["print_area_variant_count"],
+                                coverage_gap,
+                            )
+                            logger.warning(
+                                "Incompatible update fallback activated product_id=%s template=%s fallback_action=rebuild",
+                                existing_product_id,
+                                template.key,
+                            )
+                            action = "rebuild"
+                            try:
+                                product_id, result = _execute_rebuild(previous_product_id=existing_product_id)
+                            except DryRunMutationSkipped:
+                                return {"status": "dry-run", "action": "rebuild", "payload_preview": payload, "printify_product_id": existing_product_id}
+                            break
                 except NonRetryableRequestError as exc:
-                    if not _is_printify_update_incompatible_error(exc):
-                        raise
-                    coverage_gap = max(0, payload_stats["enabled_variant_count"] - payload_stats["print_area_variant_count"])
-                    logger.warning(
-                        "Update rejected as incompatible by Printify; classifying as update incompatibility "
-                        "product_id=%s template=%s code_hint=8251 enabled_variant_count=%s print_area_variant_count=%s coverage_gap=%s",
-                        existing_product_id,
-                        template.key,
-                        payload_stats["enabled_variant_count"],
-                        payload_stats["print_area_variant_count"],
-                        coverage_gap,
-                    )
-                    logger.warning(
-                        "Incompatible update fallback activated product_id=%s template=%s fallback_action=rebuild",
-                        existing_product_id,
-                        template.key,
-                    )
-                    action = "rebuild"
-                    try:
-                        printify.delete_product(shop_id, existing_product_id)
-                    except DryRunMutationSkipped:
-                        return {"status": "dry-run", "action": "rebuild", "payload_preview": payload, "printify_product_id": existing_product_id}
-                    except Exception:
-                        logger.warning("Delete existing product failed during rebuild product_id=%s", existing_product_id)
-                    product_id, create_result = _execute_create()
-                    result = {"action": "rebuild", "previous_product_id": existing_product_id, "printify_product_id": product_id, "created": create_result["created"]}
+                    raise
                 except DryRunMutationSkipped:
                     return {"status": "dry-run", "action": "update", "payload_preview": payload, "printify_product_id": existing_product_id}
                 else:
-                    result = {"action": "update", "printify_product_id": existing_product_id, "updated": updated}
-                    product_id = existing_product_id
+                    if action == "update":
+                        result = {"action": "update", "printify_product_id": existing_product_id, "updated": updated}
+                        product_id = existing_product_id
             else:
                 try:
-                    printify.delete_product(shop_id, existing_product_id)
+                    product_id, result = _execute_rebuild(previous_product_id=existing_product_id)
                 except DryRunMutationSkipped:
                     return {"status": "dry-run", "action": "rebuild", "payload_preview": payload, "printify_product_id": existing_product_id}
-                except Exception:
-                    logger.warning("Delete existing product failed during rebuild product_id=%s", existing_product_id)
-                product_id, create_result = _execute_create()
-                result = {"action": "rebuild", "previous_product_id": existing_product_id, "printify_product_id": product_id, "created": create_result["created"]}
     elif action == "rebuild":
         if existing_product_id:
             try:
