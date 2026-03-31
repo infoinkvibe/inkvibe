@@ -5856,6 +5856,18 @@ def _is_http_404_error(exc: Exception) -> bool:
     return isinstance(exc, NonRetryableRequestError) and "HTTP 404" in str(exc)
 
 
+def _is_printify_update_incompatible_error(exc: Exception) -> bool:
+    if not isinstance(exc, NonRetryableRequestError):
+        return False
+    message = str(exc)
+    if "HTTP 400" not in message:
+        return False
+    lowered = message.lower()
+    return ("code" in lowered and "8251" in lowered) or (
+        "variants do not match selected blueprint and print provider" in lowered
+    )
+
+
 def normalize_catalog_variants_response(raw_variants: Any) -> List[Dict[str, Any]]:
     response_type = type(raw_variants).__name__
     logger.debug("Printify variants response top-level type: %s", response_type)
@@ -7288,10 +7300,38 @@ def upsert_in_printify(
             if action == "update":
                 try:
                     updated = printify.update_product(shop_id, existing_product_id, payload)
+                except NonRetryableRequestError as exc:
+                    if not _is_printify_update_incompatible_error(exc):
+                        raise
+                    coverage_gap = max(0, payload_stats["enabled_variant_count"] - payload_stats["print_area_variant_count"])
+                    logger.warning(
+                        "Update rejected as incompatible by Printify; classifying as update incompatibility "
+                        "product_id=%s template=%s code_hint=8251 enabled_variant_count=%s print_area_variant_count=%s coverage_gap=%s",
+                        existing_product_id,
+                        template.key,
+                        payload_stats["enabled_variant_count"],
+                        payload_stats["print_area_variant_count"],
+                        coverage_gap,
+                    )
+                    logger.warning(
+                        "Incompatible update fallback activated product_id=%s template=%s fallback_action=rebuild",
+                        existing_product_id,
+                        template.key,
+                    )
+                    action = "rebuild"
+                    try:
+                        printify.delete_product(shop_id, existing_product_id)
+                    except DryRunMutationSkipped:
+                        return {"status": "dry-run", "action": "rebuild", "payload_preview": payload, "printify_product_id": existing_product_id}
+                    except Exception:
+                        logger.warning("Delete existing product failed during rebuild product_id=%s", existing_product_id)
+                    product_id, create_result = _execute_create()
+                    result = {"action": "rebuild", "previous_product_id": existing_product_id, "printify_product_id": product_id, "created": create_result["created"]}
                 except DryRunMutationSkipped:
                     return {"status": "dry-run", "action": "update", "payload_preview": payload, "printify_product_id": existing_product_id}
-                result = {"action": "update", "printify_product_id": existing_product_id, "updated": updated}
-                product_id = existing_product_id
+                else:
+                    result = {"action": "update", "printify_product_id": existing_product_id, "updated": updated}
+                    product_id = existing_product_id
             else:
                 try:
                     printify.delete_product(shop_id, existing_product_id)

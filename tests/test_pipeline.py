@@ -82,6 +82,7 @@ from printify_shopify_sync_pipeline import (
     assess_update_compatibility,
     enforce_variant_safety_limit,
     upsert_in_printify,
+    _is_printify_update_incompatible_error,
     _row_status,
     write_csv_report,
     run,
@@ -4177,6 +4178,66 @@ def test_upsert_in_printify_recovers_from_stale_product_id(tmp_path: Path):
     )
     assert result["action"] == "create"
     assert result["printify_product_id"] == "new-123"
+
+
+def test_classifies_printify_update_incompatible_8251_error():
+    exc = NonRetryableRequestError(
+        "HTTP 400 for PUT /shops/1/products/p1.json: {'code': 8251, "
+        "'message': 'Variants do not match selected blueprint and print provider.'}"
+    )
+    assert _is_printify_update_incompatible_error(exc) is True
+
+
+def test_upsert_in_printify_rebuilds_after_8251_update_rejection(tmp_path: Path):
+    artwork = _create_artwork(tmp_path, 3000, 3000)
+    template = ProductTemplate(
+        key="tee-test",
+        printify_blueprint_id=9,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[PlacementRequirement("front", 1000, 1000)],
+    )
+
+    class DummyPrintify8251Fallback:
+        dry_run = False
+
+        def get_product(self, shop_id, product_id):
+            return {
+                "id": product_id,
+                "blueprint_id": 9,
+                "print_provider_id": 99,
+                "variants": [{"id": 101, "is_enabled": True}],
+                "print_areas": [{"placeholders": [{"position": "front"}]}],
+            }
+
+        def update_product(self, shop_id, product_id, payload):
+            raise NonRetryableRequestError(
+                "HTTP 400 for PUT /shops/1/products/existing-1.json: {'code': 8251, "
+                "'message': 'Variants do not match selected blueprint and print provider.'}"
+            )
+
+        def delete_product(self, shop_id, product_id):
+            return {"deleted": True}
+
+        def create_product(self, shop_id, payload):
+            return {"id": "recreated-8251"}
+
+    result = upsert_in_printify(
+        printify=DummyPrintify8251Fallback(),
+        shop_id=1,
+        artwork=artwork,
+        template=template,
+        variant_rows=[{"id": 101, "is_available": True, "price": 1200, "options": {"color": "White", "size": "M"}}],
+        upload_map={"front": {"id": "upload-1"}},
+        existing_product_id="existing-1",
+        action="update",
+        publish_mode="skip",
+        verify_publish=False,
+    )
+    assert result["action"] == "rebuild"
+    assert result["previous_product_id"] == "existing-1"
+    assert result["printify_product_id"] == "recreated-8251"
 
 
 def test_run_summary_logging_does_not_raise_format_error(tmp_path: Path, monkeypatch):
