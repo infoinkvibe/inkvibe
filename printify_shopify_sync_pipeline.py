@@ -12,6 +12,7 @@ import os
 import pathlib
 import random
 import re
+import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field, replace
@@ -333,6 +334,8 @@ class VariantFilterDiagnostics:
     requested_model_overlap_count: int = 0
     fallback_model_set_applied: bool = False
     final_selected_models: List[str] = field(default_factory=list)
+    selected_additional_colors: List[str] = field(default_factory=list)
+    unavailable_additional_colors: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -528,6 +531,7 @@ class ProductTemplate:
     preferred_mockup_position: Optional[str] = None
     secondary_collection_handles: List[str] = field(default_factory=list)
     min_margin_after_shipping: Optional[str] = None
+    min_profit_after_shipping: Optional[str] = None
     target_margin_after_shipping: Optional[str] = None
     shipping_basis_for_margin: str = "cost"
     disable_variants_below_margin_floor: bool = False
@@ -546,6 +550,50 @@ class ProductTemplate:
     min_source_short_edge: Optional[int] = None
     min_source_long_edge: Optional[int] = None
     min_effective_cover_ratio: Optional[float] = None
+    expanded_enabled_colors: List[str] = field(default_factory=list)
+
+
+@dataclass
+class RunProgressTracker:
+    enabled: bool
+    total: int
+    completed: int = 0
+    current_artwork: str = ""
+    current_template: str = ""
+    current_stage: str = "prepare"
+    stream: Any = sys.stderr
+
+    def _render(self) -> None:
+        if not self.enabled:
+            return
+        total = max(1, int(self.total))
+        completed = max(0, min(int(self.completed), total))
+        pct = int((completed / total) * 100)
+        line = (
+            f"\r[{completed}/{total} {pct:>3}%] "
+            f"artwork={self.current_artwork or '-'} "
+            f"template={self.current_template or '-'} "
+            f"stage={self.current_stage or '-'}"
+        )
+        print(line[:220], end="", file=self.stream, flush=True)
+
+    def update(self, *, artwork: str = "", template: str = "", stage: str = "") -> None:
+        if artwork:
+            self.current_artwork = artwork
+        if template:
+            self.current_template = template
+        if stage:
+            self.current_stage = stage
+        self._render()
+
+    def complete_one(self) -> None:
+        self.completed += 1
+        self._render()
+
+    def finish(self) -> None:
+        if self.enabled:
+            self._render()
+            print("", file=self.stream, flush=True)
 
 
 @dataclass
@@ -2532,6 +2580,20 @@ def log_run_summary(summary: RunSummary) -> None:
     logger.info(format_run_summary(summary))
 
 
+def should_enable_progress(*, force_enable: Optional[bool], stream: Any = sys.stderr) -> Tuple[bool, str]:
+    if force_enable is True:
+        return True, "forced_on"
+    if force_enable is False:
+        return False, "forced_off"
+    is_tty = bool(getattr(stream, "isatty", lambda: False)())
+    ci_detected = any(str(os.getenv(key, "")).strip() for key in ("CI", "GITHUB_ACTIONS", "BUILD_NUMBER"))
+    if not is_tty:
+        return False, "non_tty"
+    if ci_detected:
+        return False, "ci_environment"
+    return True, "interactive_tty"
+
+
 def build_generic_description_html(artwork_title: str) -> str:
     return (
         f"<p><strong>{artwork_title}</strong> adds an easy style upgrade to your everyday wardrobe.</p>"
@@ -2948,7 +3010,47 @@ def compute_compare_at_price_minor(template: ProductTemplate, sale_price_minor: 
 
 
 def _shipping_minor_for_variant(variant: Dict[str, Any], template: ProductTemplate) -> int:
+    def _row_first_item_minor(row: Dict[str, Any]) -> Optional[int]:
+        for key in ("first_item", "first_item_price", "first_item_cost", "shipping", "price", "cost"):
+            if row.get(key) is not None:
+                try:
+                    return normalize_printify_price(row.get(key))
+                except Exception:
+                    return None
+        return None
+
+    def _is_us_row(row: Dict[str, Any]) -> bool:
+        country = str(row.get("country") or row.get("country_code") or row.get("region") or "").strip().upper()
+        if country in {"US", "USA", "UNITED STATES", "UNITED STATES OF AMERICA"}:
+            return True
+        countries = row.get("countries")
+        if isinstance(countries, list):
+            normalized = {str(v).strip().upper() for v in countries if str(v).strip()}
+            if normalized.intersection({"US", "USA", "UNITED STATES", "UNITED STATES OF AMERICA"}):
+                return True
+        return False
+
+    def _extract_rows(payload: Any) -> List[Dict[str, Any]]:
+        if isinstance(payload, list):
+            return [row for row in payload if isinstance(row, dict)]
+        if isinstance(payload, dict):
+            rows: List[Dict[str, Any]] = []
+            for key in ("shipping", "shipping_rows", "rows", "rates", "profiles"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    rows.extend([row for row in value if isinstance(row, dict)])
+            if rows:
+                return rows
+        return []
+
     shipping = variant.get("shipping") or variant.get("shipping_cost") or variant.get("shipping_price")
+    shipping_rows = _extract_rows(shipping)
+    if shipping_rows:
+        us_rows = [row for row in shipping_rows if _is_us_row(row)]
+        candidate_rows = us_rows or shipping_rows
+        first_item_values = [value for value in (_row_first_item_minor(row) for row in candidate_rows) if value is not None]
+        if first_item_values:
+            return min(first_item_values)
     if shipping is None:
         family = content_engine.infer_product_family(template)
         defaults = {
@@ -2986,8 +3088,9 @@ def _variant_price_ceiling_minor(template: ProductTemplate, variant: Dict[str, A
 
 
 def apply_variant_margin_guardrails(template: ProductTemplate, variant_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    min_margin_minor = int((_decimal_from_value(template.min_margin_after_shipping, default="0") * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-    target_margin_minor = int((_decimal_from_value(template.target_margin_after_shipping, default=str(template.min_margin_after_shipping or "0")) * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    min_profit_config = template.min_profit_after_shipping if template.min_profit_after_shipping is not None else template.min_margin_after_shipping
+    min_margin_minor = int((_decimal_from_value(min_profit_config, default="0") * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    target_margin_minor = int((_decimal_from_value(template.target_margin_after_shipping, default=str(min_profit_config or "0")) * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
     adjusted: List[Dict[str, Any]] = []
     disabled: List[int] = []
     repriced: List[int] = []
@@ -3093,12 +3196,14 @@ def apply_variant_margin_guardrails(template: ProductTemplate, variant_rows: Lis
         "variant_diagnostics": variant_diagnostics,
     }
     logger.info(
-        "Variant guardrails template=%s selected_count=%s repriced_count=%s disabled_count_after_reprice=%s final_enabled_count=%s skip_reason=%s",
+        "Variant guardrails template=%s selected_count=%s repriced_count=%s disabled_count_after_reprice=%s final_enabled_count=%s min_profit_after_shipping_minor=%s target_profit_after_shipping_minor=%s skip_reason=%s",
         template.key,
         report["selected_count"],
         report["repriced_count"],
         report["disabled_count_after_reprice"],
         report["final_enabled_count"],
+        min_margin_minor,
+        target_margin_minor,
         report["skip_reason"] or "-",
     )
     if template.key == "tote_basic":
@@ -4205,8 +4310,10 @@ def _analyze_variant_filtering(catalog_variants: List[Dict[str, Any]], template:
             schema_values.setdefault(canonical_key, Counter())[str(value or "").strip()] += 1
 
     effective_filters: Dict[str, List[str]] = {}
-    if template.enabled_colors:
-        effective_filters["color"] = [str(v).strip() for v in template.enabled_colors if str(v).strip()]
+    if template.enabled_colors or template.expanded_enabled_colors:
+        base_colors = [str(v).strip() for v in template.enabled_colors if str(v).strip()]
+        expanded_colors = [str(v).strip() for v in template.expanded_enabled_colors if str(v).strip()]
+        effective_filters["color"] = list(dict.fromkeys([*base_colors, *expanded_colors]))
     if template.enabled_sizes:
         effective_filters["size"] = [str(v).strip() for v in template.enabled_sizes if str(v).strip()]
     for key, values in (template.enabled_variant_option_filters or {}).items():
@@ -4312,6 +4419,17 @@ def _analyze_variant_filtering(catalog_variants: List[Dict[str, Any]], template:
                 diagnostics.fallback_model_set_applied = bool(resolved_values)
                 missing_values = []
             diagnostics.final_selected_models = sorted(set(resolved_values))
+        if _canonical_option_token(requested_key) == "color" and template.expanded_enabled_colors:
+            base_tokens = {_canonical_option_token(v) for v in template.enabled_colors}
+            expanded_tokens = {_canonical_option_token(v) for v in template.expanded_enabled_colors}
+            resolved_tokens = {_canonical_option_token(v) for v in resolved_values}
+            missing_tokens = {_canonical_option_token(v) for v in missing_values}
+            diagnostics.selected_additional_colors = sorted(
+                {v for v in resolved_values if _canonical_option_token(v) in (expanded_tokens - base_tokens)}
+            )
+            diagnostics.unavailable_additional_colors = sorted(
+                {v for v in template.expanded_enabled_colors if _canonical_option_token(v) in missing_tokens}
+            )
         resolved_set = set(resolved_values)
         filtered_rows = [(variant, opts) for variant, opts in filtered_rows if str(opts.get(resolved_schema_key, "")).strip() in resolved_set]
         diagnostics.filter_counts.append(
@@ -5707,7 +5825,7 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
         raise TemplateValidationError(f"Template[{index}] rounding_mode must be none|whole_dollar|x_99")
     if row.get("max_enabled_variants") is not None and int(row.get("max_enabled_variants", 0)) <= 0:
         raise TemplateValidationError(f"Template[{index}] max_enabled_variants must be > 0 when provided")
-    for margin_key in ("min_margin_after_shipping", "target_margin_after_shipping"):
+    for margin_key in ("min_margin_after_shipping", "min_profit_after_shipping", "target_margin_after_shipping"):
         if row.get(margin_key) is not None and _decimal_from_value(row.get(margin_key), default="0") < 0:
             raise TemplateValidationError(f"Template[{index}] {margin_key} must be >= 0 when provided")
     if row.get("shipping_basis_for_margin") is not None:
@@ -5843,6 +5961,7 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
                 preferred_mockup_position=str(row.get("preferred_mockup_position", "")).strip() or None,
                 secondary_collection_handles=[str(v) for v in row.get("secondary_collection_handles", [])],
                 min_margin_after_shipping=str(row["min_margin_after_shipping"]) if row.get("min_margin_after_shipping") is not None else None,
+                min_profit_after_shipping=str(row["min_profit_after_shipping"]) if row.get("min_profit_after_shipping") is not None else None,
                 target_margin_after_shipping=str(row["target_margin_after_shipping"]) if row.get("target_margin_after_shipping") is not None else None,
                 shipping_basis_for_margin=str(row.get("shipping_basis_for_margin", "cost")).strip().lower() or "cost",
                 disable_variants_below_margin_floor=bool(row.get("disable_variants_below_margin_floor", False)),
@@ -5863,6 +5982,7 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
                 min_source_short_edge=int(row["min_source_short_edge"]) if row.get("min_source_short_edge") is not None else None,
                 min_source_long_edge=int(row["min_source_long_edge"]) if row.get("min_source_long_edge") is not None else None,
                 min_effective_cover_ratio=float(row["min_effective_cover_ratio"]) if row.get("min_effective_cover_ratio") is not None else None,
+                expanded_enabled_colors=[str(v) for v in row.get("expanded_enabled_colors", [])],
                 placements=[PlacementRequirement(**p) for p in row.get("placements", [])],
             )
         )
@@ -5874,10 +5994,10 @@ def choose_variants_from_catalog_with_diagnostics(catalog_variants: Any, templat
     catalog_variants = normalize_catalog_variants_response(catalog_variants)
     chosen, diagnostics = _analyze_variant_filtering(catalog_variants, template)
     def _is_apparel_recovery_key(key: str) -> bool:
-        return key in {"tshirt_gildan", "hoodie_gildan"}
+        return key in {"tshirt_gildan", "hoodie_gildan", "sweatshirt_gildan"}
 
     if _is_apparel_recovery_key(template.key):
-        color_rank = {"Black": 0, "White": 1, "Navy": 2, "Sport Grey": 3, "Sand": 4}
+        color_rank = {"Black": 0, "White": 1, "Navy": 2, "Sport Grey": 3, "Sand": 4, "Dark Heather": 5, "Maroon": 6, "Military Green": 7, "Charcoal": 8, "Ash": 9, "Carolina Blue": 10}
         size_rank = {"S": 0, "M": 1, "L": 2, "XL": 3, "2XL": 4, "3XL": 5}
 
         def _variant_sort_key(variant: Dict[str, Any]) -> Tuple[int, int, int]:
@@ -5914,6 +6034,13 @@ def choose_variants_from_catalog_with_diagnostics(catalog_variants: Any, templat
         diagnostics.zero_selection_reason,
         effective_limit,
     )
+    if diagnostics.selected_additional_colors or diagnostics.unavailable_additional_colors:
+        logger.info(
+            "Color expansion template=%s selected_additional_colors=%s unavailable_additional_colors=%s",
+            template.key,
+            diagnostics.selected_additional_colors,
+            diagnostics.unavailable_additional_colors,
+        )
     return chosen, diagnostics
 
 
@@ -7704,7 +7831,7 @@ def upsert_in_printify(
     return result
 
 
-def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, defer_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, verify_collections: bool = False, summary: Optional[RunSummary] = None, failure_rows: Optional[List[FailureReportRow]] = None, run_rows: Optional[List[RunReportRow]] = None, launch_plan_row: str = "", launch_plan_row_id: str = "", collection_handle: str = "", collection_title: str = "", collection_description: str = "", launch_name: str = "", campaign: str = "", merch_theme: str = "", routed_asset_family: str = "", routed_asset_mode: str = "", enforce_family_collection_membership: bool = True, collection_removal_mode: str = "conservative", collection_sort_order: str = "", collection_image_src: str = "", secondary_collection_handles: str = "") -> None:
+def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient], shop_id: Optional[int], artwork: Artwork, templates: List[ProductTemplate], state: Dict[str, Any], force: bool, export_dir: pathlib.Path, state_path: pathlib.Path, artwork_options: ArtworkProcessingOptions, upload_strategy: str, r2_config: Optional[R2Config], create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, defer_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, verify_collections: bool = False, summary: Optional[RunSummary] = None, failure_rows: Optional[List[FailureReportRow]] = None, run_rows: Optional[List[RunReportRow]] = None, launch_plan_row: str = "", launch_plan_row_id: str = "", collection_handle: str = "", collection_title: str = "", collection_description: str = "", launch_name: str = "", campaign: str = "", merch_theme: str = "", routed_asset_family: str = "", routed_asset_mode: str = "", enforce_family_collection_membership: bool = True, collection_removal_mode: str = "conservative", collection_sort_order: str = "", collection_image_src: str = "", secondary_collection_handles: str = "", progress: Optional[RunProgressTracker] = None) -> None:
     processed = state.setdefault("processed", {})
     existing = processed.get(artwork.slug, {})
     existing_products = existing.get("products", []) if isinstance(existing.get("products", []), list) else []
@@ -7729,6 +7856,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
     except Exception:
         logger.warning("Runtime blueprint title lookup failed; family validation will rely on option schema only.")
     for template in templates:
+        if progress is not None:
+            progress.update(artwork=artwork.src_path.name, template=template.key, stage="prepare")
         title_info = resolve_artwork_title(template, artwork)
         artwork.final_title_source = title_info.title_source
         rendered_title = render_product_title(template, artwork)
@@ -8188,9 +8317,13 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
+            if progress is not None:
+                progress.update(stage="upload")
             upload_map = upload_assets_to_printify(printify, state, artwork, resolved_template, prepared_assets, state_path, upload_strategy, r2_config)
 
             result: Dict[str, Any] = {}
+            if progress is not None:
+                progress.update(stage="create/update")
             result["printify"] = upsert_in_printify(
                 printify=printify,
                 shop_id=shop_id,
@@ -8232,6 +8365,10 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 result["shopify"] = create_in_shopify_only(shopify, artwork, template, variant_rows)
 
             printify_result = result.get("printify", {}) if isinstance(result.get("printify"), dict) else {}
+            if progress is not None and bool(printify_result.get("publish_attempted")):
+                progress.update(stage="publish")
+            if progress is not None and verify_publish:
+                progress.update(stage="verify")
             family_collection = resolve_family_collection_target(resolved_template)
             family_collection_handle = str(family_collection.get("handle") or "").strip()
             family_collection_title = str(family_collection.get("title") or "").strip()
@@ -8480,6 +8617,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
             if run_rows is not None:
                 run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "failure", action, resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id, summarize_upload_strategy(upload_map), "", False, False, rendered_title, source_size_report, trimmed_bounds_report, "", exported_canvas_report, placement_scale_report, effective_upscale_factor_report, requested_upscale_factor_report, applied_upscale_factor_report, upscale_capped_report, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
             log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": error_result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action=action, upload_map=upload_map)
+        if progress is not None:
+            progress.complete_one()
         save_json_atomic(state_path, state)
         logger.info("State persisted after template processing state_path=%s", state_path)
         time.sleep(0.25)
@@ -8576,6 +8715,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-publish", action="store_true", help="Skip publish after create/update/rebuild")
     parser.add_argument("--defer-publish", action="store_true", help="Create/update products now and enqueue publish for later")
     parser.add_argument("--resume-publish-only", action="store_true", help="Skip create/update and only drain persisted publish queue")
+    progress_group = parser.add_mutually_exclusive_group()
+    progress_group.add_argument("--progress", dest="progress", action="store_true", help="Force-enable single-line terminal progress display")
+    progress_group.add_argument("--no-progress", dest="progress", action="store_false", help="Force-disable terminal progress display")
+    parser.set_defaults(progress=None)
     parser.add_argument("--publish-batch-size", type=int, default=5, help="Maximum queued publish operations per batch")
     parser.add_argument("--pause-between-publish-batches-seconds", type=float, default=2.0, help="Pause duration between publish batches")
     parser.add_argument("--verify-publish", action="store_true", help="Read back created/updated product and verify basic storefront indicators")
@@ -9035,7 +9178,7 @@ def apply_high_volume_mode_defaults(
     }
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", export_preflight_report_path: str = "", allow_preflight_failures: bool = False, preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, enable_ai_product_copy: Optional[bool] = None, ai_product_copy_model: str = "", generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "", max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS, interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS, catalog_cache_dir: str = CATALOG_CACHE_DIR_DEFAULT, catalog_cache_ttl_hours: int = CACHE_TTL_HOURS_DEFAULT, no_catalog_cache: bool = False, chunk_size: int = 0, pause_between_chunks_seconds: float = 0.0, catalog_request_spacing_ms: int = 0, template_spacing_ms: int = 0, artwork_spacing_ms: int = 0, resume_only_pending: bool = False, high_volume_mode: bool = False, publish_batch_size: int = 5, pause_between_publish_batches_seconds: float = 2.0, defer_publish: bool = False, resume_publish_only: bool = False) -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", export_preflight_report_path: str = "", allow_preflight_failures: bool = False, preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, enable_ai_product_copy: Optional[bool] = None, ai_product_copy_model: str = "", generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "", max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS, interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS, catalog_cache_dir: str = CATALOG_CACHE_DIR_DEFAULT, catalog_cache_ttl_hours: int = CACHE_TTL_HOURS_DEFAULT, no_catalog_cache: bool = False, chunk_size: int = 0, pause_between_chunks_seconds: float = 0.0, catalog_request_spacing_ms: int = 0, template_spacing_ms: int = 0, artwork_spacing_ms: int = 0, resume_only_pending: bool = False, high_volume_mode: bool = False, publish_batch_size: int = 5, pause_between_publish_batches_seconds: float = 2.0, defer_publish: bool = False, resume_publish_only: bool = False, progress: Optional[bool] = None) -> None:
     max_retry_sleep_seconds = max(0.0, float(max_retry_sleep_seconds))
     interactive_retry_cap_seconds = max(0.0, float(interactive_retry_cap_seconds))
     if resume_only_pending:
@@ -9456,6 +9599,12 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
     if effective_chunk_size > 0 and artworks:
         artwork_chunks = [artworks[i:i + effective_chunk_size] for i in range(0, len(artworks), effective_chunk_size)]
     summary.total_chunks = len(artwork_chunks)
+    progress_enabled, progress_reason = should_enable_progress(force_enable=progress)
+    progress_tracker = RunProgressTracker(
+        enabled=progress_enabled,
+        total=max(1, len(artworks) * max(1, len(templates))),
+    )
+    logger.info("Progress display enabled=%s reason=%s", progress_enabled, progress_reason)
 
     if launch_plan_path:
         template_by_key = {template.key: template for template in templates}
@@ -9472,6 +9621,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             templates=templates,
             image_dir=image_dir,
         )
+        progress_tracker.total = max(1, len(launch_rows))
         failure_rows.extend(validation_failures)
         summary.failures += len(validation_failures)
 
@@ -9562,6 +9712,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                 collection_image_src=launch_row.collection_image_src,
                 collection_sort_order=launch_row.collection_sort_order,
                 secondary_collection_handles=launch_row.secondary_collection_handles,
+                progress=progress_tracker,
             )
             if summary.failures > before_failures:
                 if fail_fast:
@@ -9619,6 +9770,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                     run_rows=run_rows,
                     routed_asset_family=route.family,
                     routed_asset_mode="family-aware",
+                    progress=progress_tracker,
                 )
                 if summary.failures > before_failures:
                     if fail_fast:
@@ -9670,6 +9822,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                         summary=summary,
                         failure_rows=failure_rows,
                         run_rows=run_rows,
+                        progress=progress_tracker,
                     )
                     if template_spacing_ms > 0:
                         time.sleep(template_spacing_ms / 1000.0)
@@ -9721,6 +9874,7 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
     summary.publish_queue_failed_count = publish_stats["failed"]
     summary.publish_rate_limit_events += publish_stats["rate_limited"]
     summary.rate_limit_events = dict(getattr(printify, "rate_limit_events", {}))
+    progress_tracker.finish()
 
     if export_failure_report:
         write_csv_report(pathlib.Path(export_failure_report), [row.__dict__ for row in failure_rows])
@@ -9884,6 +10038,7 @@ if __name__ == "__main__":
             pause_between_publish_batches_seconds=args.pause_between_publish_batches_seconds,
             defer_publish=args.defer_publish,
             resume_publish_only=args.resume_publish_only,
+            progress=args.progress,
         )
     except CatalogCliUsageError as exc:
         print(f"Catalog CLI error: {exc}")
