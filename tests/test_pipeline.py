@@ -4372,6 +4372,130 @@ def test_upsert_in_printify_rebuilds_after_8251_update_rejection(tmp_path: Path)
     assert result["printify_product_id"] == "recreated-8251"
 
 
+def test_upsert_in_printify_skips_noop_rerun_when_fingerprint_unchanged(tmp_path: Path):
+    artwork = _create_artwork(tmp_path, 3000, 3000)
+    template = ProductTemplate(
+        key="tee-test",
+        printify_blueprint_id=9,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[PlacementRequirement("front", 1000, 1000)],
+    )
+
+    class DummyPrintifyNoopRerun:
+        dry_run = False
+
+        def __init__(self):
+            self.get_calls = 0
+            self.update_calls = 0
+
+        def get_product(self, shop_id, product_id):
+            self.get_calls += 1
+            return {
+                "id": product_id,
+                "blueprint_id": 9,
+                "print_provider_id": 99,
+                "variants": [{"id": 101, "is_enabled": True}],
+                "print_areas": [{"placeholders": [{"position": "front"}]}],
+            }
+
+        def update_product(self, shop_id, product_id, payload):
+            self.update_calls += 1
+            return {"id": product_id}
+
+    dummy = DummyPrintifyNoopRerun()
+    first_result = upsert_in_printify(
+        printify=dummy,
+        shop_id=1,
+        artwork=artwork,
+        template=template,
+        variant_rows=[{"id": 101, "is_available": True, "price": 1200, "options": {"color": "White", "size": "M"}}],
+        upload_map={"front": {"id": "upload-1"}},
+        existing_product_id="existing-1",
+        action="update",
+        publish_mode="skip",
+        verify_publish=False,
+    )
+    assert first_result["action"] == "update"
+    second_result = upsert_in_printify(
+        printify=dummy,
+        shop_id=1,
+        artwork=artwork,
+        template=template,
+        variant_rows=[{"id": 101, "is_available": True, "price": 1200, "options": {"color": "White", "size": "M"}}],
+        upload_map={"front": {"id": "upload-1"}},
+        existing_product_id="existing-1",
+        action="update",
+        publish_mode="skip",
+        verify_publish=False,
+        prior_state_row={"result": {"printify": first_result}},
+    )
+    assert second_result["action"] == "skip"
+    assert second_result["reason"] == "rerun_noop_unchanged_fingerprint"
+    assert dummy.update_calls == 1
+
+
+def test_upsert_in_printify_updates_when_only_mutable_listing_changes(tmp_path: Path):
+    artwork = _create_artwork(tmp_path, 3000, 3000)
+    template = ProductTemplate(
+        key="mug-test",
+        printify_blueprint_id=9,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[PlacementRequirement("front", 1000, 1000)],
+    )
+
+    class DummyPrintifyMutableUpdate:
+        dry_run = False
+
+        def __init__(self):
+            self.update_calls = 0
+
+        def get_product(self, shop_id, product_id):
+            return {
+                "id": product_id,
+                "blueprint_id": 9,
+                "print_provider_id": 99,
+                "variants": [{"id": 101, "is_enabled": True}],
+                "print_areas": [{"placeholders": [{"position": "front"}]}],
+            }
+
+        def update_product(self, shop_id, product_id, payload):
+            self.update_calls += 1
+            return {"id": product_id, "status": "updated"}
+
+    dummy = DummyPrintifyMutableUpdate()
+    first_result = upsert_in_printify(
+        printify=dummy,
+        shop_id=1,
+        artwork=artwork,
+        template=template,
+        variant_rows=[{"id": 101, "is_available": True, "price": 1200, "options": {"color": "White", "size": "11oz"}}],
+        upload_map={"front": {"id": "upload-1"}},
+        existing_product_id="existing-mug",
+        action="update",
+        publish_mode="skip",
+        verify_publish=False,
+    )
+    second_result = upsert_in_printify(
+        printify=dummy,
+        shop_id=1,
+        artwork=artwork,
+        template=template,
+        variant_rows=[{"id": 101, "is_available": True, "price": 1300, "options": {"color": "White", "size": "11oz"}}],
+        upload_map={"front": {"id": "upload-1"}},
+        existing_product_id="existing-mug",
+        action="update",
+        publish_mode="skip",
+        verify_publish=False,
+        prior_state_row={"result": {"printify": first_result}},
+    )
+    assert second_result["action"] == "update"
+    assert dummy.update_calls == 2
+
+
 def test_upsert_in_printify_retries_8252_then_updates(tmp_path: Path, monkeypatch):
     import printify_shopify_sync_pipeline as pipeline
 
