@@ -2720,6 +2720,52 @@ def render_product_description(template: ProductTemplate, artwork: Artwork) -> s
         cleaned = re.sub(r"\s{2,}", " ", cleaned)
         return cleaned.strip()
 
+    def _is_sticker_template() -> bool:
+        hint = " ".join(
+            [
+                str(template.key or ""),
+                str(template.product_type_label or ""),
+                str(template.shopify_product_type or ""),
+            ]
+        ).lower()
+        return "sticker" in hint or "kiss-cut" in hint or "kiss cut" in hint
+
+    def _with_terminal_punctuation(text: str) -> str:
+        cleaned_text = sanitize_description_text(text)
+        if not cleaned_text:
+            return ""
+        if cleaned_text[-1] in ".!?":
+            return cleaned_text
+        return f"{cleaned_text}."
+
+    def _build_sticker_description() -> str:
+        artwork_title = str(context.get("artwork_title") or "").strip() or "This design"
+        normalized_metadata = _with_terminal_punctuation(metadata_description)
+        opener = f"{artwork_title} by InkVibe."
+
+        sentences: List[str] = [opener]
+        if normalized_metadata:
+            if normalized_metadata.lower() != opener.lower():
+                sentences.append(normalized_metadata)
+        else:
+            sentences.append("A distinctive art-forward sticker design with everyday display appeal.")
+
+        lowered_blob = " ".join(sentences).lower()
+        if "gift" not in lowered_blob:
+            sentences.append("An easy gift-ready choice for anyone who loves expressive art.")
+        if "sticker" not in lowered_blob:
+            sentences.append("Made for stickers and everyday display.")
+
+        stitched = " ".join(
+            row.strip()
+            for row in sentences
+            if row and row.strip()
+        )
+        return _sanitize_html(f"<p>{stitched}</p>")
+
+    if _is_sticker_template():
+        return _build_sticker_description()
+
     if not pattern or pattern in {"{artwork_title}", "<p>{artwork_title}</p>"}:
         if metadata_description:
             return _sanitize_html(generated.strip())
