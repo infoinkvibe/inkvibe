@@ -1592,6 +1592,52 @@ def test_render_description_uses_rich_metadata_context(tmp_path: Path):
     assert "<ul>" in description
 
 
+def test_sticker_description_adds_terminal_punctuation_when_metadata_lacks_it(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    art.metadata = {
+        "title": "Golden Trail Wolf",
+        "description": "A nature-inspired wolf design with a bold expressive look suited for stickers and everyday display",
+    }
+    template = _template_for_variant_tests()
+    template.key = "sticker_kisscut"
+    template.product_type_label = "Sticker"
+    template.shopify_product_type = "Stickers"
+    description = render_product_description(template, art)
+    assert "display. An easy gift-ready choice" in description
+    assert "display.An easy gift-ready choice" not in description
+
+
+def test_sticker_description_respects_existing_punctuation_and_avoids_duplicate_sticker_line(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    art.metadata = {
+        "title": "Golden Trail Wolf",
+        "description": "A nature-inspired wolf design with a bold expressive look suited for stickers and everyday display.",
+    }
+    template = _template_for_variant_tests()
+    template.key = "sticker_kisscut"
+    template.product_type_label = "Sticker"
+    template.shopify_product_type = "Stickers"
+    description = render_product_description(template, art)
+    assert description.count("everyday display.") == 1
+    assert "<p>Golden Trail Wolf by InkVibe." in description
+
+
+def test_sticker_description_wolf_preview_is_natural_sentence_block(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    art.metadata = {
+        "title": "Golden Trail Wolf",
+        "description": "A nature-inspired wolf design with a bold, expressive look suited for stickers and everyday display.",
+    }
+    template = _template_for_variant_tests()
+    template.key = "sticker_kisscut"
+    template.product_type_label = "Sticker"
+    template.shopify_product_type = "Stickers"
+    description = render_product_description(template, art)
+    assert description.startswith("<p>Golden Trail Wolf by InkVibe.")
+    assert "stickers and everyday display. An easy gift-ready choice" in description
+    assert description.endswith("</p>")
+
+
 def test_launch_plan_overrides_still_win_for_listing_copy(tmp_path: Path):
     art = _create_artwork(tmp_path, 1000, 1000)
     art.metadata = {
