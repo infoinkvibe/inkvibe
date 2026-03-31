@@ -6566,6 +6566,96 @@ def assess_update_compatibility(existing_product: Dict[str, Any], payload: Dict[
         "existing_print_provider_id": existing_provider,
     }
 
+
+def _stable_json_hash(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _build_rerun_fingerprints(
+    *,
+    artwork: Artwork,
+    template: ProductTemplate,
+    payload: Dict[str, Any],
+) -> Dict[str, str]:
+    enabled_variant_ids = sorted(
+        int(variant.get("id"))
+        for variant in payload.get("variants", [])
+        if isinstance(variant, dict) and variant.get("is_enabled", True) and variant.get("id") is not None
+    )
+    print_area_rows: List[Dict[str, Any]] = []
+    for area in payload.get("print_areas", []) if isinstance(payload.get("print_areas", []), list) else []:
+        if not isinstance(area, dict):
+            continue
+        area_variant_ids = sorted(int(variant_id) for variant_id in (area.get("variant_ids") or []))
+        placeholders: List[Dict[str, Any]] = []
+        for placeholder in area.get("placeholders", []) if isinstance(area.get("placeholders", []), list) else []:
+            if not isinstance(placeholder, dict):
+                continue
+            normalized_images: List[Dict[str, Any]] = []
+            for image in placeholder.get("images", []) if isinstance(placeholder.get("images", []), list) else []:
+                if not isinstance(image, dict):
+                    continue
+                normalized_images.append(
+                    {
+                        "id": str(image.get("id") or ""),
+                        "x": float(image.get("x") or 0.0),
+                        "y": float(image.get("y") or 0.0),
+                        "scale": float(image.get("scale") or 0.0),
+                        "angle": float(image.get("angle") or 0.0),
+                    }
+                )
+            placeholders.append({"position": str(placeholder.get("position") or ""), "images": normalized_images})
+        print_area_rows.append({"variant_ids": area_variant_ids, "placeholders": placeholders})
+
+    material_shape = {
+        "template_key": template.key,
+        "artwork_slug": artwork.slug,
+        "blueprint_id": int(payload.get("blueprint_id") or 0),
+        "print_provider_id": int(payload.get("print_provider_id") or 0),
+        "enabled_variant_ids": enabled_variant_ids,
+        "print_areas": print_area_rows,
+    }
+    mutable_listing = {
+        "title": str(payload.get("title") or ""),
+        "description": str(payload.get("description") or ""),
+        "tags": sorted(str(tag) for tag in (payload.get("tags") or [])),
+        "variants": sorted(
+            (
+                int(variant.get("id") or 0),
+                int(variant.get("price") or 0),
+                int(variant.get("compare_at_price") or 0),
+            )
+            for variant in payload.get("variants", [])
+            if isinstance(variant, dict)
+        ),
+    }
+    return {
+        "material_fingerprint": _stable_json_hash(material_shape),
+        "update_fingerprint": _stable_json_hash({"material_shape": material_shape, "mutable_listing": mutable_listing}),
+    }
+
+
+def _extract_prior_rerun_fingerprints(prior_state_row: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    if not isinstance(prior_state_row, dict):
+        return {"material_fingerprint": "", "update_fingerprint": ""}
+    candidates: List[Dict[str, Any]] = []
+    if isinstance(prior_state_row.get("rerun_fingerprints"), dict):
+        candidates.append(prior_state_row.get("rerun_fingerprints", {}))
+    row_result = prior_state_row.get("result", {}) if isinstance(prior_state_row.get("result"), dict) else {}
+    printify_result = row_result.get("printify", {}) if isinstance(row_result.get("printify"), dict) else {}
+    if isinstance(printify_result.get("rerun_fingerprints"), dict):
+        candidates.append(printify_result.get("rerun_fingerprints", {}))
+    for candidate in candidates:
+        material_fingerprint = str(candidate.get("material_fingerprint") or "").strip()
+        update_fingerprint = str(candidate.get("update_fingerprint") or "").strip()
+        if material_fingerprint or update_fingerprint:
+            return {
+                "material_fingerprint": material_fingerprint,
+                "update_fingerprint": update_fingerprint,
+            }
+    return {"material_fingerprint": "", "update_fingerprint": ""}
+
 def preview_listing_copy(*, artworks: List[Artwork], templates: List[ProductTemplate]) -> None:
     for artwork in artworks:
         for template in templates:
@@ -7227,6 +7317,7 @@ def upsert_in_printify(
     defer_publish: bool = False,
     state: Optional[Dict[str, Any]] = None,
     auto_rebuild_on_incompatible_update: bool = False,
+    prior_state_row: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     def _execute_create() -> Tuple[str, Dict[str, Any]]:
         try:
@@ -7263,11 +7354,18 @@ def upsert_in_printify(
             "printify_product_id": existing_product_id or "",
         }
     payload_stats = validate_printify_payload_consistency(payload)
+    rerun_fingerprints = _build_rerun_fingerprints(artwork=artwork, template=template, payload=payload)
+    prior_fingerprints = _extract_prior_rerun_fingerprints(prior_state_row)
     enforce_variant_safety_limit(template=template, enabled_variant_count=payload_stats["enabled_variant_count"])
     logger.info("Mockup/image publish behavior template=%s publish_images=%s publish_mockups_override=%s", template.key, template.publish_images, template.publish_mockups)
 
     if action == "skip":
-        return {"status": "skipped", "action": "skip", "printify_product_id": existing_product_id or ""}
+        return {
+            "status": "skipped",
+            "action": "skip",
+            "printify_product_id": existing_product_id or "",
+            "rerun_fingerprints": rerun_fingerprints,
+        }
 
     if action == "update" and not existing_product_id:
         raise RuntimeError("Cannot update product because no existing product_id was found")
@@ -7303,6 +7401,39 @@ def upsert_in_printify(
                 return {"status": "dry-run", "action": "create", "payload_preview": payload}
 
         if action == "update":
+            if prior_fingerprints["update_fingerprint"] and prior_fingerprints["update_fingerprint"] == rerun_fingerprints["update_fingerprint"]:
+                logger.info(
+                    "Rerun classification template=%s product_id=%s decision=skip_noop reason=unchanged_fingerprint",
+                    template.key,
+                    existing_product_id,
+                )
+                return {
+                    "status": "skipped",
+                    "action": "skip",
+                    "reason": "rerun_noop_unchanged_fingerprint",
+                    "printify_product_id": existing_product_id,
+                    "rerun_fingerprints": rerun_fingerprints,
+                    "rerun_decision": {"decision": "skip", "reason": "unchanged_fingerprint"},
+                }
+
+            if prior_fingerprints["material_fingerprint"] and prior_fingerprints["material_fingerprint"] == rerun_fingerprints["material_fingerprint"]:
+                logger.info(
+                    "Rerun classification template=%s product_id=%s decision=update reason=mutable_listing_changed",
+                    template.key,
+                    existing_product_id,
+                )
+            elif prior_fingerprints["material_fingerprint"]:
+                logger.info(
+                    "Rerun classification template=%s product_id=%s decision=update reason=material_shape_changed",
+                    template.key,
+                    existing_product_id,
+                )
+            else:
+                logger.info(
+                    "Rerun classification template=%s product_id=%s decision=update reason=no_prior_fingerprint",
+                    template.key,
+                    existing_product_id,
+                )
             compatibility = assess_update_compatibility(existing_product, payload)
             logger.info(
                 "Update preflight product_id=%s action=%s enabled_variant_count=%s print_area_variant_count=%s",
@@ -7432,6 +7563,7 @@ def upsert_in_printify(
     result["publish_verified"] = False
     result["publish_outcome"] = "create_success_publish_deferred" if defer_publish else "create_success_publish_success"
     result["publish_queue_status"] = ""
+    result["rerun_fingerprints"] = rerun_fingerprints
 
     if defer_publish and product_id and state is not None:
         enqueue_publish_pending(
@@ -7525,12 +7657,14 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
         state_key = f"{artwork.slug}:{template.key}"
         matching_rows = [row for row in record["products"] if isinstance(row, dict) and row.get("state_key") == state_key]
         existing_product_id = ""
+        latest_success_row: Optional[Dict[str, Any]] = None
         for row in reversed(matching_rows):
             row_result = row.get("result", {}) if isinstance(row.get("result"), dict) else {}
             printify_row = row_result.get("printify", {}) if isinstance(row_result.get("printify"), dict) else {}
             candidate = printify_row.get("printify_product_id")
             if isinstance(candidate, str) and candidate.strip() and row_result.get("error") is None:
                 existing_product_id = candidate.strip()
+                latest_success_row = row if isinstance(row, dict) else None
                 break
 
         action = resolve_product_action(
@@ -7993,6 +8127,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 defer_publish=defer_publish,
                 state=state,
                 auto_rebuild_on_incompatible_update=auto_rebuild_on_incompatible_update,
+                prior_state_row=latest_success_row,
             ) if (resolved_template.push_via_printify and shop_id is not None) else {"status": "prepared_only", "action": action, "publish_attempted": False, "publish_verified": False}
             printify_result_for_skip = result.get("printify", {}) if isinstance(result.get("printify"), dict) else {}
             if str(printify_result_for_skip.get("action") or "") == "skip":
@@ -8118,6 +8253,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 "featured_image_strategy": resolved_template.preferred_featured_image_strategy,
                 "featured_image_source": "verified_product_image_preference" if preferred_featured_candidate.get("selected_featured_mockup_src") else "printify_mockup_recommendation",
                 "tote_scale_strategy": "front_fill_boost_orientation_tuned" if resolved_template.key == "tote_basic" else "",
+                "rerun_fingerprints": printify_result.get("rerun_fingerprints", {}) if isinstance(printify_result.get("rerun_fingerprints", {}), dict) else {},
                 "result": result,
                 "dry_run": bool(printify.dry_run),
                 "completion_status": "dry-run-only" if printify.dry_run else "real-completed",
