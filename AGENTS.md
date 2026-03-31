@@ -1,34 +1,4 @@
 # AGENTS.md
-On the first run after introducing new rerun-state metadata, seeding that metadata is acceptable; after that, unchanged reruns should prefer skip/update over rebuild.
-
-## Current rerun/update priority
-
-The pipeline should not rely on rebuild as the normal rerun path.
-
-Desired rerun behavior:
-- If nothing material changed, prefer skip.
-- If only mutable listing/product fields changed, prefer update.
-- Use rebuild only as a fallback when Printify truly rejects compatibility or editability.
-
-When working on Printify update behavior:
-- Preserve existing create success behavior.
-- Preserve existing 404 / 8251 / 8252 recovery paths.
-- Prefer reducing unnecessary PUT/update calls over broad fallback expansion.
-- Treat repeated rebuild-on-rerun behavior as a bug to reduce, not a success state.
-
-## Material-change guidance
-
-When deciding whether a rerun should update:
-- Consider blueprint/provider, enabled variants, print-area variant ids, artwork/upload identity, placement transforms, and intended mutable listing fields.
-- If those are unchanged, prefer skip.
-- Do not rebuild just because the run was repeated.
-
-## Validation priority
-
-For rerun-related patches, validate:
-- first run create behavior remains intact
-- rerun of unchanged artwork/templates mostly skips or updates
-- rebuild remains available only for genuine incompatibility/edit-lock fallback
 
 ## Purpose
 
@@ -48,17 +18,71 @@ If a task can be completed with a narrow change, do that instead of restructurin
 2. Preserve current pricing, margin guardrails, provider/blueprint resolution, upload logic, publish queue behavior, and state handling.
 3. Improve customer-facing merchandising quality without destabilizing the pipeline.
 4. Prefer deterministic fallbacks when adding AI-assisted behavior.
+5. Prioritize correctness of artwork metadata and listing copy over aggressive cache reuse.
+
+## Current validated production baseline
+
+Current validated 7-template working baseline:
+
+- tshirt_gildan
+- sweatshirt_gildan
+- hoodie_gildan
+- mug_new
+- poster_basic
+- phone_case_basic
+- sticker_kisscut
+
+Expected rerun behavior for this baseline:
+- fresh create runs should succeed
+- unchanged reruns should mostly skip
+- update should happen only when material or intended mutable fields changed
+- rebuild should remain fallback only
 
 ## Current priorities
 
 Current development priority order:
 
-1. Improve product-page copy for the strongest categories first:
-   - hoodies
-   - mugs
-2. Improve titles, descriptions, tags, and SEO-style listing text so outputs feel less templated.
-3. Keep all existing automation behavior intact.
-4. Only after merchandising quality improves should more backend automation be expanded.
+1. Fix metadata / copy-source correctness so the right artwork always gets the right title, description, tags, and AI-generated copy.
+2. Continue improving product-page copy quality for the strongest categories and newly supported AI-copy families.
+3. Improve SEO/tag quality and merchandising QA.
+4. Preserve all existing automation behavior.
+5. Only after correctness and merchandising quality are stronger should more backend automation be expanded.
+6. Collections can be revisited later, after listing correctness and quality are stable.
+
+## Current rerun/update priority
+
+The pipeline should not rely on rebuild as the normal rerun path.
+
+Desired rerun behavior:
+- If nothing material changed, prefer skip.
+- If only mutable listing/product fields changed, prefer update.
+- Use rebuild only as a fallback when Printify truly rejects compatibility or editability.
+
+When working on Printify update behavior:
+- Preserve existing create success behavior.
+- Preserve existing 404 / 8251 / 8252 recovery paths.
+- Prefer reducing unnecessary PUT/update calls over broad fallback expansion.
+- Treat repeated rebuild-on-rerun behavior as a bug to reduce, not a success state.
+- On the first run after introducing new rerun-state metadata, seeding that metadata is acceptable; after that, unchanged reruns should prefer skip/update over rebuild.
+
+## Material-change guidance
+
+When deciding whether a rerun should update:
+- Consider blueprint/provider, enabled variants, print-area variant ids, artwork/upload identity, placement transforms, and intended mutable listing fields.
+- If those are unchanged, prefer skip.
+- Do not rebuild just because the run was repeated.
+
+## Metadata and copy correctness priority
+
+Customer-facing titles, descriptions, tags, SEO fields, and AI-generated copy must always belong to the correct artwork and product family.
+
+When resolving metadata or cached AI copy:
+- Prefer exact artwork-sidecar identity over fuzzy matching.
+- Do not reuse cached copy across different artworks.
+- If metadata candidates are ambiguous, prefer safe fallback over wrong assignment.
+- Correctness is more important than cache reuse.
+- Avoid silently cross-matching based only on weak slug similarity.
+- If identity is unclear, log the ambiguity at a high level and fall back safely.
 
 ## Repo change philosophy
 
@@ -85,6 +109,7 @@ Do not casually modify these areas:
 - state persistence behavior
 - Shopify collection sync behavior
 - retry / rate-limit handling
+- rerun fingerprint logic that is already working for unchanged reruns
 
 If a task touches one of these, keep the patch minimal and explain the impact clearly.
 
@@ -97,6 +122,8 @@ These are preferred areas for improvement:
 - SEO metadata quality
 - copy sanitization
 - metadata enrichment
+- metadata identity validation
+- AI copy cache identity validation
 - category-specific merchandising logic
 - fallback copy behavior
 - caching of generated copy
@@ -121,9 +148,20 @@ New features should plug into these flows instead of bypassing them.
 
 ## AI-assisted copy generation rules
 
-If implementing AI-assisted product copy:
+Current supported AI-copy families:
 
-- Scope phase 1 to hoodie and mug families only.
+- hoodie
+- mug
+- tshirt
+- sweatshirt
+- poster
+- phone_case
+
+Current excluded family:
+- sticker
+
+If implementing or changing AI-assisted product copy:
+
 - Keep all non-copy business logic deterministic.
 - Use AI only for customer-facing copy fields such as:
   - title
@@ -144,10 +182,9 @@ If implementing AI-assisted product copy:
 - If AI generation fails, the pipeline must still complete successfully using existing copy logic.
 - Prefer structured output and validation over free-form text scraping.
 - Cache generated copy so repeated runs do not regenerate unnecessarily.
+- Cache reuse must be identity-safe for the current artwork and family/template.
 
 ## Merchandising guidance
-
-For category copy:
 
 ### Hoodies
 Prioritize:
@@ -173,6 +210,56 @@ Prioritize:
 
 Avoid generic filler and repetitive phrasing.
 
+### T-Shirts
+Prioritize:
+- wearable everyday art
+- easy styling
+- giftability
+- simple expressive design
+- casual versatility
+
+### Sweatshirts
+Prioritize:
+- comfort
+- cozy layering
+- casual warmth
+- relaxed daily wear
+- giftability
+
+### Posters
+Prioritize:
+- wall decor
+- room mood
+- visual centerpiece
+- giftable art
+- simple display value
+
+### Phone Cases
+Prioritize:
+- expressive everyday utility
+- giftability
+- visual personality
+- practical carry item
+- accessory-style phrasing
+
+### Stickers
+Sticker economics and priority remain weaker than the core categories.
+Do not spend disproportionate effort on sticker merchandising unless explicitly requested.
+
+## Validation priority
+
+For rerun-related patches, validate:
+- first run create behavior remains intact
+- rerun of unchanged artwork/templates mostly skips or updates
+- rebuild remains available only for genuine incompatibility/edit-lock fallback
+
+For metadata/copy correctness patches, validate:
+- exact sidecar match wins over fuzzy/fallback matching
+- ambiguous slug/fallback matching does not cross-assign wrong metadata
+- AI copy cache does not leak across artworks
+- correct artwork/template cache reuse still works
+- no regression to existing rerun skip behavior
+
 ## Testing expectations
 
 When changing behavior:
@@ -182,13 +269,16 @@ When changing behavior:
 - prefer narrow tests around the changed behavior
 - keep existing behavior unchanged outside the scoped feature
 
-If adding AI copy generation, test at minimum:
+If changing AI copy or metadata/copy resolution, test at minimum:
 
 - disabled AI path falls back cleanly
 - missing API key falls back cleanly
-- hoodie path can use generated copy
-- mug path can use generated copy
-- other product families still use existing deterministic copy
+- supported family path can use generated copy
+- unsupported families still use deterministic copy
+- exact sidecar match wins
+- ambiguous metadata does not cross-assign
+- AI copy cache does not leak across artworks
+- unchanged reruns still skip on the current baseline
 
 ## Logging expectations
 
@@ -198,6 +288,9 @@ When adding new behavior:
 - do not add noisy logs for every tiny step
 - log fallback activation when AI copy is skipped or fails
 - log cache hit vs cache miss for generated copy where practical
+- log metadata source chosen at a high level
+- log cache bypass reason when identity validation fails
+- avoid giant payload dumps unless debug-only
 
 ## File and code style expectations
 
@@ -229,7 +322,8 @@ Do not:
 - silently change pricing behavior
 - silently change publish behavior
 - silently change template selection behavior
-- broaden AI-generated behavior to all categories in phase 1
+- silently broaden fuzzy metadata matching
+- silently reuse cached copy across different artworks
 
 ## Preferred implementation style for copy improvements
 
@@ -243,4 +337,4 @@ When possible:
 
 ## Default assumption
 
-If something is ambiguous, choose the safer option that preserves current production behavior.
+If something is ambiguous, choose the safer option that preserves current production behavior and favors correctness over convenience.
