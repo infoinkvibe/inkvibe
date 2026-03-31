@@ -1,5 +1,35 @@
 # AGENTS.md
 
+
+## Current rerun/update priority
+
+The pipeline should not rely on rebuild as the normal rerun path.
+
+Desired rerun behavior:
+- If nothing material changed, prefer skip.
+- If only mutable listing/product fields changed, prefer update.
+- Use rebuild only as a fallback when Printify truly rejects compatibility or editability.
+
+When working on Printify update behavior:
+- Preserve existing create success behavior.
+- Preserve existing 404 / 8251 / 8252 recovery paths.
+- Prefer reducing unnecessary PUT/update calls over broad fallback expansion.
+- Treat repeated rebuild-on-rerun behavior as a bug to reduce, not a success state.
+
+## Material-change guidance
+
+When deciding whether a rerun should update:
+- Consider blueprint/provider, enabled variants, print-area variant ids, artwork/upload identity, placement transforms, and intended mutable listing fields.
+- If those are unchanged, prefer skip.
+- Do not rebuild just because the run was repeated.
+
+## Validation priority
+
+For rerun-related patches, validate:
+- first run create behavior remains intact
+- rerun of unchanged artwork/templates mostly skips or updates
+- rebuild remains available only for genuine incompatibility/edit-lock fallback
+
 ## Purpose
 
 This repository powers the InkVibeAuto print-on-demand pipeline for creating and syncing products to Printify and Shopify.
