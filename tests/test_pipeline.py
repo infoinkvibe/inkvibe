@@ -7638,12 +7638,16 @@ def test_storefront_mockup_qa_captures_publish_flags():
     assert "mockups_channel_provider_dependent_selection" in warnings
 
 
-def test_run_storefront_qa_non_mutating_and_exports(tmp_path: Path):
+def test_run_storefront_qa_non_mutating_and_exports(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     class DummyPrintify:
         dry_run = False
 
         def list_variants(self, blueprint_id, provider_id):
             return [{"id": 1, "is_available": True, "options": {"color": "Black", "size": "M"}, "price": 1200}]
+
+    # Keep this QA export test deterministic regardless of prior test order.
+    monkeypatch.setattr("printify_shopify_sync_pipeline.AI_PRODUCT_COPY_SETTINGS.enabled", False)
+    monkeypatch.setattr("printify_shopify_sync_pipeline.AI_PRODUCT_COPY_SETTINGS.api_key", "")
 
     artwork = _qa_artwork(tmp_path)
     template = _qa_template()
@@ -7659,6 +7663,7 @@ def test_run_storefront_qa_non_mutating_and_exports(tmp_path: Path):
     assert len(rows) == 1
     assert rows[0].metadata_resolution_source == "fallback"
     assert rows[0].copy_provenance == "deterministic_fallback"
+    assert rows[0].ai_product_copy_cache_reason == "cache_bucket_missing"
     assert csv_path.exists()
     assert json_path.exists()
     exported = csv_path.read_text(encoding="utf-8")
