@@ -959,6 +959,8 @@ FAMILY_COLLECTION_RULES: Dict[str, Dict[str, str]] = {
     "sticker": {"handle": "stickers", "title": "Stickers", "department_key": "accessories", "department_label": "Accessories"},
     "canvas": {"handle": "canvas-prints", "title": "Canvas Prints", "department_key": "home-decor", "department_label": "Home Decor"},
     "blanket": {"handle": "blankets", "title": "Blankets", "department_key": "home-decor", "department_label": "Home Decor"},
+    "throw_pillow": {"handle": "throw-pillows", "title": "Throw Pillows", "department_key": "home-decor", "department_label": "Home Decor"},
+    "embroidered_hat": {"handle": "embroidered-hats", "title": "Embroidered Hats", "department_key": "accessories", "department_label": "Accessories"},
 }
 
 THEME_NORMALIZATION_PATTERNS: Dict[str, Tuple[str, ...]] = {
@@ -2048,8 +2050,12 @@ def _template_intended_family(template: ProductTemplate) -> str:
         return "tumbler"
     if "travel_mug" in hint or "travel mug" in hint:
         return "travel_mug"
+    if "throw_pillow" in hint or "throw pillow" in hint or "pillow" in hint:
+        return "throw_pillow"
     if "blanket" in hint or "throw" in hint or "fleece" in hint:
         return "blanket"
+    if "embroidered_hat" in hint or "embroidered hat" in hint:
+        return "embroidered_hat"
     return "other"
 
 
@@ -2112,6 +2118,20 @@ def _looks_like_blanket_size(value: str) -> bool:
     if "blanket" in normalized or "throw" in normalized:
         return True
     return bool(re.search(r"\d{1,3}\s*(?:\"|in)\s*[x×]\s*\d{1,3}\s*(?:\"|in)?", normalized))
+
+
+def _looks_like_throw_pillow_size(value: str) -> bool:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return False
+    if "pillow" in normalized:
+        return True
+    match = re.search(r"(\d{1,3})\s*(?:\"|in)\s*[x×]\s*(\d{1,3})\s*(?:\"|in)?", normalized)
+    if not match:
+        return False
+    width = int(match.group(1))
+    height = int(match.group(2))
+    return abs(width - height) <= 4
 
 
 def _looks_like_framed_poster_size(value: str) -> bool:
@@ -2307,6 +2327,46 @@ def validate_catalog_family_schema(
             )
         return CatalogFamilyValidationResult(intended_family=intended_family, plausible=True)
 
+    if intended_family == "throw_pillow":
+        has_size_dimension = any(token in option_name_tokens for token in ("size", "dimensions"))
+        size_values = option_values_summary.get("size", []) + option_values_summary.get("dimensions", [])
+        has_pillow_sizes = any(_looks_like_throw_pillow_size(value) for value in size_values)
+        has_material_signal = any(token in all_values for token in ("polyester", "linen", "spun", "faux suede", "insert", "cover"))
+        has_title_signal = any(token in title_tokens for token in ("pillow", "throw pillow", "pillow cover"))
+        wrong_family_title = any(token in title_tokens for token in ("hoodie", "t-shirt", "sweatshirt", "phone case", "sticker", "canvas", "blanket"))
+        if wrong_family_title:
+            return CatalogFamilyValidationResult(
+                intended_family=intended_family,
+                plausible=False,
+                reason="Throw pillow schema mismatch: blueprint/provider title indicates a different product family.",
+            )
+        if not ((has_size_dimension and has_pillow_sizes) or has_material_signal or has_title_signal):
+            return CatalogFamilyValidationResult(
+                intended_family=intended_family,
+                plausible=False,
+                reason=f"Throw pillow schema mismatch: missing pillow-like square dimensions/material/title hints. option_names={option_names}",
+            )
+        return CatalogFamilyValidationResult(intended_family=intended_family, plausible=True)
+
+    if intended_family == "embroidered_hat":
+        option_names_flat = " ".join(option_name_tokens)
+        has_hat_signal = any(token in title_tokens for token in ("hat", "cap", "dad hat", "trucker"))
+        has_embroidery_signal = any(token in title_tokens for token in ("embroidered", "embroidery")) or ("embroid" in option_names_flat)
+        wrong_family_title = any(token in title_tokens for token in ("hoodie", "t-shirt", "sweatshirt", "phone case", "sticker", "blanket", "poster"))
+        if wrong_family_title:
+            return CatalogFamilyValidationResult(
+                intended_family=intended_family,
+                plausible=False,
+                reason="Embroidered hat schema mismatch: blueprint/provider title indicates a different product family.",
+            )
+        if not (has_hat_signal and has_embroidery_signal):
+            return CatalogFamilyValidationResult(
+                intended_family=intended_family,
+                plausible=False,
+                reason=f"Embroidered hat schema mismatch: missing hat+embroidery signals. option_names={option_names}",
+            )
+        return CatalogFamilyValidationResult(intended_family=intended_family, plausible=True)
+
     return CatalogFamilyValidationResult(intended_family=intended_family, plausible=True)
 
 
@@ -2383,6 +2443,8 @@ def _discover_family_catalog_mapping(
         "tumbler": ["tumbler", "skinny tumbler", "20oz tumbler"],
         "travel_mug": ["travel mug", "commuter mug", "insulated travel mug"],
         "blanket": ["blanket", "throw blanket", "fleece blanket"],
+        "throw_pillow": ["throw pillow", "pillow", "pillow cover"],
+        "embroidered_hat": ["embroidered hat", "dad hat embroidery", "trucker cap embroidery"],
     }
     queries = family_queries.get(intended_family, [])
     discovery_cache_key = f"family_discovery:{template.key}:{intended_family}:{template.printify_blueprint_id}:{template.printify_print_provider_id}"
@@ -2480,6 +2542,21 @@ def _discover_family_catalog_mapping(
                     score += 500
                 if "fleece" in title_blob or "sherpa" in title_blob:
                     score += 200
+            elif intended_family == "throw_pillow":
+                lowered = {name.lower() for name in option_names}
+                if "size" in lowered or "dimensions" in lowered:
+                    score += 700
+                title_blob = f"{blueprint_title} {provider_title}".lower()
+                if "pillow" in title_blob:
+                    score += 500
+                if "cover" in title_blob:
+                    score += 150
+            elif intended_family == "embroidered_hat":
+                title_blob = f"{blueprint_title} {provider_title}".lower()
+                if "hat" in title_blob or "cap" in title_blob:
+                    score += 400
+                if "embroider" in title_blob:
+                    score += 700
             if _provider_is_printify_choice(provider):
                 score += 200
             if score > best_score:

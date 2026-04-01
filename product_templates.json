@@ -755,9 +755,11 @@
     "key": "blanket_basic",
     "printify_blueprint_id": 50,
     "printify_print_provider_id": 1,
+    "pinned_blueprint_id": 50,
+    "pinned_provider_id": 1,
     "provider_selection_strategy": "prefer_printify_choice_then_ranked",
     "fallback_provider_allowed": true,
-    "active": false,
+    "active": true,
     "high_resolution_family": true,
     "skip_if_artwork_below_threshold": true,
     "min_source_width": 6000,
@@ -805,6 +807,72 @@
         "placement_name": "front",
         "width_px": 6000,
         "height_px": 4800,
+        "file_type": "png",
+        "allow_upscale": false,
+        "artwork_fit_mode": "cover"
+      }
+    ],
+    "min_margin_after_shipping": "6.00",
+    "target_margin_after_shipping": "9.00",
+    "shipping_basis_for_margin": "cost",
+    "disable_variants_below_margin_floor": true,
+    "reprice_variants_to_margin_floor": true,
+    "mark_template_nonviable_if_needed": true
+  },
+  {
+    "key": "throw_pillow_basic",
+    "printify_blueprint_id": 9,
+    "printify_print_provider_id": 1,
+    "provider_selection_strategy": "prefer_printify_choice_then_ranked",
+    "fallback_provider_allowed": true,
+    "active": false,
+    "high_resolution_family": true,
+    "skip_if_artwork_below_threshold": true,
+    "min_source_width": 4500,
+    "min_source_height": 4500,
+    "min_source_short_edge": 4200,
+    "min_effective_cover_ratio": 1.0,
+    "title_pattern": "{artwork_title} Throw Pillow",
+    "description_pattern": "<p>{generated_description}</p>",
+    "enabled_colors": [],
+    "enabled_sizes": [
+      "18\" × 18\""
+    ],
+    "max_enabled_variants": 4,
+    "tags": [
+      "throw pillow",
+      "home decor"
+    ],
+    "seo_keywords": [
+      "throw pillow cover",
+      "home decor gift"
+    ],
+    "audience": "home decor shoppers",
+    "product_type_label": "Throw Pillow",
+    "style_keywords": [
+      "cozy",
+      "giftable"
+    ],
+    "shopify_product_type": "Home Decor",
+    "publish_to_shopify": false,
+    "push_via_printify": true,
+    "publish_after_create": true,
+    "publish_title": true,
+    "publish_description": true,
+    "publish_images": true,
+    "publish_variants": true,
+    "publish_tags": true,
+    "default_price": "36.99",
+    "base_price": "27.99",
+    "markup_type": "fixed",
+    "markup_value": "9.00",
+    "rounding_mode": "x_99",
+    "compare_at_price": "46.99",
+    "placements": [
+      {
+        "placement_name": "front",
+        "width_px": 4500,
+        "height_px": 4500,
         "file_type": "png",
         "allow_upscale": false,
         "artwork_fit_mode": "cover"
