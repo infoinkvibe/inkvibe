@@ -2042,6 +2042,12 @@ def _template_intended_family(template: ProductTemplate) -> str:
         return "sticker"
     if "canvas" in hint or "wall art" in hint:
         return "canvas"
+    if "framed_poster" in hint or "framed poster" in hint:
+        return "framed_poster"
+    if "tumbler" in hint:
+        return "tumbler"
+    if "travel_mug" in hint or "travel mug" in hint:
+        return "travel_mug"
     if "blanket" in hint or "throw" in hint or "fleece" in hint:
         return "blanket"
     return "other"
@@ -2106,6 +2112,22 @@ def _looks_like_blanket_size(value: str) -> bool:
     if "blanket" in normalized or "throw" in normalized:
         return True
     return bool(re.search(r"\d{1,3}\s*(?:\"|in)\s*[x×]\s*\d{1,3}\s*(?:\"|in)?", normalized))
+
+
+def _looks_like_framed_poster_size(value: str) -> bool:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return False
+    if "vertical" in normalized or "horizontal" in normalized:
+        return True
+    return bool(re.search(r"\d{1,3}\s*(?:\"|″|in)\s*[x×]\s*\d{1,3}\s*(?:\"|″|in)?", normalized))
+
+
+def _looks_like_drinkware_capacity(value: str) -> bool:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return False
+    return bool(re.search(r"\b\d{1,2}\s*(?:oz|ounce|ounces)\b", normalized))
 
 
 def validate_catalog_family_schema(
@@ -2203,6 +2225,56 @@ def validate_catalog_family_schema(
                 intended_family=intended_family,
                 plausible=False,
                 reason=f"Canvas schema mismatch: missing canvas-like dimensions/title hints. option_names={option_names}",
+            )
+        return CatalogFamilyValidationResult(intended_family=intended_family, plausible=True)
+
+    if intended_family == "framed_poster":
+        has_size_dimension = any(token in option_name_tokens for token in ("size", "dimensions"))
+        size_values = option_values_summary.get("size", []) + option_values_summary.get("dimensions", [])
+        has_framed_sizes = any(_looks_like_framed_poster_size(value) for value in size_values)
+        has_frame_dimension = any(token in option_name_tokens for token in ("frame", "frame color", "frame color/mat", "frame/mat"))
+        has_title_signal = any(token in title_tokens for token in ("framed poster", "framed print", "framed art"))
+        wrong_family_title = any(token in title_tokens for token in ("hoodie", "t-shirt", "sweatshirt", "phone case", "sticker", "mug", "tumbler", "travel mug"))
+        if wrong_family_title:
+            return CatalogFamilyValidationResult(
+                intended_family=intended_family,
+                plausible=False,
+                reason="Framed poster schema mismatch: blueprint/provider title indicates a different product family.",
+            )
+        if not ((has_size_dimension and has_framed_sizes) and (has_frame_dimension or has_title_signal)):
+            return CatalogFamilyValidationResult(
+                intended_family=intended_family,
+                plausible=False,
+                reason=f"Framed poster schema mismatch: missing framed-poster size/frame schema. option_names={option_names}",
+            )
+        return CatalogFamilyValidationResult(intended_family=intended_family, plausible=True)
+
+    if intended_family in {"tumbler", "travel_mug"}:
+        has_capacity_dimension = any(token in option_name_tokens for token in ("size", "capacity"))
+        capacity_values = option_values_summary.get("size", []) + option_values_summary.get("capacity", [])
+        has_capacity_values = any(_looks_like_drinkware_capacity(value) for value in capacity_values)
+        has_color_or_finish = any(token in option_name_tokens for token in ("color", "finish", "surface"))
+        if intended_family == "tumbler":
+            title_keywords = ("tumbler", "skinny tumbler")
+            wrong_keywords = ("travel mug", "phone case", "sticker", "hoodie", "t-shirt")
+            mismatch_reason = "Tumbler schema mismatch: missing tumbler capacity schema/title hints."
+        else:
+            title_keywords = ("travel mug", "commuter mug")
+            wrong_keywords = ("tumbler", "phone case", "sticker", "hoodie", "t-shirt")
+            mismatch_reason = "Travel mug schema mismatch: missing travel-mug capacity schema/title hints."
+        has_title_signal = any(token in title_tokens for token in title_keywords)
+        wrong_family_title = any(token in title_tokens for token in wrong_keywords)
+        if wrong_family_title:
+            return CatalogFamilyValidationResult(
+                intended_family=intended_family,
+                plausible=False,
+                reason=f"{'Tumbler' if intended_family == 'tumbler' else 'Travel mug'} schema mismatch: blueprint/provider title indicates a different product family.",
+            )
+        if not ((has_capacity_dimension and has_capacity_values and has_color_or_finish) or has_title_signal):
+            return CatalogFamilyValidationResult(
+                intended_family=intended_family,
+                plausible=False,
+                reason=f"{mismatch_reason} option_names={option_names}",
             )
         return CatalogFamilyValidationResult(intended_family=intended_family, plausible=True)
 
@@ -2307,6 +2379,9 @@ def _discover_family_catalog_mapping(
         "phone_case": ["phone case", "tough case", "slim case"],
         "sticker": ["kiss-cut sticker", "sticker", "die-cut sticker"],
         "canvas": ["canvas", "framed canvas", "wall art"],
+        "framed_poster": ["framed poster", "framed print", "framed art"],
+        "tumbler": ["tumbler", "skinny tumbler", "20oz tumbler"],
+        "travel_mug": ["travel mug", "commuter mug", "insulated travel mug"],
         "blanket": ["blanket", "throw blanket", "fleece blanket"],
     }
     queries = family_queries.get(intended_family, [])
@@ -2377,6 +2452,25 @@ def _discover_family_catalog_mapping(
                     score += 500
                 if "wall art" in blueprint_title.lower():
                     score += 200
+            elif intended_family == "framed_poster":
+                lowered = {name.lower() for name in option_names}
+                if "size" in lowered or "dimensions" in lowered:
+                    score += 800
+                if any(token in lowered for token in ("frame", "frame color", "frame color/mat")):
+                    score += 500
+                if "framed" in blueprint_title.lower():
+                    score += 400
+            elif intended_family in {"tumbler", "travel_mug"}:
+                lowered = {name.lower() for name in option_names}
+                if "size" in lowered or "capacity" in lowered:
+                    score += 700
+                if any(token in lowered for token in ("color", "finish", "surface")):
+                    score += 200
+                title_blob = f"{blueprint_title} {provider_title}".lower()
+                if intended_family == "tumbler" and "tumbler" in title_blob:
+                    score += 500
+                if intended_family == "travel_mug" and "travel mug" in title_blob:
+                    score += 500
             elif intended_family == "blanket":
                 lowered = {name.lower() for name in option_names}
                 if "size" in lowered or "dimensions" in lowered:

@@ -545,8 +545,8 @@
   },
   {
     "key": "canvas_basic",
-    "printify_blueprint_id": 13,
-    "printify_print_provider_id": 1,
+    "printify_blueprint_id": 944,
+    "printify_print_provider_id": 105,
     "provider_selection_strategy": "pinned_then_printify_choice_then_lowest_cost",
     "fallback_provider_allowed": true,
     "active": true,
@@ -609,8 +609,8 @@
     "disable_variants_below_margin_floor": true,
     "reprice_variants_to_margin_floor": true,
     "mark_template_nonviable_if_needed": true,
-    "pinned_provider_id": 1,
-    "pinned_blueprint_id": 13,
+    "pinned_provider_id": 105,
+    "pinned_blueprint_id": 944,
     "preferred_mockup_types": [
       "lifestyle",
       "wall-art",
