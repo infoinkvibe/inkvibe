@@ -378,6 +378,11 @@
       "clean",
       "playful"
     ],
+    "tags": [
+      "mug",
+      "coffee mug",
+      "giftable drinkware"
+    ],
     "enabled_variant_option_filters": {
       "color": [],
       "size": [
@@ -1016,6 +1021,11 @@
       "gallery",
       "giftable"
     ],
+    "tags": [
+      "framed poster",
+      "wall art",
+      "framed decor"
+    ],
     "shopify_product_type": "Home Decor",
     "poster_safe_max_upscale_factor": 1.55,
     "poster_safe_min_source_ratio": 0.34,
@@ -1102,6 +1112,11 @@
       "practical",
       "giftable"
     ],
+    "tags": [
+      "tumbler",
+      "insulated drinkware",
+      "giftable tumbler"
+    ],
     "shopify_product_type": "Drinkware",
     "preferred_mockup_colors": [
       "White"
@@ -1180,6 +1195,11 @@
     "style_keywords": [
       "practical",
       "giftable"
+    ],
+    "tags": [
+      "travel mug",
+      "commuter drinkware",
+      "giftable mug"
     ],
     "shopify_product_type": "Drinkware",
     "preferred_mockup_colors": [
