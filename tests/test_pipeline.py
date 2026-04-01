@@ -121,6 +121,7 @@ from printify_shopify_sync_pipeline import (
     choose_best_theme_signal,
     choose_preferred_featured_variant_color,
     choose_preferred_featured_mockup_candidate,
+    reorder_variants_for_storefront_display,
     resolve_family_collection_target,
     select_provider_for_template,
     preflight_active_templates,
@@ -1498,6 +1499,75 @@ def test_sticker_template_remains_without_expanded_colors():
     templates = load_templates(Path("product_templates.json"))
     sticker = next(template for template in templates if template.key == "sticker_kisscut")
     assert sticker.expanded_enabled_colors == []
+
+
+def test_storefront_display_color_rotation_is_template_scoped_to_apparel():
+    templates = load_templates(Path("product_templates.json"))
+    mug = next(template for template in templates if template.key == "mug_new")
+    tee = next(template for template in templates if template.key == "tshirt_gildan")
+    assert mug.storefront_display_color_priority == []
+    assert mug.storefront_default_color_candidates == []
+    assert tee.storefront_display_color_priority
+    assert tee.storefront_default_color_candidates == ["Dark Heather", "Military Green", "White"]
+
+
+def test_storefront_display_color_rotation_preserves_enabled_apparel_colors():
+    templates = load_templates(Path("product_templates.json"))
+    tee = next(template for template in templates if template.key == "tshirt_gildan")
+    sweatshirt = next(template for template in templates if template.key == "sweatshirt_gildan")
+    hoodie = next(template for template in templates if template.key == "hoodie_gildan")
+    assert tee.enabled_colors == ["Black", "White", "Navy", "Sport Grey", "Sand"]
+    assert sweatshirt.enabled_colors == ["Black", "White", "Navy", "Sport Grey", "Sand"]
+    assert hoodie.enabled_colors == ["Black", "White", "Navy", "Sport Grey", "Sand"]
+
+
+def test_reorder_variants_for_storefront_display_is_deterministic(tmp_path: Path):
+    art = _create_artwork(tmp_path, 3000, 3000)
+    template = ProductTemplate(
+        key="tshirt_gildan",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        storefront_display_color_priority=["Dark Heather", "Military Green", "White"],
+        storefront_display_color_rotation_seed="seed-v1",
+        storefront_default_color_candidates=["Dark Heather", "Military Green", "White"],
+    )
+    variants = [
+        {"id": 3, "options": {"color": "White", "size": "M"}},
+        {"id": 2, "options": {"color": "Military Green", "size": "M"}},
+        {"id": 1, "options": {"color": "Dark Heather", "size": "M"}},
+    ]
+    first = reorder_variants_for_storefront_display(template=template, artwork=art, variant_rows=variants)
+    second = reorder_variants_for_storefront_display(template=template, artwork=art, variant_rows=variants)
+    assert [row["id"] for row in first] == [row["id"] for row in second]
+    assert first[0]["options"]["color"] in {"Dark Heather", "Military Green"}
+
+
+def test_reorder_variants_for_storefront_display_falls_back_to_white(tmp_path: Path):
+    art = _create_artwork(tmp_path, 3000, 3000)
+    template = ProductTemplate(
+        key="tshirt_gildan",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        storefront_display_color_priority=["Dark Heather", "Military Green", "White"],
+        storefront_display_color_rotation_seed="seed-v1",
+        storefront_default_color_candidates=["Dark Heather", "Military Green", "White"],
+    )
+    variants = [
+        {"id": 10, "options": {"color": "White", "size": "M"}},
+        {"id": 11, "options": {"color": "White", "size": "L"}},
+    ]
+    reordered = reorder_variants_for_storefront_display(template=template, artwork=art, variant_rows=variants)
+    assert reordered[0]["options"]["color"] == "White"
+
+
+def test_product_templates_keep_validated_baseline_keys_present():
+    templates = load_templates(Path("product_templates.json"))
+    loaded_keys = {template.key for template in templates}
+    assert set(PRODUCTION_BASELINE_TEMPLATE_KEYS).issubset(loaded_keys)
 
 
 def test_should_enable_progress_respects_tty_and_overrides(monkeypatch: pytest.MonkeyPatch):
@@ -4695,6 +4765,75 @@ def test_upsert_in_printify_skips_noop_rerun_when_fingerprint_unchanged(tmp_path
         artwork=artwork,
         template=template,
         variant_rows=[{"id": 101, "is_available": True, "price": 1200, "options": {"color": "White", "size": "M"}}],
+        upload_map={"front": {"id": "upload-1"}},
+        existing_product_id="existing-1",
+        action="update",
+        publish_mode="skip",
+        verify_publish=False,
+        prior_state_row={"result": {"printify": first_result}},
+    )
+    assert second_result["action"] == "skip"
+    assert second_result["reason"] == "rerun_noop_unchanged_fingerprint"
+    assert dummy.update_calls == 1
+
+
+def test_storefront_color_rotation_keeps_noop_rerun_skip_behavior(tmp_path: Path):
+    artwork = _create_artwork(tmp_path, 3000, 3000)
+    template = ProductTemplate(
+        key="tshirt_gildan",
+        printify_blueprint_id=9,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[PlacementRequirement("front", 1000, 1000)],
+        storefront_display_color_priority=["Dark Heather", "Military Green", "White"],
+        storefront_display_color_rotation_seed="seed-v1",
+        storefront_default_color_candidates=["Dark Heather", "Military Green", "White"],
+    )
+
+    class DummyPrintifyNoopRerun:
+        dry_run = False
+
+        def __init__(self):
+            self.update_calls = 0
+
+        def get_product(self, shop_id, product_id):
+            return {
+                "id": product_id,
+                "blueprint_id": 9,
+                "print_provider_id": 99,
+                "variants": [{"id": 101, "is_enabled": True}, {"id": 102, "is_enabled": True}],
+                "print_areas": [{"placeholders": [{"position": "front"}]}],
+            }
+
+        def update_product(self, shop_id, product_id, payload):
+            self.update_calls += 1
+            return {"id": product_id}
+
+    dummy = DummyPrintifyNoopRerun()
+    base_variants = [
+        {"id": 101, "is_available": True, "price": 1200, "options": {"color": "Dark Heather", "size": "M"}},
+        {"id": 102, "is_available": True, "price": 1200, "options": {"color": "Military Green", "size": "M"}},
+    ]
+    ordered_variants = reorder_variants_for_storefront_display(template=template, artwork=artwork, variant_rows=base_variants)
+    first_result = upsert_in_printify(
+        printify=dummy,
+        shop_id=1,
+        artwork=artwork,
+        template=template,
+        variant_rows=ordered_variants,
+        upload_map={"front": {"id": "upload-1"}},
+        existing_product_id="existing-1",
+        action="update",
+        publish_mode="skip",
+        verify_publish=False,
+    )
+    second_result = upsert_in_printify(
+        printify=dummy,
+        shop_id=1,
+        artwork=artwork,
+        template=template,
+        variant_rows=ordered_variants,
         upload_map={"front": {"id": "upload-1"}},
         existing_product_id="existing-1",
         action="update",

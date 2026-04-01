@@ -551,6 +551,9 @@ class ProductTemplate:
     min_source_long_edge: Optional[int] = None
     min_effective_cover_ratio: Optional[float] = None
     expanded_enabled_colors: List[str] = field(default_factory=list)
+    storefront_display_color_priority: List[str] = field(default_factory=list)
+    storefront_display_color_rotation_seed: Optional[str] = None
+    storefront_default_color_candidates: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1000,6 +1003,84 @@ def _normalize_color_name(value: str) -> str:
 def _is_white_like_color(value: str) -> bool:
     normalized = _normalize_color_name(value)
     return normalized in {"white", "white glossy", "snowwhite"}
+
+
+def _choose_rotated_storefront_display_color(
+    *,
+    template: ProductTemplate,
+    available_colors: List[str],
+    deterministic_key: str,
+) -> str:
+    if not available_colors:
+        return ""
+    if not template.storefront_default_color_candidates:
+        return ""
+    key_basis = f"{template.storefront_display_color_rotation_seed or template.key}:{deterministic_key}"
+    rotation_index = int(hashlib.sha256(key_basis.encode("utf-8")).hexdigest()[:8], 16)
+    normalized_available = {_normalize_color_name(color): color for color in available_colors}
+    non_white_candidates: List[str] = []
+    white_candidates: List[str] = []
+    for candidate in template.storefront_default_color_candidates:
+        normalized = _normalize_color_name(candidate)
+        if normalized not in normalized_available:
+            continue
+        resolved = normalized_available[normalized]
+        if _is_white_like_color(resolved):
+            white_candidates.append(resolved)
+        else:
+            non_white_candidates.append(resolved)
+    if non_white_candidates:
+        return non_white_candidates[rotation_index % len(non_white_candidates)]
+    if white_candidates:
+        return white_candidates[rotation_index % len(white_candidates)]
+    return ""
+
+
+def reorder_variants_for_storefront_display(
+    *,
+    template: ProductTemplate,
+    artwork: Artwork,
+    variant_rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not variant_rows or not template.storefront_display_color_priority:
+        return variant_rows
+    available_colors: List[str] = []
+    seen: set[str] = set()
+    for variant in variant_rows:
+        color = _variant_option_value(variant, "color")
+        if not color:
+            continue
+        normalized = _normalize_color_name(color)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        available_colors.append(color)
+    deterministic_key = f"{artwork.slug}:{template.key}:{metadata_fingerprint(artwork.metadata)}"
+    preferred_color = _choose_rotated_storefront_display_color(
+        template=template,
+        available_colors=available_colors,
+        deterministic_key=deterministic_key,
+    )
+    priority_order = [preferred_color] if preferred_color else []
+    for candidate in template.storefront_display_color_priority:
+        if not candidate:
+            continue
+        if _normalize_color_name(candidate) == _normalize_color_name(preferred_color):
+            continue
+        priority_order.append(candidate)
+    priority_map = {_normalize_color_name(color): index for index, color in enumerate(priority_order)}
+    max_rank = len(priority_map) + 100
+
+    def _sort_key(variant: Dict[str, Any]) -> Tuple[int, int]:
+        color = _variant_option_value(variant, "color")
+        color_rank = priority_map.get(_normalize_color_name(color), max_rank)
+        variant_id = int(variant.get("id") or 0)
+        return (color_rank, variant_id)
+
+    reordered = sorted(variant_rows, key=_sort_key)
+    if preferred_color:
+        template.preferred_default_variant_color = preferred_color
+    return reordered
 
 
 def resolve_family_collection_target(template: ProductTemplate) -> Dict[str, str]:
@@ -5983,6 +6064,9 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
                 min_source_long_edge=int(row["min_source_long_edge"]) if row.get("min_source_long_edge") is not None else None,
                 min_effective_cover_ratio=float(row["min_effective_cover_ratio"]) if row.get("min_effective_cover_ratio") is not None else None,
                 expanded_enabled_colors=[str(v) for v in row.get("expanded_enabled_colors", [])],
+                storefront_display_color_priority=[str(v) for v in row.get("storefront_display_color_priority", [])],
+                storefront_display_color_rotation_seed=str(row.get("storefront_display_color_rotation_seed", "")).strip() or None,
+                storefront_default_color_candidates=[str(v) for v in row.get("storefront_default_color_candidates", [])],
                 placements=[PlacementRequirement(**p) for p in row.get("placements", [])],
             )
         )
@@ -8051,6 +8135,11 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
             variant_rows, variant_diagnostics = choose_variants_from_catalog_with_diagnostics(normalized_catalog_variants, resolved_template)
+            variant_rows = reorder_variants_for_storefront_display(
+                template=resolved_template,
+                artwork=artwork,
+                variant_rows=variant_rows,
+            )
             if not variant_rows:
                 zero_classification = _classify_zero_selection(
                     resolved_template,
