@@ -1717,6 +1717,20 @@ def resolve_artwork_metadata_with_source(
         sidecar_metadata = load_artwork_metadata(sidecar_path)
         normalized_stem = slugify(path.stem)
         stronger_wins = bool(normalized_stem and metadata_map.get(normalized_stem))
+        if not stronger_wins and metadata_map:
+            alias_values = [path.stem]
+            canonical_slug = slugify(artwork_slug) if artwork_slug else ""
+            if canonical_slug:
+                alias_values.append(canonical_slug)
+            if persisted_aliases:
+                alias_values.extend([slugify(alias) for alias in persisted_aliases if slugify(alias)])
+            normalized_aliases = {slugify(value) for value in alias_values if slugify(value)}
+            if normalized_aliases:
+                matched_entry, matched_key, ambiguous_keys = _resolve_unique_alias_match(
+                    metadata_map,
+                    normalized_aliases=normalized_aliases,
+                )
+                stronger_wins = bool(matched_entry is not None and matched_key is not None and not ambiguous_keys)
         if stronger_wins:
             logger.info(
                 "Content metadata resolution artwork=%s source=sidecar stronger_source_won_over=metadata_map weaker_key=%s",
@@ -4181,20 +4195,29 @@ class BaseApiClient:
         interactive_retry_policy = bool(getattr(self, "interactive_retry_policy", True))
         interactive_retry_cap_seconds = max(0.0, float(getattr(self, "interactive_retry_cap_seconds", INTERACTIVE_RETRY_CAP_SECONDS)))
         max_retry_sleep_seconds = max(0.0, float(getattr(self, "max_retry_sleep_seconds", MAX_RETRY_SLEEP_SECONDS)))
+        catalog_request_spacing_ms = max(0, int(getattr(self, "catalog_request_spacing_ms", 0) or 0))
+        last_catalog_request_at = float(getattr(self, "last_catalog_request_at", 0.0) or 0.0)
+        consecutive_catalog_rate_limits = int(getattr(self, "consecutive_catalog_rate_limits", 0) or 0)
+        rate_limit_events = getattr(self, "rate_limit_events", None)
+        if rate_limit_events is None:
+            rate_limit_events = Counter()
+            self.rate_limit_events = rate_limit_events
 
         for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
             try:
-                if method.upper() == "GET" and _is_catalog_discovery_path(path) and self.catalog_request_spacing_ms > 0:
-                    elapsed = (time.time() - self.last_catalog_request_at) * 1000.0
-                    if elapsed < self.catalog_request_spacing_ms:
-                        wait_ms = self.catalog_request_spacing_ms - elapsed
-                        jitter_ms = random.uniform(0, max(1.0, self.catalog_request_spacing_ms * 0.15))
+                if method.upper() == "GET" and _is_catalog_discovery_path(path) and catalog_request_spacing_ms > 0:
+                    elapsed = (time.time() - last_catalog_request_at) * 1000.0
+                    if elapsed < catalog_request_spacing_ms:
+                        wait_ms = catalog_request_spacing_ms - elapsed
+                        jitter_ms = random.uniform(0, max(1.0, catalog_request_spacing_ms * 0.15))
                         time.sleep((wait_ms + jitter_ms) / 1000.0)
                 response = self.session.request(method=method.upper(), url=url, params=params, json=payload, timeout=120)
                 if method.upper() == "GET" and _is_catalog_discovery_path(path):
-                    self.last_catalog_request_at = time.time()
+                    last_catalog_request_at = time.time()
+                    self.last_catalog_request_at = last_catalog_request_at
                 if response.status_code in expected_statuses:
                     if _is_catalog_discovery_path(path):
+                        consecutive_catalog_rate_limits = 0
                         self.consecutive_catalog_rate_limits = 0
                     return response.json() if response.content else {}
 
@@ -4230,12 +4253,13 @@ class BaseApiClient:
                             endpoint_label = "catalog_providers"
                         elif "blueprints.json" in path:
                             endpoint_label = "catalog_blueprints"
-                        self.rate_limit_events[endpoint_label] += 1
+                        rate_limit_events[endpoint_label] += 1
                         if _is_catalog_discovery_path(path):
-                            self.consecutive_catalog_rate_limits += 1
+                            consecutive_catalog_rate_limits += 1
+                            self.consecutive_catalog_rate_limits = consecutive_catalog_rate_limits
                             sleep_seconds = min(
-                                max_retry_sleep_seconds,
-                                sleep_seconds + min(8.0, self.consecutive_catalog_rate_limits * 1.25),
+                                applied_cap,
+                                sleep_seconds + min(8.0, consecutive_catalog_rate_limits * 1.25),
                             )
                     if attempt >= RETRY_MAX_ATTEMPTS:
                         raise RetryLimitExceededError(
