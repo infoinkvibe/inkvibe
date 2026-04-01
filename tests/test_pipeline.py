@@ -8186,6 +8186,20 @@ def test_top10_template_keys_exist_and_curated():
     assert by_key["poster_basic"].enabled_sizes == ["11″ x 14″ (Vertical)", "12″ x 16″ (Vertical)", "16″ x 20″ (Vertical)"]
 
 
+def test_template_metadata_defaults_are_populated_for_poster_and_tote():
+    templates = load_templates(Path("product_templates.json"))
+    by_key = {template.key: template for template in templates}
+
+    poster = by_key["poster_basic"]
+    assert poster.product_type_label == "Poster"
+    assert poster.audience == "home decor and art gift shoppers"
+    assert poster.seo_keywords == ["wall art poster", "vertical art print", "giftable wall decor"]
+    assert poster.tags == ["poster", "wall art", "giftable decor"]
+
+    tote = by_key["tote_basic"]
+    assert tote.audience == "everyday carry and gift shoppers"
+
+
 def test_guardrail_zero_enabled_variants_skip_before_payload_validation():
     class StubPrintify:
         dry_run = False

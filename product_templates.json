@@ -433,11 +433,17 @@
     "markup_value": "5.00",
     "rounding_mode": "x_99",
     "seo_keywords": [
-      "replace-me-keyword-1",
-      "replace-me-keyword-2"
+      "wall art poster",
+      "vertical art print",
+      "giftable wall decor"
     ],
-    "audience": "",
-    "product_type_label": "",
+    "audience": "home decor and art gift shoppers",
+    "product_type_label": "Poster",
+    "tags": [
+      "poster",
+      "wall art",
+      "giftable decor"
+    ],
     "style_keywords": [
       "minimal",
       "giftable"
@@ -500,7 +506,7 @@
       "everyday carry bag",
       "giftable accessory"
     ],
-    "audience": "",
+    "audience": "everyday carry and gift shoppers",
     "product_type_label": "Tote Bag",
     "style_keywords": [
       "minimal",
