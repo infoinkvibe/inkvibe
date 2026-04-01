@@ -465,7 +465,7 @@
     "key": "tote_basic",
     "printify_blueprint_id": 609,
     "printify_print_provider_id": 74,
-    "title_pattern": "{artwork_title}",
+    "title_pattern": "{artwork_title} Tote Bag",
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [
       "Natural",
@@ -496,11 +496,12 @@
     "markup_value": "5.00",
     "rounding_mode": "x_99",
     "seo_keywords": [
-      "replace-me-keyword-1",
-      "replace-me-keyword-2"
+      "tote bag",
+      "everyday carry bag",
+      "giftable accessory"
     ],
     "audience": "",
-    "product_type_label": "",
+    "product_type_label": "Tote Bag",
     "style_keywords": [
       "minimal",
       "giftable"
@@ -526,7 +527,7 @@
     "pinned_provider_id": 74,
     "pinned_blueprint_id": 609,
     "fallback_provider_allowed": true,
-    "active": false,
+    "active": true,
     "default_price": "24.99",
     "compare_at_price": "29.99",
     "min_margin_after_shipping": "3.00",
@@ -534,15 +535,21 @@
     "shipping_basis_for_margin": "cost",
     "disable_variants_below_margin_floor": true,
     "reprice_variants_to_margin_floor": true,
-    "max_allowed_price": "34.99"
+    "max_allowed_price": "34.99",
+    "shopify_product_type": "Accessories",
+    "tags": [
+      "tote bag",
+      "everyday carry",
+      "giftable"
+    ]
   },
   {
     "key": "canvas_basic",
     "printify_blueprint_id": 13,
     "printify_print_provider_id": 1,
-    "provider_selection_strategy": "prefer_printify_choice_then_ranked",
+    "provider_selection_strategy": "pinned_then_printify_choice_then_lowest_cost",
     "fallback_provider_allowed": true,
-    "active": false,
+    "active": true,
     "high_resolution_family": true,
     "skip_if_artwork_below_threshold": true,
     "min_source_width": 4500,
@@ -553,7 +560,8 @@
     "enabled_colors": [],
     "enabled_sizes": [
       "9\" x 12\" (Vertical)",
-      "11\" x 14\" (Vertical)"
+      "11\" x 14\" (Vertical)",
+      "16\" x 20\" (Vertical)"
     ],
     "max_enabled_variants": 12,
     "tags": [
@@ -600,7 +608,15 @@
     "shipping_basis_for_margin": "cost",
     "disable_variants_below_margin_floor": true,
     "reprice_variants_to_margin_floor": true,
-    "mark_template_nonviable_if_needed": true
+    "mark_template_nonviable_if_needed": true,
+    "pinned_provider_id": 1,
+    "pinned_blueprint_id": 13,
+    "preferred_mockup_types": [
+      "lifestyle",
+      "wall-art",
+      "front"
+    ],
+    "preferred_featured_image_strategy": "mockup_type_then_variant_color"
   },
   {
     "key": "phone_case_basic",
@@ -886,5 +902,239 @@
     "reprice_variants_to_margin_floor": false,
     "mark_template_nonviable_if_needed": true,
     "active": false
+  },
+  {
+    "key": "framed_poster_basic",
+    "printify_blueprint_id": 853,
+    "printify_print_provider_id": 73,
+    "title_pattern": "{artwork_title} Framed Poster",
+    "description_pattern": "<p>{generated_description}</p>",
+    "enabled_colors": [],
+    "enabled_sizes": [
+      "11\u2033 x 14\u2033 (Vertical)"
+    ],
+    "max_enabled_variants": 6,
+    "placements": [
+      {
+        "placement_name": "front",
+        "width_px": 4500,
+        "height_px": 5400,
+        "file_type": "png",
+        "allow_upscale": false,
+        "artwork_fit_mode": "cover"
+      }
+    ],
+    "base_price": "39.99",
+    "markup_type": "fixed",
+    "markup_value": "8.00",
+    "rounding_mode": "x_99",
+    "default_price": "47.99",
+    "compare_at_price": "57.99",
+    "max_allowed_price": "74.99",
+    "seo_keywords": [
+      "framed poster",
+      "wall art frame",
+      "giftable wall decor"
+    ],
+    "audience": "home decor fans",
+    "product_type_label": "Framed Poster",
+    "style_keywords": [
+      "gallery",
+      "giftable"
+    ],
+    "shopify_product_type": "Home Decor",
+    "poster_safe_max_upscale_factor": 1.55,
+    "poster_safe_min_source_ratio": 0.34,
+    "poster_fill_target_pct": 0.94,
+    "poster_trim_fill_optimization": true,
+    "high_resolution_family": true,
+    "skip_if_artwork_below_threshold": true,
+    "min_source_width": 4500,
+    "min_source_height": 5400,
+    "min_effective_cover_ratio": 1.0,
+    "preferred_mockup_colors": [],
+    "preferred_mockup_types": [
+      "lifestyle",
+      "wall-art",
+      "front"
+    ],
+    "preferred_featured_image_strategy": "mockup_type_then_variant_color",
+    "provider_selection_strategy": "pinned_then_printify_choice_then_lowest_cost",
+    "pinned_provider_id": 73,
+    "pinned_blueprint_id": 853,
+    "fallback_provider_allowed": true,
+    "publish_to_shopify": false,
+    "push_via_printify": true,
+    "publish_after_create": true,
+    "publish_title": true,
+    "publish_description": true,
+    "publish_images": true,
+    "publish_variants": true,
+    "publish_tags": true,
+    "min_margin_after_shipping": "5.00",
+    "target_margin_after_shipping": "8.00",
+    "shipping_basis_for_margin": "cost",
+    "disable_variants_below_margin_floor": true,
+    "reprice_variants_to_margin_floor": true,
+    "mark_template_nonviable_if_needed": true,
+    "active": true
+  },
+  {
+    "key": "tumbler_20oz_basic",
+    "printify_blueprint_id": 619,
+    "printify_print_provider_id": 1,
+    "title_pattern": "{artwork_title} 20oz Tumbler",
+    "description_pattern": "<p>{generated_description}</p>",
+    "enabled_colors": [],
+    "enabled_sizes": [
+      "20oz"
+    ],
+    "enabled_variant_option_filters": {
+      "color": [],
+      "size": [
+        "20oz"
+      ]
+    },
+    "max_enabled_variants": 1,
+    "placements": [
+      {
+        "placement_name": "front",
+        "width_px": 3000,
+        "height_px": 1200,
+        "file_type": "png",
+        "allow_upscale": false,
+        "placement_scale": 0.8,
+        "placement_x": 0.5,
+        "placement_y": 0.5,
+        "placement_angle": 0,
+        "artwork_fit_mode": "contain"
+      }
+    ],
+    "base_price": "24.99",
+    "markup_type": "fixed",
+    "markup_value": "8.00",
+    "rounding_mode": "x_99",
+    "default_price": "32.99",
+    "compare_at_price": "39.99",
+    "max_allowed_price": "49.99",
+    "seo_keywords": [
+      "20oz tumbler",
+      "travel tumbler",
+      "giftable drinkware"
+    ],
+    "audience": "daily drinkware shoppers",
+    "product_type_label": "20oz Tumbler",
+    "style_keywords": [
+      "practical",
+      "giftable"
+    ],
+    "shopify_product_type": "Drinkware",
+    "preferred_mockup_colors": [
+      "White"
+    ],
+    "preferred_default_variant_color": "White",
+    "preferred_mockup_types": [
+      "studio",
+      "lifestyle"
+    ],
+    "preferred_featured_image_strategy": "variant_color_then_mockup_type",
+    "provider_selection_strategy": "pinned_then_printify_choice_then_lowest_cost",
+    "pinned_provider_id": 1,
+    "pinned_blueprint_id": 619,
+    "fallback_provider_allowed": true,
+    "publish_to_shopify": false,
+    "push_via_printify": true,
+    "publish_after_create": true,
+    "publish_title": true,
+    "publish_description": true,
+    "publish_images": true,
+    "publish_variants": true,
+    "publish_tags": true,
+    "min_margin_after_shipping": "5.00",
+    "target_margin_after_shipping": "8.00",
+    "shipping_basis_for_margin": "cost",
+    "disable_variants_below_margin_floor": true,
+    "reprice_variants_to_margin_floor": true,
+    "mark_template_nonviable_if_needed": true,
+    "active": true
+  },
+  {
+    "key": "travel_mug_basic",
+    "printify_blueprint_id": 84,
+    "printify_print_provider_id": 1,
+    "title_pattern": "{artwork_title} Travel Mug",
+    "description_pattern": "<p>{generated_description}</p>",
+    "enabled_colors": [],
+    "enabled_sizes": [
+      "15oz"
+    ],
+    "enabled_variant_option_filters": {
+      "color": [],
+      "size": [
+        "15oz"
+      ]
+    },
+    "max_enabled_variants": 1,
+    "placements": [
+      {
+        "placement_name": "front",
+        "width_px": 2800,
+        "height_px": 1200,
+        "file_type": "png",
+        "allow_upscale": false,
+        "placement_scale": 0.78,
+        "placement_x": 0.5,
+        "placement_y": 0.5,
+        "placement_angle": 0,
+        "artwork_fit_mode": "contain"
+      }
+    ],
+    "base_price": "22.99",
+    "markup_type": "fixed",
+    "markup_value": "7.00",
+    "rounding_mode": "x_99",
+    "default_price": "29.99",
+    "compare_at_price": "36.99",
+    "max_allowed_price": "46.99",
+    "seo_keywords": [
+      "travel mug",
+      "commuter mug",
+      "giftable drinkware"
+    ],
+    "audience": "commuters and desk drinkers",
+    "product_type_label": "Travel Mug",
+    "style_keywords": [
+      "practical",
+      "giftable"
+    ],
+    "shopify_product_type": "Drinkware",
+    "preferred_mockup_colors": [
+      "White"
+    ],
+    "preferred_default_variant_color": "White",
+    "preferred_mockup_types": [
+      "studio",
+      "lifestyle"
+    ],
+    "preferred_featured_image_strategy": "variant_color_then_mockup_type",
+    "provider_selection_strategy": "pinned_then_printify_choice_then_lowest_cost",
+    "pinned_provider_id": 1,
+    "pinned_blueprint_id": 84,
+    "fallback_provider_allowed": true,
+    "publish_to_shopify": false,
+    "push_via_printify": true,
+    "publish_after_create": true,
+    "publish_title": true,
+    "publish_description": true,
+    "publish_images": true,
+    "publish_variants": true,
+    "publish_tags": true,
+    "min_margin_after_shipping": "5.00",
+    "target_margin_after_shipping": "8.00",
+    "shipping_basis_for_margin": "cost",
+    "disable_variants_below_margin_floor": true,
+    "reprice_variants_to_margin_floor": true,
+    "mark_template_nonviable_if_needed": true,
+    "active": true
   }
 ]

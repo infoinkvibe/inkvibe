@@ -188,6 +188,11 @@ _FAMILY_CONFIG: Dict[str, Dict[str, Any]] = {
         "tags": ["poster", "gift idea", "wall art"],
         "description_closing": "A simple way to add personality to your wall and space.",
     },
+    "framed_poster": {
+        "suffix": "Framed Poster",
+        "tags": ["framed poster", "gift idea", "wall art"],
+        "description_closing": "A polished wall-art format with ready-to-display appeal.",
+    },
     "phone_case": {
         "suffix": "Phone Case",
         "tags": ["phone case", "gift idea", "everyday accessory"],
@@ -212,6 +217,16 @@ _FAMILY_CONFIG: Dict[str, Dict[str, Any]] = {
         "suffix": "Mug",
         "tags": ["mug", "gift idea", "drinkware"],
         "description_closing": "Designed to bring character to your coffee, tea, or desk setup.",
+    },
+    "tumbler": {
+        "suffix": "Tumbler",
+        "tags": ["tumbler", "gift idea", "drinkware"],
+        "description_closing": "Built for practical daily hydration with expressive personality.",
+    },
+    "travel_mug": {
+        "suffix": "Travel Mug",
+        "tags": ["travel mug", "gift idea", "drinkware"],
+        "description_closing": "Made for commutes, errands, and desk days with art-forward character.",
     },
     "default": {
         "suffix": "Product",
@@ -239,6 +254,8 @@ def infer_product_family(template: Any) -> str:
         return "tshirt"
     if "tote" in hint:
         return "tote"
+    if "framed" in hint and "poster" in hint:
+        return "framed_poster"
     if "poster" in hint:
         return "poster"
     if "canvas" in hint:
@@ -249,6 +266,10 @@ def infer_product_family(template: Any) -> str:
         return "phone_case"
     if "sticker" in hint or "kiss cut" in hint or "kisscut" in hint:
         return "sticker"
+    if "tumbler" in hint:
+        return "tumbler"
+    if "travel mug" in hint or "travel_mug" in hint:
+        return "travel_mug"
     if "mug" in hint or "drinkware" in hint:
         return "mug"
     return "default"
@@ -280,8 +301,11 @@ def build_branded_description(*, artwork_title: str, short_description: str, tem
         "tshirt": "Designed for everyday rotation, casual hangs, and weekend plans.",
         "tote": "Perfect for books, errands, market runs, and daily carry.",
         "poster": "Works beautifully in offices, bedrooms, studios, and gallery-style walls.",
+        "framed_poster": "Designed to feel elevated as a ready-to-display wall centerpiece.",
         "phone_case": "Made for everyday carry with practical protection and expressive style.",
         "mug": "Made for coffee rituals, tea breaks, and desk-side personality.",
+        "tumbler": "Great for commuting, workouts, and all-day hydration routines.",
+        "travel_mug": "A practical companion for commutes, road trips, and desk coffee sessions.",
         "default": "Made for everyday use with bold visual personality.",
     }
     idx = int(hashlib.sha256(f"{family}:{artwork_title}".encode("utf-8")).hexdigest()[:2], 16) % len(gift_openers)
