@@ -4520,6 +4520,37 @@ def test_validate_catalog_family_schema_rejects_wrong_family_for_blanket():
     assert "blanket schema mismatch" in (result.reason or "").lower()
 
 
+def test_validate_catalog_family_schema_accepts_framed_poster_schema():
+    template = ProductTemplate("framed_poster_basic", 853, 73, "{artwork_title}", "{artwork_title}", product_type_label="Framed Poster")
+    variants = [
+        {"id": 1, "is_available": True, "options": {"Size": '11" x 14" (Vertical)', "Frame Color": "Black"}},
+        {"id": 2, "is_available": True, "options": {"Size": '16" x 20" (Vertical)', "Frame Color": "Walnut"}},
+    ]
+    result = validate_catalog_family_schema(template=template, variants=variants, blueprint_title="Framed Posters")
+    assert result.intended_family == "framed_poster"
+    assert result.plausible is True
+
+
+def test_validate_catalog_family_schema_accepts_tumbler_schema():
+    template = ProductTemplate("tumbler_20oz_basic", 619, 1, "{artwork_title}", "{artwork_title}", product_type_label="20oz Tumbler")
+    variants = [
+        {"id": 1, "is_available": True, "options": {"Size": "20oz", "Color": "White"}},
+    ]
+    result = validate_catalog_family_schema(template=template, variants=variants, blueprint_title="Skinny Tumbler")
+    assert result.intended_family == "tumbler"
+    assert result.plausible is True
+
+
+def test_validate_catalog_family_schema_accepts_travel_mug_schema():
+    template = ProductTemplate("travel_mug_basic", 84, 1, "{artwork_title}", "{artwork_title}", product_type_label="Travel Mug")
+    variants = [
+        {"id": 1, "is_available": True, "options": {"Capacity": "15oz", "Color": "White"}},
+    ]
+    result = validate_catalog_family_schema(template=template, variants=variants, blueprint_title="Travel Mug")
+    assert result.intended_family == "travel_mug"
+    assert result.plausible is True
+
+
 def test_select_provider_for_template_discovers_canvas_mapping_when_template_hint_is_wrong_family():
     class DummyPrintify:
         def list_blueprints(self):
@@ -4558,6 +4589,115 @@ def test_select_provider_for_template_discovers_canvas_mapping_when_template_hin
     resolved = select_provider_for_template(printify=DummyPrintify(), template=template)
     assert resolved.printify_blueprint_id == 13
     assert resolved.printify_print_provider_id == 7
+
+
+def test_select_provider_for_template_discovers_framed_poster_mapping_when_template_hint_is_wrong_family():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [
+                {"id": 9, "title": "Unisex Tee"},
+                {"id": 853, "title": "Framed Posters"},
+            ]
+
+        def list_print_providers(self, blueprint_id):
+            if blueprint_id == 9:
+                return [{"id": 99, "title": "Generic"}]
+            if blueprint_id == 853:
+                return [{"id": 73, "title": "Printify Choice"}]
+            return []
+
+        def list_variants(self, blueprint_id, provider_id):
+            if blueprint_id == 9:
+                return [{"id": 1, "is_available": True, "options": {"Color": "Black", "Size": "M"}}]
+            if blueprint_id == 853 and provider_id == 73:
+                return [{"id": 21, "is_available": True, "cost": 2600, "price": 3600, "options": {"Size": '11" x 14" (Vertical)', "Frame Color": "Black"}}]
+            return []
+
+    template = ProductTemplate(
+        "framed_poster_basic",
+        9,
+        99,
+        "{artwork_title}",
+        "{artwork_title}",
+        active=False,
+        enabled_sizes=['11" x 14" (Vertical)'],
+        provider_selection_strategy="prefer_printify_choice_then_ranked",
+    )
+    resolved = select_provider_for_template(printify=DummyPrintify(), template=template)
+    assert resolved.printify_blueprint_id == 853
+    assert resolved.printify_print_provider_id == 73
+
+
+def test_select_provider_for_template_discovers_tumbler_mapping_when_template_hint_is_wrong_family():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [
+                {"id": 9, "title": "Unisex Tee"},
+                {"id": 619, "title": "Skinny Tumbler"},
+            ]
+
+        def list_print_providers(self, blueprint_id):
+            if blueprint_id == 9:
+                return [{"id": 99, "title": "Generic"}]
+            if blueprint_id == 619:
+                return [{"id": 22, "title": "Printify Choice"}]
+            return []
+
+        def list_variants(self, blueprint_id, provider_id):
+            if blueprint_id == 9:
+                return [{"id": 1, "is_available": True, "options": {"Color": "Black", "Size": "M"}}]
+            if blueprint_id == 619 and provider_id == 22:
+                return [{"id": 31, "is_available": True, "cost": 1400, "price": 2200, "options": {"Size": "20oz", "Color": "White"}}]
+            return []
+
+    template = ProductTemplate(
+        "tumbler_20oz_basic",
+        9,
+        99,
+        "{artwork_title}",
+        "{artwork_title}",
+        active=False,
+        enabled_variant_option_filters={"size": ["20oz"]},
+        provider_selection_strategy="prefer_printify_choice_then_ranked",
+    )
+    resolved = select_provider_for_template(printify=DummyPrintify(), template=template)
+    assert resolved.printify_blueprint_id == 619
+    assert resolved.printify_print_provider_id == 22
+
+
+def test_select_provider_for_template_discovers_travel_mug_mapping_when_template_hint_is_stale():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [
+                {"id": 84, "title": "Legacy Product"},
+                {"id": 777, "title": "Travel Mug"},
+            ]
+
+        def list_print_providers(self, blueprint_id):
+            if blueprint_id == 84:
+                return []
+            if blueprint_id == 777:
+                return [{"id": 11, "title": "Printify Choice"}]
+            return []
+
+        def list_variants(self, blueprint_id, provider_id):
+            if blueprint_id == 777 and provider_id == 11:
+                return [{"id": 41, "is_available": True, "cost": 1200, "price": 2100, "options": {"Capacity": "15oz", "Color": "White"}}]
+            return []
+
+    template = ProductTemplate(
+        "travel_mug_basic",
+        84,
+        1,
+        "{artwork_title}",
+        "{artwork_title}",
+        active=False,
+        enabled_variant_option_filters={"size": ["15oz"]},
+        provider_selection_strategy="prefer_printify_choice_then_ranked",
+    )
+    resolved = select_provider_for_template(printify=DummyPrintify(), template=template)
+    assert resolved.printify_blueprint_id == 777
+    assert resolved.printify_print_provider_id == 11
 
 
 def test_canvas_size_normalization_matches_provider_quotes_and_orientation_labels():
@@ -5300,6 +5440,25 @@ def test_next_wave_templates_define_provider_blueprint_and_variant_guards():
     assert travel.enabled_variant_option_filters.get("size") == ["15oz"]
     assert travel.max_enabled_variants == 1
     assert travel.disable_variants_below_margin_floor is True
+
+
+def test_canvas_template_uses_live_mapping_not_stale_hint():
+    templates = load_templates(Path("product_templates.json"))
+    canvas = next(t for t in templates if t.key == "canvas_basic")
+    assert canvas.printify_blueprint_id == 944
+    assert canvas.printify_print_provider_id == 105
+    assert canvas.pinned_blueprint_id == 944
+    assert canvas.pinned_provider_id == 105
+
+
+def test_tote_mapping_and_primary_publish_behavior_remain_unchanged():
+    templates = load_templates(Path("product_templates.json"))
+    tote = next(t for t in templates if t.key == "tote_basic")
+    assert tote.printify_blueprint_id == 609
+    assert tote.printify_print_provider_id == 74
+    assert tote.preferred_primary_placement == "front"
+    assert tote.publish_only_primary_placement is True
+    assert tote.active_placements == ["front"]
 
 
 def test_shirt_template_enables_allow_upscale_while_mug_stays_conservative():
