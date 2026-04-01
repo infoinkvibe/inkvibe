@@ -193,6 +193,21 @@ _FAMILY_CONFIG: Dict[str, Dict[str, Any]] = {
         "tags": ["phone case", "gift idea", "everyday accessory"],
         "description_closing": "A practical daily accessory with expressive visual personality.",
     },
+    "sticker": {
+        "suffix": "Sticker",
+        "tags": ["sticker", "gift idea", "accessory"],
+        "description_closing": "A simple way to add personality to everyday items.",
+    },
+    "canvas": {
+        "suffix": "Canvas Print",
+        "tags": ["canvas print", "wall art", "gift idea"],
+        "description_closing": "A bold wall-art format for expressive rooms and gifting.",
+    },
+    "blanket": {
+        "suffix": "Blanket",
+        "tags": ["blanket", "home decor", "gift idea"],
+        "description_closing": "A cozy home accent designed to feel practical and expressive.",
+    },
     "mug": {
         "suffix": "Mug",
         "tags": ["mug", "gift idea", "drinkware"],
@@ -226,8 +241,14 @@ def infer_product_family(template: Any) -> str:
         return "tote"
     if "poster" in hint:
         return "poster"
+    if "canvas" in hint:
+        return "canvas"
+    if "blanket" in hint:
+        return "blanket"
     if "phone_case" in hint or "phone case" in hint:
         return "phone_case"
+    if "sticker" in hint or "kiss cut" in hint or "kisscut" in hint:
+        return "sticker"
     if "mug" in hint or "drinkware" in hint:
         return "mug"
     return "default"

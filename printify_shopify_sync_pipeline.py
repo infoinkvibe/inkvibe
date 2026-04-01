@@ -945,13 +945,52 @@ LAUNCH_PLAN_OVERRIDE_COLUMNS = [
 ]
 
 FAMILY_COLLECTION_RULES: Dict[str, Dict[str, str]] = {
-    "tshirt": {"handle": "t-shirts", "title": "T-Shirts"},
-    "long_sleeve": {"handle": "long-sleeve-shirts", "title": "Long Sleeve Shirts"},
-    "hoodie": {"handle": "hoodies", "title": "Hoodies"},
-    "sweatshirt": {"handle": "sweatshirts", "title": "Sweatshirts"},
-    "mug": {"handle": "mugs", "title": "Mugs"},
-    "poster": {"handle": "posters", "title": "Posters"},
-    "tote": {"handle": "tote-bags", "title": "Tote Bags"},
+    "tshirt": {"handle": "t-shirts", "title": "T-Shirts", "department_key": "apparel", "department_label": "Apparel"},
+    "long_sleeve": {"handle": "long-sleeve-shirts", "title": "Long Sleeve Shirts", "department_key": "apparel", "department_label": "Apparel"},
+    "hoodie": {"handle": "hoodies", "title": "Hoodies", "department_key": "apparel", "department_label": "Apparel"},
+    "sweatshirt": {"handle": "sweatshirts", "title": "Sweatshirts", "department_key": "apparel", "department_label": "Apparel"},
+    "mug": {"handle": "mugs", "title": "Mugs", "department_key": "drinkware", "department_label": "Drinkware"},
+    "poster": {"handle": "posters", "title": "Posters", "department_key": "wall-art", "department_label": "Wall Art"},
+    "tote": {"handle": "tote-bags", "title": "Tote Bags", "department_key": "accessories", "department_label": "Accessories"},
+    "phone_case": {"handle": "phone-cases", "title": "Phone Cases", "department_key": "accessories", "department_label": "Accessories"},
+    "sticker": {"handle": "stickers", "title": "Stickers", "department_key": "accessories", "department_label": "Accessories"},
+    "canvas": {"handle": "canvas-prints", "title": "Canvas Prints", "department_key": "home-decor", "department_label": "Home Decor"},
+    "blanket": {"handle": "blankets", "title": "Blankets", "department_key": "home-decor", "department_label": "Home Decor"},
+}
+
+THEME_NORMALIZATION_PATTERNS: Dict[str, Tuple[str, ...]] = {
+    "nature-wildlife": ("nature", "wildlife", "forest", "animal", "botanical", "floral", "woodland"),
+    "ocean-coastal": ("ocean", "coastal", "beach", "sea", "shore", "surf", "nautical"),
+    "food-fun": ("food", "snack", "dessert", "coffee", "pizza", "fruit", "fun"),
+    "minimal-bold": ("minimal", "bold", "clean", "graphic", "modern"),
+    "outdoor-vibes": ("outdoor", "mountain", "hiking", "camp", "adventure", "trail"),
+    "giftable-art": ("gift", "giftable", "present"),
+}
+
+AUDIENCE_NORMALIZATION_PATTERNS: Dict[str, Tuple[str, ...]] = {
+    "unisex": ("unisex",),
+    "men": ("men", "mens", "male"),
+    "women": ("women", "womens", "female"),
+    "youth": ("youth", "kids", "children", "teen"),
+    "giftable": ("gift", "giftable"),
+    "home-decor-shoppers": ("decor", "home decor", "interior"),
+    "coffee-lovers": ("coffee", "tea", "mug"),
+    "phone-accessory-shoppers": ("phone", "case", "mobile accessory"),
+    "sticker-lovers": ("sticker", "decal"),
+}
+
+SEASON_NORMALIZATION_PATTERNS: Dict[str, Tuple[str, ...]] = {
+    "spring": ("spring", "bloom"),
+    "summer": ("summer", "beach"),
+    "fall": ("fall", "autumn"),
+    "winter": ("winter", "snow", "holiday"),
+    "holiday": ("holiday", "christmas", "xmas"),
+}
+
+MANUAL_MERCH_COLLECTIONS: Dict[str, Dict[str, str]] = {
+    "featured": {"title": "Featured", "handle": "featured"},
+    "new-drops": {"title": "New Drops", "handle": "new-drops"},
+    "best-sellers": {"title": "Best Sellers", "handle": "best-sellers"},
 }
 
 
@@ -1086,6 +1125,68 @@ def reorder_variants_for_storefront_display(
 def resolve_family_collection_target(template: ProductTemplate) -> Dict[str, str]:
     family = content_engine.infer_product_family(template)
     return dict(FAMILY_COLLECTION_RULES.get(family, {}))
+
+
+def _normalize_taxonomy_keys(values: List[Any], allowlist: Dict[str, Tuple[str, ...]]) -> List[str]:
+    haystack = " ".join(normalize_theme_tag(value) for value in values if normalize_theme_tag(value))
+    if not haystack:
+        return []
+    normalized: List[str] = []
+    for key, patterns in allowlist.items():
+        if any(pattern in haystack for pattern in patterns):
+            normalized.append(key)
+    return normalized
+
+
+def build_normalized_shopify_organization(template: ProductTemplate, artwork: Artwork) -> Dict[str, Any]:
+    family = content_engine.infer_product_family(template)
+    family_cfg = dict(FAMILY_COLLECTION_RULES.get(family, {}))
+    metadata = artwork.metadata or {}
+    family_label = content_engine.family_title_suffix(template)
+    department_key = str(family_cfg.get("department_key") or "").strip()
+    department_label = str(family_cfg.get("department_label") or "").strip()
+    theme_inputs: List[Any] = [
+        metadata.get("theme"),
+        metadata.get("collection"),
+        metadata.get("occasion"),
+        *_split_keywords(metadata.get("tags")),
+        *_split_keywords(metadata.get("style_keywords")),
+        *_split_keywords(metadata.get("seo_keywords")),
+    ]
+    audience_inputs: List[Any] = [metadata.get("audience"), *_split_keywords(metadata.get("tags")), *_split_keywords(metadata.get("seo_keywords"))]
+    season_inputs: List[Any] = [
+        metadata.get("season"),
+        metadata.get("occasion"),
+        metadata.get("theme"),
+        metadata.get("collection"),
+        *_split_keywords(metadata.get("tags")),
+    ]
+    normalized_theme_keys = _normalize_taxonomy_keys(theme_inputs, THEME_NORMALIZATION_PATTERNS)
+    normalized_audience_keys = _normalize_taxonomy_keys(audience_inputs, AUDIENCE_NORMALIZATION_PATTERNS)
+    normalized_season_keys = _normalize_taxonomy_keys(season_inputs, SEASON_NORMALIZATION_PATTERNS) or ["evergreen"]
+    merchandising_collection_handles: List[str] = []
+    if "giftable-art" in normalized_theme_keys:
+        merchandising_collection_handles.append(MANUAL_MERCH_COLLECTIONS["featured"]["handle"])
+    smart_collection_tags = [f"family-{family.replace('_', '-')}"]
+    if department_key:
+        smart_collection_tags.append(f"dept-{department_key}")
+    smart_collection_tags.extend(f"theme-{key}" for key in normalized_theme_keys)
+    smart_collection_tags.extend(f"audience-{key}" for key in normalized_audience_keys)
+    smart_collection_tags.extend(f"season-{key}" for key in normalized_season_keys)
+    deduped_smart_tags = list(dict.fromkeys(smart_collection_tags))
+    return {
+        "family_key": family,
+        "family_label": family_label,
+        "primary_collection_handle": str(family_cfg.get("handle") or ""),
+        "primary_collection_title": str(family_cfg.get("title") or ""),
+        "department_key": department_key,
+        "department_label": department_label,
+        "normalized_theme_keys": normalized_theme_keys,
+        "normalized_audience_keys": normalized_audience_keys,
+        "normalized_season_keys": normalized_season_keys,
+        "merchandising_collection_handles": merchandising_collection_handles,
+        "smart_collection_tags": deduped_smart_tags,
+    }
 
 
 def choose_preferred_featured_variant_color(*, template: ProductTemplate, variant_rows: List[Dict[str, Any]]) -> str:
@@ -2690,6 +2791,7 @@ def build_generic_description_html(artwork_title: str) -> str:
 
 def build_seo_context(template: ProductTemplate, artwork: Artwork) -> Dict[str, str]:
     context = content_engine.build_listing_context(template, artwork)
+    organization = build_normalized_shopify_organization(template, artwork)
     merged_style = [*template.style_keywords, *_split_keywords((artwork.metadata or {}).get("style_keywords"))]
     product_type = (template.product_type_label or template.shopify_product_type or context.get("family_label") or "Product").strip()
     context.update(
@@ -2697,6 +2799,15 @@ def build_seo_context(template: ProductTemplate, artwork: Artwork) -> Dict[str, 
             "product_type_label": product_type,
             "style_keywords": ", ".join(list(dict.fromkeys(merged_style))[:6]),
             "family_label": content_engine.family_title_suffix(template),
+            "family_key": str(organization.get("family_key") or ""),
+            "primary_collection_handle": str(organization.get("primary_collection_handle") or ""),
+            "primary_collection_title": str(organization.get("primary_collection_title") or ""),
+            "department_key": str(organization.get("department_key") or ""),
+            "department_label": str(organization.get("department_label") or ""),
+            "normalized_theme_keys": ",".join(organization.get("normalized_theme_keys", [])),
+            "normalized_audience_keys": ",".join(organization.get("normalized_audience_keys", [])),
+            "normalized_season_keys": ",".join(organization.get("normalized_season_keys", [])),
+            "merchandising_collection_handles": ",".join(organization.get("merchandising_collection_handles", [])),
         }
     )
     return context
@@ -2739,11 +2850,13 @@ def render_product_title(template: ProductTemplate, artwork: Artwork) -> str:
 def _render_listing_tags(template: ProductTemplate, artwork: Artwork) -> List[str]:
     metadata = artwork.metadata or {}
     context = build_seo_context(template, artwork)
+    organization = build_normalized_shopify_organization(template, artwork)
+    taxonomy_tags = list(organization.get("smart_collection_tags", []))
     ai_copy = _maybe_render_ai_product_copy(template, artwork, context)
     if ai_copy and ai_copy.tags:
         merged: List[str] = []
         seen: set[str] = set()
-        for row in [*ai_copy.tags, *content_engine.family_tags(template)]:
+        for row in [*ai_copy.tags, *content_engine.family_tags(template), *taxonomy_tags]:
             cleaned = normalize_theme_tag(row)
             if not cleaned or cleaned in seen:
                 continue
@@ -2837,6 +2950,10 @@ def _render_listing_tags(template: ProductTemplate, artwork: Artwork) -> List[st
             _push_tag(row, allow_generic=True)
             if len(tags) >= 8:
                 break
+    for row in taxonomy_tags:
+        if len(tags) >= max_tags:
+            break
+        _push_tag(row, allow_generic=True)
     return tags
 
 

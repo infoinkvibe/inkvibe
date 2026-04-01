@@ -16,6 +16,7 @@ import pytest
 from PIL import Image
 
 import product_copy_generator
+import content_engine
 from r2_uploader import build_r2_public_url
 
 from printify_shopify_sync_pipeline import (
@@ -123,6 +124,7 @@ from printify_shopify_sync_pipeline import (
     choose_preferred_featured_mockup_candidate,
     reorder_variants_for_storefront_display,
     resolve_family_collection_target,
+    build_normalized_shopify_organization,
     select_provider_for_template,
     preflight_active_templates,
     validate_catalog_family_schema,
@@ -1698,6 +1700,92 @@ def test_tag_generation_prioritizes_family_and_theme_over_generic(tmp_path: Path
     assert any("forest" in tag or "wolf" in tag for tag in tags)
     assert tags.count("printify") <= 1
     assert len(tags) <= 20
+
+
+def test_sticker_and_phone_case_get_normalized_collection_metadata(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1200, 1200)
+    sticker_template = _template_for_variant_tests()
+    sticker_template.key = "sticker_kisscut"
+    sticker_template.product_type_label = "Sticker"
+    sticker_template.shopify_product_type = "Stickers"
+    sticker_org = build_normalized_shopify_organization(sticker_template, art)
+    assert sticker_org["family_key"] == "sticker"
+    assert sticker_org["primary_collection_handle"] == "stickers"
+    assert sticker_org["department_key"] == "accessories"
+
+    phone_template = _template_for_variant_tests()
+    phone_template.key = "phone_case_basic"
+    phone_template.product_type_label = "Phone Case"
+    phone_template.shopify_product_type = "Phone Cases"
+    phone_org = build_normalized_shopify_organization(phone_template, art)
+    assert phone_org["family_key"] == "phone_case"
+    assert phone_org["primary_collection_handle"] == "phone-cases"
+    assert phone_org["department_key"] == "accessories"
+
+
+def test_theme_audience_and_season_normalization_defaults_safely(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1200, 1200)
+    art.metadata = {
+        "theme": "Ocean wildlife escape",
+        "collection": "Coastal Gifts",
+        "audience": "Coffee lovers and gift buyers",
+        "tags": ["coastal", "giftable art"],
+    }
+    template = _template_for_variant_tests()
+    template.key = "mug_new"
+    template.product_type_label = "Mug"
+    template.shopify_product_type = "Mugs"
+    org = build_normalized_shopify_organization(template, art)
+    assert "ocean-coastal" in org["normalized_theme_keys"]
+    assert "nature-wildlife" in org["normalized_theme_keys"]
+    assert "coffee-lovers" in org["normalized_audience_keys"]
+    assert "giftable" in org["normalized_audience_keys"]
+    assert org["normalized_season_keys"] == ["evergreen"]
+
+
+def test_listing_tags_include_taxonomy_tags_without_case_duplicates(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1200, 1200)
+    art.tags = ["Family-Sticker"]
+    art.metadata = {"theme": "outdoor trail", "audience": "Sticker lovers", "tags": ["family-sticker", "gift"]}
+    template = _template_for_variant_tests()
+    template.key = "sticker_kisscut"
+    template.product_type_label = "Sticker"
+    template.shopify_product_type = "Stickers"
+    tags = _render_listing_tags(template, art)
+    normalized = [tag.lower() for tag in tags]
+    assert "family sticker" in normalized
+    assert "dept accessories" in normalized
+    assert "audience sticker lovers" in normalized
+    assert normalized.count("family sticker") == 1
+
+
+@pytest.mark.parametrize(
+    ("template_key", "product_type", "shopify_type", "expected_family"),
+    [
+        ("tshirt_gildan", "T-Shirt", "T-Shirts", "tshirt"),
+        ("hoodie_gildan", "Hoodie", "Hoodies", "hoodie"),
+        ("sweatshirt_gildan", "Sweatshirt", "Sweatshirts", "sweatshirt"),
+        ("longsleeve_gildan", "Long Sleeve", "Long Sleeve Shirts", "long_sleeve"),
+        ("mug_new", "Mug", "Mugs", "mug"),
+        ("poster_basic", "Poster", "Posters", "poster"),
+        ("tote_basic", "Tote Bag", "Tote Bags", "tote"),
+        ("phone_case_basic", "Phone Case", "Phone Cases", "phone_case"),
+        ("sticker_kisscut", "Sticker", "Stickers", "sticker"),
+        ("canvas_basic", "Canvas", "Canvas Prints", "canvas"),
+        ("blanket_basic", "Blanket", "Blankets", "blanket"),
+    ],
+)
+def test_family_inference_supports_normalized_shopify_taxonomy_keys(
+    template_key: str,
+    product_type: str,
+    shopify_type: str,
+    expected_family: str,
+):
+    template = _template_for_variant_tests()
+    template.key = template_key
+    template.product_type_label = product_type
+    template.shopify_product_type = shopify_type
+    assert content_engine.infer_product_family(template) == expected_family
 
 
 def test_preview_listing_copy_behavior(tmp_path: Path, capsys):
