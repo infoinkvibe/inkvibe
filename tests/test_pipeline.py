@@ -225,6 +225,22 @@ def test_template_validation_rejects_missing_fields(tmp_path: Path):
         load_templates(config)
 
 
+def test_active_templates_include_default_tags_for_targeted_families():
+    templates = json.loads(Path("product_templates.json").read_text(encoding="utf-8"))
+    required_keys = {
+        "mug_new",
+        "framed_poster_basic",
+        "tumbler_20oz_basic",
+        "travel_mug_basic",
+    }
+    templates_by_key = {template["key"]: template for template in templates}
+
+    for key in required_keys:
+        assert key in templates_by_key
+        tags = templates_by_key[key].get("tags")
+        assert isinstance(tags, list) and tags
+
+
 def test_save_json_atomic_roundtrip(tmp_path: Path):
     path = tmp_path / "state.json"
     data = {"processed": {"a": 1}}
