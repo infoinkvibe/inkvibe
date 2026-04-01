@@ -100,6 +100,21 @@
       "Dark Heather",
       "Military Green"
     ],
+    "storefront_display_color_priority": [
+      "Dark Heather",
+      "Military Green",
+      "Black",
+      "Navy",
+      "Sport Grey",
+      "Sand",
+      "White"
+    ],
+    "storefront_display_color_rotation_seed": "tshirt_gildan_v1",
+    "storefront_default_color_candidates": [
+      "Dark Heather",
+      "Military Green",
+      "White"
+    ],
     "min_profit_after_shipping": "3.00"
   },
   {
@@ -188,6 +203,21 @@
     "expanded_enabled_colors": [
       "Dark Heather",
       "Maroon"
+    ],
+    "storefront_display_color_priority": [
+      "Dark Heather",
+      "Maroon",
+      "Black",
+      "Navy",
+      "Sport Grey",
+      "Sand",
+      "White"
+    ],
+    "storefront_display_color_rotation_seed": "sweatshirt_gildan_v1",
+    "storefront_default_color_candidates": [
+      "Dark Heather",
+      "Maroon",
+      "White"
     ],
     "min_profit_after_shipping": "3.00"
   },
@@ -291,6 +321,22 @@
     "expanded_enabled_colors": [
       "Dark Heather",
       "Maroon"
+    ],
+    "storefront_display_color_priority": [
+      "Dark Heather",
+      "Maroon",
+      "Black",
+      "Navy",
+      "Charcoal",
+      "Sport Grey",
+      "Sand",
+      "White"
+    ],
+    "storefront_display_color_rotation_seed": "hoodie_gildan_v1",
+    "storefront_default_color_candidates": [
+      "Dark Heather",
+      "Maroon",
+      "White"
     ],
     "min_profit_after_shipping": "3.00"
   },
