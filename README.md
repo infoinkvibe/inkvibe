@@ -793,4 +793,5 @@ python printify_shopify_sync_pipeline.py \
 
 Notes:
 - QA rows include launch-plan metadata when run with `--launch-plan`.
+- QA CSV/JSON exports include metadata and copy provenance columns such as `metadata_resolution_source`, `metadata_generated_inline`, `metadata_sidecar_written`, `copy_provenance`, and `ai_product_copy_cache_reason`.
 - Mockup/image selection is still partially provider/channel-dependent in Printify, so this report flags publish intent and placement context, but cannot guarantee exact storefront mockup ordering.
