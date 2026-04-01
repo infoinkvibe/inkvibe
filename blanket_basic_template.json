@@ -1,9 +1,9 @@
 {
   "key": "blanket_basic",
-  "printify_blueprint_id": 50,
-  "printify_print_provider_id": 1,
-  "pinned_blueprint_id": 50,
-  "pinned_provider_id": 1,
+  "printify_blueprint_id": 238,
+  "printify_print_provider_id": 99,
+  "pinned_blueprint_id": 238,
+  "pinned_provider_id": 99,
   "provider_selection_strategy": "prefer_printify_choice_then_ranked",
   "fallback_provider_allowed": true,
   "active": true,

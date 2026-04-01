@@ -5463,6 +5463,29 @@ def test_tote_template_file_stays_in_sync_with_product_templates():
     assert tote_primary.printify_print_provider_id == tote_standalone.printify_print_provider_id == 74
 
 
+def test_blanket_template_uses_recovered_live_mapping_not_stale_pair():
+    templates = load_templates(Path("product_templates.json"))
+    blanket = next(t for t in templates if t.key == "blanket_basic")
+    assert blanket.printify_blueprint_id == 238
+    assert blanket.printify_print_provider_id == 99
+    assert blanket.pinned_blueprint_id == 238
+    assert blanket.pinned_provider_id == 99
+    assert (blanket.printify_blueprint_id, blanket.printify_print_provider_id) != (50, 1)
+    assert blanket.enabled_sizes == ['50" × 60"', '60" × 80"']
+    assert blanket.max_enabled_variants == 6
+
+
+def test_blanket_template_file_stays_in_sync_with_product_templates():
+    product_templates = load_templates(Path("product_templates.json"))
+    blanket_templates = load_templates(Path("blanket_basic_template.json"))
+    blanket_primary = next(t for t in product_templates if t.key == "blanket_basic")
+    blanket_standalone = next(t for t in blanket_templates if t.key == "blanket_basic")
+    assert blanket_primary.printify_blueprint_id == blanket_standalone.printify_blueprint_id == 238
+    assert blanket_primary.printify_print_provider_id == blanket_standalone.printify_print_provider_id == 99
+    assert blanket_primary.pinned_blueprint_id == blanket_standalone.pinned_blueprint_id == 238
+    assert blanket_primary.pinned_provider_id == blanket_standalone.pinned_provider_id == 99
+
+
 def test_phone_and_sticker_template_files_stay_in_sync_with_product_templates():
     product_templates = load_templates(Path("product_templates.json"))
     phone_templates = load_templates(Path("phone_case_basic_template.json"))
@@ -5512,6 +5535,56 @@ def test_non_poster_family_mappings_remain_unchanged():
     assert by_key["longsleeve_gildan"].printify_print_provider_id == 30
     assert by_key["mug_new"].printify_blueprint_id == 68
     assert by_key["mug_new"].printify_print_provider_id == 1
+
+
+def test_blanket_catalog_happy_path_uses_pinned_mapping_without_discovery():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [{"id": 238, "title": "Mink-Cotton Blanket"}]
+
+        def list_print_providers(self, blueprint_id):
+            assert blueprint_id == 238
+            return [{"id": 99, "title": "Printify Choice"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            assert (blueprint_id, provider_id) == (238, 99)
+            return [
+                {"id": 11, "is_available": True, "cost": 2800, "price": 3600, "options": {"Size": '50" × 60"', "Material": "Mink"}},
+                {"id": 12, "is_available": True, "cost": 3300, "price": 4300, "options": {"Size": '60" × 80"', "Material": "Mink"}},
+            ]
+
+    template = next(t for t in load_templates(Path("product_templates.json")) if t.key == "blanket_basic")
+    passed, issues, rows = preflight_active_templates(printify=DummyPrintify(), templates=[template], explicit_template_keys=[])
+    assert issues == []
+    assert len(passed) == 1
+    row = rows[0]
+    assert row.template_hint_blueprint_id == 238
+    assert row.template_hint_provider_id == 99
+    assert row.blueprint_id == 238
+    assert row.provider_id == 99
+    assert row.catalog_discovery_used is False
+    assert row.fallback_discovery_triggered is False
+    assert row.final_enabled_count == 2
+    option_values = json.loads(row.option_values_summary)
+    assert option_values["Size"] == ['50" × 60"', '60" × 80"']
+
+
+def test_blanket_and_related_template_deferment_and_resolution_guards_remain_unchanged():
+    templates = load_templates(Path("product_templates.json"))
+    by_key = {template.key: template for template in templates}
+
+    assert by_key["throw_pillow_basic"].active is False
+    assert "embroidered_hat_basic" not in by_key
+    assert by_key["tote_basic"].printify_blueprint_id == 609
+    assert by_key["tote_basic"].printify_print_provider_id == 74
+    assert by_key["tumbler_20oz_basic"].printify_blueprint_id == 1927
+    assert by_key["tumbler_20oz_basic"].printify_print_provider_id == 410
+    assert by_key["travel_mug_basic"].printify_blueprint_id == 1513
+    assert by_key["travel_mug_basic"].printify_print_provider_id == 217
+    assert by_key["canvas_basic"].min_source_width == 4500
+    assert by_key["canvas_basic"].min_source_height == 5400
+    assert by_key["framed_poster_basic"].min_source_width == 4500
+    assert by_key["framed_poster_basic"].min_source_height == 5400
 
 
 def test_next_wave_templates_define_provider_blueprint_and_variant_guards():
