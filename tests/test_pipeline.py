@@ -1743,6 +1743,68 @@ def test_theme_audience_and_season_normalization_defaults_safely(tmp_path: Path)
     assert org["normalized_season_keys"] == ["evergreen"]
 
 
+@pytest.mark.parametrize(
+    ("template_key", "product_type_label", "shopify_type", "expected_suffix"),
+    [
+        ("canvas_basic", "Canvas Print", "Canvas Prints", "canvas print"),
+        ("blanket_basic", "Blanket", "Blankets", "blanket"),
+        ("tumbler_20oz_basic", "20 oz Tumbler", "Tumblers", "20 oz tumbler"),
+        ("travel_mug_basic", "Travel Mug", "Travel Mugs", "travel mug"),
+        ("tote_basic", "Tote Bag", "Tote Bags", "tote bag"),
+    ],
+)
+def test_live_family_titles_are_family_specific(
+    tmp_path: Path,
+    template_key: str,
+    product_type_label: str,
+    shopify_type: str,
+    expected_suffix: str,
+):
+    art = _create_artwork(tmp_path, 1200, 1200)
+    art.metadata = {"title": "Coastal Bloom", "description": "Ocean-inspired floral artwork for everyday lifestyle products."}
+    template = _template_for_variant_tests()
+    template.key = template_key
+    template.product_type_label = product_type_label
+    template.shopify_product_type = shopify_type
+    title = render_product_title(template, art)
+    assert expected_suffix in title.lower()
+
+
+def test_title_refinement_removes_generic_filler_prefixes(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1200, 1200)
+    art.metadata = {"title": "Happy Abstract Coastal Bloom"}
+    template = _template_for_variant_tests()
+    template.key = "canvas_basic"
+    template.product_type_label = "Canvas Print"
+    template.shopify_product_type = "Canvas Prints"
+    title = render_product_title(template, art)
+    assert "canvas print" in title.lower()
+    assert not title.lower().startswith("happy ")
+    assert not title.lower().startswith("abstract ")
+
+
+def test_live_family_descriptions_are_family_specific(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1200, 1200)
+    art.metadata = {"title": "Coastal Bloom"}
+    template = _template_for_variant_tests()
+    template.description_pattern = "<p>{artwork_title}</p>"
+
+    template.key = "canvas_basic"
+    template.product_type_label = "Canvas Print"
+    canvas_desc = render_product_description(template, art).lower()
+    assert "wall art" in canvas_desc
+
+    template.key = "blanket_basic"
+    template.product_type_label = "Blanket"
+    blanket_desc = render_product_description(template, art).lower()
+    assert "cozy" in blanket_desc
+
+    template.key = "travel_mug_basic"
+    template.product_type_label = "Travel Mug"
+    travel_desc = render_product_description(template, art).lower()
+    assert "commutes" in travel_desc or "travel days" in travel_desc
+
+
 def test_listing_tags_include_taxonomy_tags_without_case_duplicates(tmp_path: Path):
     art = _create_artwork(tmp_path, 1200, 1200)
     art.tags = ["Family-Sticker"]
@@ -1757,6 +1819,68 @@ def test_listing_tags_include_taxonomy_tags_without_case_duplicates(tmp_path: Pa
     assert "dept accessories" in normalized
     assert "audience sticker lovers" in normalized
     assert normalized.count("family sticker") == 1
+
+
+def test_live_family_tags_prioritize_family_and_department_tags(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1200, 1200)
+    art.metadata = {"theme": "coastal", "audience": "gift shoppers", "season": "summer", "tags": ["coastal", "gift"]}
+    template = _template_for_variant_tests()
+    template.key = "canvas_basic"
+    template.product_type_label = "Canvas Print"
+    template.shopify_product_type = "Canvas Prints"
+    tags = _render_listing_tags(template, art)
+    normalized = [tag.lower() for tag in tags]
+    assert "family canvas" in normalized
+    assert "dept home decor" in normalized
+    assert len(normalized) == len(set(normalized))
+
+
+@pytest.mark.parametrize(
+    ("template_key", "product_type_label", "shopify_type", "expected_product_type", "expected_department", "expected_handle"),
+    [
+        ("canvas_basic", "Canvas Print", "Canvas Prints", "Canvas Prints", "home-decor", "canvas-prints"),
+        ("blanket_basic", "Blanket", "Blankets", "Blankets", "home-decor", "blankets"),
+        ("tumbler_20oz_basic", "20 oz Tumbler", "Tumblers", "Tumblers", "drinkware", "tumblers"),
+        ("travel_mug_basic", "Travel Mug", "Travel Mugs", "Travel Mugs", "drinkware", "travel-mugs"),
+        ("tote_basic", "Tote Bag", "Tote Bags", "Tote Bags", "accessories", "tote-bags"),
+    ],
+)
+def test_live_family_shopify_merchandising_mapping(
+    tmp_path: Path,
+    template_key: str,
+    product_type_label: str,
+    shopify_type: str,
+    expected_product_type: str,
+    expected_department: str,
+    expected_handle: str,
+):
+    art = _create_artwork(tmp_path, 1200, 1200)
+    template = _template_for_variant_tests()
+    template.key = template_key
+    template.product_type_label = product_type_label
+    template.shopify_product_type = shopify_type
+    org = build_normalized_shopify_organization(template, art)
+    assert org["recommended_product_type"] == expected_product_type
+    assert org["department_key"] == expected_department
+    assert org["primary_collection_handle"] == expected_handle
+    assert org["recommended_manual_collections"] == ["featured", "new-drops", "best-sellers"]
+
+
+def test_deferred_families_keep_existing_collection_mapping(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1200, 1200)
+    throw_template = _template_for_variant_tests()
+    throw_template.key = "throw_pillow_basic"
+    throw_template.product_type_label = "Throw Pillow"
+    throw_template.shopify_product_type = "Home Decor"
+    throw_org = build_normalized_shopify_organization(throw_template, art)
+    assert throw_org["primary_collection_handle"] == "throw-pillows"
+
+    hat_template = _template_for_variant_tests()
+    hat_template.key = "embroidered_hat_basic"
+    hat_template.product_type_label = "Embroidered Hat"
+    hat_template.shopify_product_type = "Accessories"
+    hat_org = build_normalized_shopify_organization(hat_template, art)
+    assert hat_org["primary_collection_handle"] == "embroidered-hats"
 
 
 @pytest.mark.parametrize(
