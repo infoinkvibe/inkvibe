@@ -905,8 +905,8 @@
   },
   {
     "key": "framed_poster_basic",
-    "printify_blueprint_id": 853,
-    "printify_print_provider_id": 73,
+    "printify_blueprint_id": 764,
+    "printify_print_provider_id": 72,
     "title_pattern": "{artwork_title} Framed Poster",
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],
@@ -960,8 +960,8 @@
     ],
     "preferred_featured_image_strategy": "mockup_type_then_variant_color",
     "provider_selection_strategy": "pinned_then_printify_choice_then_lowest_cost",
-    "pinned_provider_id": 73,
-    "pinned_blueprint_id": 853,
+    "pinned_provider_id": 72,
+    "pinned_blueprint_id": 764,
     "fallback_provider_allowed": true,
     "publish_to_shopify": false,
     "push_via_printify": true,
@@ -981,8 +981,8 @@
   },
   {
     "key": "tumbler_20oz_basic",
-    "printify_blueprint_id": 619,
-    "printify_print_provider_id": 1,
+    "printify_blueprint_id": 1927,
+    "printify_print_provider_id": 410,
     "title_pattern": "{artwork_title} 20oz Tumbler",
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],
@@ -1039,8 +1039,8 @@
     ],
     "preferred_featured_image_strategy": "variant_color_then_mockup_type",
     "provider_selection_strategy": "pinned_then_printify_choice_then_lowest_cost",
-    "pinned_provider_id": 1,
-    "pinned_blueprint_id": 619,
+    "pinned_provider_id": 410,
+    "pinned_blueprint_id": 1927,
     "fallback_provider_allowed": true,
     "publish_to_shopify": false,
     "push_via_printify": true,
@@ -1060,18 +1060,18 @@
   },
   {
     "key": "travel_mug_basic",
-    "printify_blueprint_id": 84,
-    "printify_print_provider_id": 1,
+    "printify_blueprint_id": 1513,
+    "printify_print_provider_id": 217,
     "title_pattern": "{artwork_title} Travel Mug",
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],
     "enabled_sizes": [
-      "15oz"
+      "20oz"
     ],
     "enabled_variant_option_filters": {
       "color": [],
       "size": [
-        "15oz"
+        "20oz"
       ]
     },
     "max_enabled_variants": 1,
@@ -1118,8 +1118,8 @@
     ],
     "preferred_featured_image_strategy": "variant_color_then_mockup_type",
     "provider_selection_strategy": "pinned_then_printify_choice_then_lowest_cost",
-    "pinned_provider_id": 1,
-    "pinned_blueprint_id": 84,
+    "pinned_provider_id": 217,
+    "pinned_blueprint_id": 1513,
     "fallback_provider_allowed": true,
     "publish_to_shopify": false,
     "push_via_printify": true,

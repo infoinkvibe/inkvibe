@@ -4502,6 +4502,34 @@ def test_preflight_sticker_remains_inactive_with_correct_family_when_requested_s
     assert report_rows[0].intended_family == "sticker"
 
 
+def test_preflight_travel_mug_selects_variants_with_20oz_capacity_filter():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [{"id": 1513, "title": "Travel Mug"}]
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 217, "title": "SPOKE Custom Products"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [{"id": 1, "is_available": True, "cost": 1200, "price": 2100, "options": {"Capacity": "20oz", "Color": "White"}}]
+
+    template = ProductTemplate(
+        "travel_mug_basic",
+        1513,
+        217,
+        "{artwork_title}",
+        "{artwork_title}",
+        enabled_variant_option_filters={"size": ["20oz"]},
+        provider_selection_strategy="pinned_then_printify_choice_then_lowest_cost",
+    )
+    passed, issues, report_rows = preflight_active_templates(printify=DummyPrintify(), templates=[template], explicit_template_keys=[])
+    assert len(passed) == 1
+    assert passed[0].key == "travel_mug_basic"
+    assert issues == []
+    assert report_rows[0].classification == ""
+    assert report_rows[0].selected_count == 1
+
+
 def test_validate_catalog_family_schema_rejects_wrong_family_for_canvas():
     template = ProductTemplate("canvas_basic", 13, 1, "{artwork_title}", "{artwork_title}", product_type_label="Canvas Print")
     variants = [{"id": 1, "is_available": True, "options": {"Device Model": "iPhone 15", "Finish": "Glossy"}}]
@@ -4521,7 +4549,7 @@ def test_validate_catalog_family_schema_rejects_wrong_family_for_blanket():
 
 
 def test_validate_catalog_family_schema_accepts_framed_poster_schema():
-    template = ProductTemplate("framed_poster_basic", 853, 73, "{artwork_title}", "{artwork_title}", product_type_label="Framed Poster")
+    template = ProductTemplate("framed_poster_basic", 764, 72, "{artwork_title}", "{artwork_title}", product_type_label="Framed Poster")
     variants = [
         {"id": 1, "is_available": True, "options": {"Size": '11" x 14" (Vertical)', "Frame Color": "Black"}},
         {"id": 2, "is_available": True, "options": {"Size": '16" x 20" (Vertical)', "Frame Color": "Walnut"}},
@@ -4532,7 +4560,7 @@ def test_validate_catalog_family_schema_accepts_framed_poster_schema():
 
 
 def test_validate_catalog_family_schema_accepts_tumbler_schema():
-    template = ProductTemplate("tumbler_20oz_basic", 619, 1, "{artwork_title}", "{artwork_title}", product_type_label="20oz Tumbler")
+    template = ProductTemplate("tumbler_20oz_basic", 1927, 410, "{artwork_title}", "{artwork_title}", product_type_label="20oz Tumbler")
     variants = [
         {"id": 1, "is_available": True, "options": {"Size": "20oz", "Color": "White"}},
     ]
@@ -4542,9 +4570,9 @@ def test_validate_catalog_family_schema_accepts_tumbler_schema():
 
 
 def test_validate_catalog_family_schema_accepts_travel_mug_schema():
-    template = ProductTemplate("travel_mug_basic", 84, 1, "{artwork_title}", "{artwork_title}", product_type_label="Travel Mug")
+    template = ProductTemplate("travel_mug_basic", 1513, 217, "{artwork_title}", "{artwork_title}", product_type_label="Travel Mug")
     variants = [
-        {"id": 1, "is_available": True, "options": {"Capacity": "15oz", "Color": "White"}},
+        {"id": 1, "is_available": True, "options": {"Capacity": "20oz", "Color": "White"}},
     ]
     result = validate_catalog_family_schema(template=template, variants=variants, blueprint_title="Travel Mug")
     assert result.intended_family == "travel_mug"
@@ -5426,18 +5454,28 @@ def test_next_wave_templates_define_provider_blueprint_and_variant_guards():
     by_key = {template.key: template for template in templates}
 
     framed = by_key["framed_poster_basic"]
-    assert framed.printify_blueprint_id > 0
-    assert framed.printify_print_provider_id > 0
+    assert framed.printify_blueprint_id == 764
+    assert framed.printify_print_provider_id == 72
+    assert framed.pinned_blueprint_id == 764
+    assert framed.pinned_provider_id == 72
     assert framed.enabled_sizes
     assert framed.mark_template_nonviable_if_needed is True
 
     tumbler = by_key["tumbler_20oz_basic"]
+    assert tumbler.printify_blueprint_id == 1927
+    assert tumbler.printify_print_provider_id == 410
+    assert tumbler.pinned_blueprint_id == 1927
+    assert tumbler.pinned_provider_id == 410
     assert tumbler.enabled_variant_option_filters.get("size") == ["20oz"]
     assert tumbler.max_enabled_variants == 1
     assert tumbler.reprice_variants_to_margin_floor is True
 
     travel = by_key["travel_mug_basic"]
-    assert travel.enabled_variant_option_filters.get("size") == ["15oz"]
+    assert travel.printify_blueprint_id == 1513
+    assert travel.printify_print_provider_id == 217
+    assert travel.pinned_blueprint_id == 1513
+    assert travel.pinned_provider_id == 217
+    assert travel.enabled_variant_option_filters.get("size") == ["20oz"]
     assert travel.max_enabled_variants == 1
     assert travel.disable_variants_below_margin_floor is True
 
@@ -5923,6 +5961,19 @@ def test_canvas_artwork_below_threshold_is_ineligible_early(tmp_path: Path):
     assert result.source_size == (1280, 1280)
     assert result.required_size == (4500, 5400)
     assert result.fit_mode == "cover"
+
+
+def test_framed_poster_artwork_below_threshold_is_ineligible_early(tmp_path: Path):
+    art = tmp_path / "framed-poster-small.png"
+    Image.new("RGBA", (1024, 1536), (1, 2, 3, 255)).save(art)
+    artwork = Artwork("a", art, "A", "", [], 1024, 1536)
+    template = next(t for t in load_templates(Path("product_templates.json")) if t.key == "framed_poster_basic")
+    placement = template.placements[0]
+    result = evaluate_artwork_eligibility_for_template(artwork=artwork, template=template, placement=placement)
+    assert result.eligible is False
+    assert result.reason_code == "insufficient_artwork_resolution"
+    assert result.source_size == (1024, 1536)
+    assert result.required_size == (4500, 5400)
 
 
 def test_blanket_artwork_below_threshold_is_ineligible_early(tmp_path: Path):
