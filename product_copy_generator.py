@@ -302,6 +302,13 @@ def maybe_generate_product_copy(
             getattr(template, "key", ""),
             cache_reason,
         )
+    else:
+        logger.debug(
+            "AI product copy cache miss artwork=%s template=%s reason=%s",
+            getattr(artwork, "slug", ""),
+            getattr(template, "key", ""),
+            cache_reason,
+        )
 
     payload = _build_payload(template=template, artwork=artwork, context=context, family=family)
     prompt = _build_prompt(payload)

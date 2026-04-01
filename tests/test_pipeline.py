@@ -2306,6 +2306,51 @@ def test_ai_product_copy_unsupported_family_falls_back(monkeypatch: pytest.Monke
     assert generated is None
 
 
+def test_ai_product_copy_cache_miss_reason_logged(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture):
+    art = _create_artwork(tmp_path, 1000, 1000)
+    art.metadata = {}
+    template = _template_for_variant_tests()
+    template.key = "poster_basic"
+    template.product_type_label = "Poster"
+    template.shopify_product_type = "Posters"
+
+    class _StubClient:
+        def __init__(self, *_args, **_kwargs):
+            self.responses = self
+
+        def create(self, **_kwargs):
+            return types.SimpleNamespace(
+                output_text=json.dumps(
+                    {
+                        "title": "Poster Title",
+                        "title_alternatives": ["Poster Alt"],
+                        "short_description": "Short poster copy",
+                        "long_description": "Long poster copy describing wall decor mood and centerpiece energy.",
+                        "seo_title": "Poster SEO",
+                        "meta_description": "Poster metadata description",
+                        "tags": ["poster", "wall decor", "gift idea"],
+                        "chosen_angle": "wall_decor_mood",
+                    }
+                )
+            )
+
+    monkeypatch.setattr(product_copy_generator, "OpenAI", _StubClient)
+    with caplog.at_level(logging.DEBUG):
+        generated = product_copy_generator.maybe_generate_product_copy(
+            template=template,
+            artwork=art,
+            context=build_seo_context(template, art),
+            family="poster",
+            enabled=True,
+            model="gpt-4.1-mini",
+            api_key="test",
+        )
+
+    assert generated is not None
+    assert "AI product copy cache miss artwork=" in caplog.text
+    assert "reason=cache_bucket_missing" in caplog.text
+
+
 def test_ai_product_copy_cache_hit_skips_second_generation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     art = _create_artwork(tmp_path, 1000, 1000)
     art.metadata = {}
