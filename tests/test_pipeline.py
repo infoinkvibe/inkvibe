@@ -4,6 +4,7 @@ import json
 import logging
 import sys
 import types
+from dataclasses import fields
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -61,6 +62,8 @@ from printify_shopify_sync_pipeline import (
     run_catalog_cli,
     RunSummary,
     RunReportRow,
+    FailureReportRow,
+    StorefrontQaRow,
     list_state_keys,
     inspect_state_key,
     load_artwork_metadata,
@@ -4088,6 +4091,87 @@ def test_run_report_export_includes_eligibility_gate_columns(tmp_path: Path):
     assert "required_placement_size" in text
     assert "eligibility_gate_stage" in text
     assert "insufficient_artwork_resolution" in text
+
+
+def test_storefront_qa_schema_contract_includes_observability_fields():
+    columns = {field.name for field in fields(StorefrontQaRow)}
+    expected = {
+        "artwork_filename",
+        "artwork_slug",
+        "template_key",
+        "qa_status",
+        "qa_warning_count",
+        "qa_error_count",
+        "metadata_resolution_source",
+        "metadata_generated_inline",
+        "metadata_sidecar_written",
+        "copy_provenance",
+        "ai_product_copy_cache_reason",
+    }
+    assert expected.issubset(columns)
+
+
+def test_run_report_schema_contract_includes_observability_and_queue_fields():
+    columns = {field.name for field in fields(RunReportRow)}
+    expected = {
+        "artwork_filename",
+        "artwork_slug",
+        "template_key",
+        "status",
+        "action",
+        "product_id",
+        "publish_queue_status",
+        "publish_queue_status_before",
+        "publish_queue_status_after",
+        "metadata_resolution_source",
+        "metadata_generated_inline",
+        "metadata_sidecar_written",
+        "final_title_source",
+    }
+    assert expected.issubset(columns)
+
+
+def test_failure_report_schema_contract_includes_core_fields():
+    columns = {field.name for field in fields(FailureReportRow)}
+    expected = {
+        "timestamp",
+        "artwork_filename",
+        "artwork_slug",
+        "template_key",
+        "action_attempted",
+        "error_type",
+        "reason_code",
+        "error_message",
+        "suggested_next_action",
+    }
+    assert expected.issubset(columns)
+
+
+def test_storefront_qa_export_populates_copy_cache_reason(tmp_path: Path):
+    class DummyPrintify:
+        dry_run = False
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [{"id": 1, "is_available": True, "options": {"color": "Black", "size": "M"}, "price": 1200}]
+
+    artwork = _qa_artwork(tmp_path)
+    artwork.metadata["ai_product_copy"] = {"cache:family:tshirt_gildan:art": {"title": "Cached"}}
+    artwork.metadata["ai_product_copy_cache_reason"] = "cache_hit"
+    template = _qa_template()
+    json_path = tmp_path / "storefront_qa.json"
+
+    rows = run_storefront_qa(
+        printify=DummyPrintify(),
+        artworks=[artwork],
+        templates=[template],
+        export_json_path=str(json_path),
+    )
+
+    assert rows[0].copy_provenance == "ai_product_copy_cache"
+    assert rows[0].ai_product_copy_cache_reason == "cache_hit"
+    exported = json.loads(json_path.read_text(encoding="utf-8"))
+    assert exported[0]["copy_provenance"] == "ai_product_copy_cache"
+    assert exported[0]["ai_product_copy_cache_reason"] == "cache_hit"
 
 
 def test_run_batch_size_and_resume_and_reporting(tmp_path: Path, monkeypatch):
