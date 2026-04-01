@@ -213,6 +213,16 @@ _FAMILY_CONFIG: Dict[str, Dict[str, Any]] = {
         "tags": ["blanket", "home decor", "gift idea"],
         "description_closing": "A cozy home accent designed to feel practical and expressive.",
     },
+    "throw_pillow": {
+        "suffix": "Throw Pillow",
+        "tags": ["throw pillow", "home decor", "gift idea"],
+        "description_closing": "A simple decor accent that adds comfort and visual personality.",
+    },
+    "embroidered_hat": {
+        "suffix": "Embroidered Hat",
+        "tags": ["embroidered hat", "accessories", "gift idea"],
+        "description_closing": "An everyday accessory with embroidery-friendly visual character.",
+    },
     "mug": {
         "suffix": "Mug",
         "tags": ["mug", "gift idea", "drinkware"],
@@ -260,8 +270,12 @@ def infer_product_family(template: Any) -> str:
         return "poster"
     if "canvas" in hint:
         return "canvas"
+    if "throw_pillow" in hint or "throw pillow" in hint or "pillow" in hint:
+        return "throw_pillow"
     if "blanket" in hint:
         return "blanket"
+    if "embroidered_hat" in hint or "embroidered hat" in hint:
+        return "embroidered_hat"
     if "phone_case" in hint or "phone case" in hint:
         return "phone_case"
     if "sticker" in hint or "kiss cut" in hint or "kisscut" in hint:
@@ -306,6 +320,8 @@ def build_branded_description(*, artwork_title: str, short_description: str, tem
         "mug": "Made for coffee rituals, tea breaks, and desk-side personality.",
         "tumbler": "Great for commuting, workouts, and all-day hydration routines.",
         "travel_mug": "A practical companion for commutes, road trips, and desk coffee sessions.",
+        "throw_pillow": "A cozy, square-friendly decor accent for sofas, beds, and reading corners.",
+        "embroidered_hat": "Great for daily wear when you want a subtle, stitched art-forward accessory.",
         "default": "Made for everyday use with bold visual personality.",
     }
     idx = int(hashlib.sha256(f"{family}:{artwork_title}".encode("utf-8")).hexdigest()[:2], 16) % len(gift_openers)

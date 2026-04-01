@@ -1776,6 +1776,8 @@ def test_listing_tags_include_taxonomy_tags_without_case_duplicates(tmp_path: Pa
         ("sticker_kisscut", "Sticker", "Stickers", "sticker"),
         ("canvas_basic", "Canvas", "Canvas Prints", "canvas"),
         ("blanket_basic", "Blanket", "Blankets", "blanket"),
+        ("throw_pillow_basic", "Throw Pillow", "Home Decor", "throw_pillow"),
+        ("embroidered_hat_basic", "Embroidered Hat", "Accessories", "embroidered_hat"),
     ],
 )
 def test_family_inference_supports_normalized_shopify_taxonomy_keys(
@@ -2490,8 +2492,8 @@ def test_default_product_templates_only_include_proven_active_set():
     templates = load_templates(Path("product_templates.json"))
     active_keys = {template.key for template in templates if template.active}
     assert set(PRODUCTION_BASELINE_TEMPLATE_KEYS).issubset(active_keys)
-    assert {"canvas_basic", "framed_poster_basic", "tote_basic", "tumbler_20oz_basic", "travel_mug_basic"}.issubset(active_keys)
-    assert "blanket_basic" not in active_keys
+    assert {"canvas_basic", "blanket_basic", "framed_poster_basic", "tote_basic", "tumbler_20oz_basic", "travel_mug_basic"}.issubset(active_keys)
+    assert "throw_pillow_basic" not in active_keys
 
 
 def test_production_baseline_template_keys_are_frozen_to_current_validated_set():
@@ -4579,6 +4581,23 @@ def test_validate_catalog_family_schema_accepts_travel_mug_schema():
     assert result.plausible is True
 
 
+def test_validate_catalog_family_schema_accepts_throw_pillow_schema():
+    template = ProductTemplate("throw_pillow_basic", 9, 1, "{artwork_title}", "{artwork_title}", product_type_label="Throw Pillow")
+    variants = [{"options": {"size": '18" x 18"', "material": "Spun Polyester"}}]
+    result = validate_catalog_family_schema(template=template, variants=variants, blueprint_title="Throw Pillow")
+    assert result.intended_family == "throw_pillow"
+    assert result.plausible is True
+
+
+def test_validate_catalog_family_schema_rejects_embroidered_hat_without_embroidery_signal():
+    template = ProductTemplate("embroidered_hat_basic", 9, 1, "{artwork_title}", "{artwork_title}", product_type_label="Embroidered Hat")
+    variants = [{"options": {"color": "Black", "size": "One size"}}]
+    result = validate_catalog_family_schema(template=template, variants=variants, blueprint_title="Dad Hat")
+    assert result.intended_family == "embroidered_hat"
+    assert result.plausible is False
+    assert "missing hat+embroidery signals" in (result.reason or "").lower()
+
+
 def test_select_provider_for_template_discovers_canvas_mapping_when_template_hint_is_wrong_family():
     class DummyPrintify:
         def list_blueprints(self):
@@ -4861,6 +4880,51 @@ def test_preflight_blanket_recovers_to_plausible_mapping_and_stays_inactive():
     assert row.catalog_discovery_used is True
     assert row.fallback_discovery_triggered is True
     assert row.intended_family == "blanket"
+    assert row.final_enabled_count > 0
+
+
+def test_preflight_throw_pillow_recovers_to_plausible_mapping_and_stays_inactive():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [
+                {"id": 9, "title": "Unisex Tee"},
+                {"id": 321, "title": "Throw Pillow"},
+            ]
+
+        def list_print_providers(self, blueprint_id):
+            if blueprint_id == 9:
+                return [{"id": 99, "title": "Generic"}]
+            return [{"id": 7, "title": "Printify Choice"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            if blueprint_id == 9:
+                return [{"id": 1, "is_available": True, "options": {"Color": "Black", "Size": "M"}}]
+            return [
+                {"id": 11, "is_available": True, "cost": 2300, "price": 3200, "options": {"Size": '18" × 18"', "Material": "Spun Polyester"}},
+            ]
+
+    template = ProductTemplate(
+        "throw_pillow_basic",
+        9,
+        99,
+        "{artwork_title}",
+        "{artwork_title}",
+        active=False,
+        enabled_sizes=['18" × 18"'],
+        provider_selection_strategy="prefer_printify_choice_then_ranked",
+    )
+    passed, issues, rows = preflight_active_templates(printify=DummyPrintify(), templates=[template], explicit_template_keys=[])
+    assert issues == []
+    assert len(passed) == 1
+    assert passed[0].active is False
+    row = rows[0]
+    assert row.template_key == "throw_pillow_basic"
+    assert row.template_hint_blueprint_id == 9
+    assert row.blueprint_id == 321
+    assert row.provider_id == 7
+    assert row.catalog_discovery_used is True
+    assert row.fallback_discovery_triggered is True
+    assert row.intended_family == "throw_pillow"
     assert row.final_enabled_count > 0
 
 
@@ -5420,7 +5484,8 @@ def test_unresolved_families_remain_inactive():
     templates = load_templates(Path("product_templates.json"))
     by_key = {template.key: template for template in templates}
     assert by_key["canvas_basic"].active is True
-    assert by_key["blanket_basic"].active is False
+    assert by_key["blanket_basic"].active is True
+    assert by_key["throw_pillow_basic"].active is False
     assert by_key["tote_basic"].active is True
     assert by_key["framed_poster_basic"].active is True
     assert by_key["tumbler_20oz_basic"].active is True
@@ -5998,6 +6063,30 @@ def test_blanket_artwork_below_threshold_is_ineligible_early(tmp_path: Path):
     assert result.reason_code == "insufficient_artwork_resolution"
     assert result.source_size == (1280, 1280)
     assert result.required_size == (6000, 4800)
+
+
+def test_throw_pillow_artwork_below_threshold_is_ineligible_early(tmp_path: Path):
+    art = tmp_path / "throw-pillow-small.png"
+    Image.new("RGBA", (2200, 2200), (1, 2, 3, 255)).save(art)
+    artwork = Artwork("a", art, "A", "", [], 2200, 2200)
+    template = ProductTemplate(
+        key="throw_pillow_basic",
+        printify_blueprint_id=321,
+        printify_print_provider_id=7,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        high_resolution_family=True,
+        skip_if_artwork_below_threshold=True,
+        min_source_width=4500,
+        min_source_height=4500,
+        min_effective_cover_ratio=1.0,
+        placements=[PlacementRequirement("front", 4500, 4500, artwork_fit_mode="cover")],
+    )
+    result = evaluate_artwork_eligibility_for_template(artwork=artwork, template=template, placement=template.placements[0])
+    assert result.eligible is False
+    assert result.reason_code == "insufficient_artwork_resolution"
+    assert result.source_size == (2200, 2200)
+    assert result.required_size == (4500, 4500)
     assert result.fit_mode == "cover"
 
 
@@ -6895,6 +6984,8 @@ def test_family_collection_mapping_routes_active_families_correctly():
     assert actual["tote_basic"] == "tote-bags"
     assert actual["tumbler_20oz_basic"] == "tumblers"
     assert actual["travel_mug_basic"] == "travel-mugs"
+    assert actual["blanket_basic"] == "blankets"
+    assert actual["throw_pillow_basic"] == "throw-pillows"
 
 
 def test_preferred_mockup_color_selection_prefers_non_white_when_available():

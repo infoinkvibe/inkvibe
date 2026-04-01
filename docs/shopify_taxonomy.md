@@ -17,6 +17,8 @@ This document describes InkVibeAuto's normalized organization metadata used to m
 | tote | Tote Bags | tote-bags | accessories |
 | canvas | Canvas Prints | canvas-prints | home-decor |
 | blanket | Blankets | blankets | home-decor |
+| throw_pillow | Throw Pillows | throw-pillows | home-decor |
+| embroidered_hat | Embroidered Hats | embroidered-hats | accessories |
 
 ## Department mapping
 
