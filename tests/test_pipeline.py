@@ -1768,7 +1768,10 @@ def test_listing_tags_include_taxonomy_tags_without_case_duplicates(tmp_path: Pa
         ("longsleeve_gildan", "Long Sleeve", "Long Sleeve Shirts", "long_sleeve"),
         ("mug_new", "Mug", "Mugs", "mug"),
         ("poster_basic", "Poster", "Posters", "poster"),
+        ("framed_poster_basic", "Framed Poster", "Framed Posters", "framed_poster"),
         ("tote_basic", "Tote Bag", "Tote Bags", "tote"),
+        ("tumbler_20oz_basic", "20oz Tumbler", "Drinkware", "tumbler"),
+        ("travel_mug_basic", "Travel Mug", "Drinkware", "travel_mug"),
         ("phone_case_basic", "Phone Case", "Phone Cases", "phone_case"),
         ("sticker_kisscut", "Sticker", "Stickers", "sticker"),
         ("canvas_basic", "Canvas", "Canvas Prints", "canvas"),
@@ -2486,10 +2489,9 @@ def test_template_filtering_defaults_to_active_only():
 def test_default_product_templates_only_include_proven_active_set():
     templates = load_templates(Path("product_templates.json"))
     active_keys = {template.key for template in templates if template.active}
-    assert active_keys == set(PRODUCTION_BASELINE_TEMPLATE_KEYS)
-    assert len(active_keys) == 7
-    for key in {"canvas_basic", "blanket_basic", "tote_basic"}:
-        assert key not in active_keys
+    assert set(PRODUCTION_BASELINE_TEMPLATE_KEYS).issubset(active_keys)
+    assert {"canvas_basic", "framed_poster_basic", "tote_basic", "tumbler_20oz_basic", "travel_mug_basic"}.issubset(active_keys)
+    assert "blanket_basic" not in active_keys
 
 
 def test_production_baseline_template_keys_are_frozen_to_current_validated_set():
@@ -5249,9 +5251,12 @@ def test_phone_and_sticker_template_files_stay_in_sync_with_product_templates():
 def test_unresolved_families_remain_inactive():
     templates = load_templates(Path("product_templates.json"))
     by_key = {template.key: template for template in templates}
-    assert by_key["canvas_basic"].active is False
+    assert by_key["canvas_basic"].active is True
     assert by_key["blanket_basic"].active is False
-    assert by_key["tote_basic"].active is False
+    assert by_key["tote_basic"].active is True
+    assert by_key["framed_poster_basic"].active is True
+    assert by_key["tumbler_20oz_basic"].active is True
+    assert by_key["travel_mug_basic"].active is True
 
 
 def test_tote_front_primary_and_publish_only_primary_behavior_preserved():
@@ -5275,6 +5280,26 @@ def test_non_poster_family_mappings_remain_unchanged():
     assert by_key["mug_new"].printify_blueprint_id == 68
     assert by_key["mug_new"].printify_print_provider_id == 1
 
+
+def test_next_wave_templates_define_provider_blueprint_and_variant_guards():
+    templates = load_templates(Path("product_templates.json"))
+    by_key = {template.key: template for template in templates}
+
+    framed = by_key["framed_poster_basic"]
+    assert framed.printify_blueprint_id > 0
+    assert framed.printify_print_provider_id > 0
+    assert framed.enabled_sizes
+    assert framed.mark_template_nonviable_if_needed is True
+
+    tumbler = by_key["tumbler_20oz_basic"]
+    assert tumbler.enabled_variant_option_filters.get("size") == ["20oz"]
+    assert tumbler.max_enabled_variants == 1
+    assert tumbler.reprice_variants_to_margin_floor is True
+
+    travel = by_key["travel_mug_basic"]
+    assert travel.enabled_variant_option_filters.get("size") == ["15oz"]
+    assert travel.max_enabled_variants == 1
+    assert travel.disable_variants_below_margin_floor is True
 
 
 def test_shirt_template_enables_allow_upscale_while_mug_stays_conservative():
@@ -6656,7 +6681,10 @@ def test_family_collection_mapping_routes_active_families_correctly():
     assert actual["sweatshirt_gildan"] == "sweatshirts"
     assert actual["mug_new"] == "mugs"
     assert actual["poster_basic"] == "posters"
+    assert actual["framed_poster_basic"] == "framed-posters"
     assert actual["tote_basic"] == "tote-bags"
+    assert actual["tumbler_20oz_basic"] == "tumblers"
+    assert actual["travel_mug_basic"] == "travel-mugs"
 
 
 def test_preferred_mockup_color_selection_prefers_non_white_when_available():
