@@ -785,6 +785,17 @@ class StorefrontQaRow:
     collection_title: str = ""
     campaign: str = ""
     merch_theme: str = ""
+    family: str = ""
+    product_type: str = ""
+    department_key: str = ""
+    department_label: str = ""
+    primary_collection_handle: str = ""
+    primary_collection_title: str = ""
+    recommended_manual_collections: str = ""
+    recommended_smart_collection_tags: str = ""
+    normalized_theme_keys: str = ""
+    normalized_audience_keys: str = ""
+    normalized_season_keys: str = ""
 
 
 @dataclass
@@ -998,6 +1009,55 @@ MANUAL_MERCH_COLLECTIONS: Dict[str, Dict[str, str]] = {
     "best-sellers": {"title": "Best Sellers", "handle": "best-sellers"},
 }
 
+SHOPIFY_PRODUCT_TYPE_BY_FAMILY: Dict[str, str] = {
+    "tshirt": "T-Shirts",
+    "long_sleeve": "Long Sleeve Shirts",
+    "hoodie": "Hoodies",
+    "sweatshirt": "Sweatshirts",
+    "mug": "Mugs",
+    "tumbler": "Tumblers",
+    "travel_mug": "Travel Mugs",
+    "poster": "Posters",
+    "framed_poster": "Framed Posters",
+    "canvas": "Canvas Prints",
+    "blanket": "Blankets",
+    "tote": "Tote Bags",
+    "phone_case": "Phone Cases",
+    "sticker": "Stickers",
+    "throw_pillow": "Throw Pillows",
+    "embroidered_hat": "Embroidered Hats",
+}
+
+SHOPIFY_CATEGORY_LABEL_BY_FAMILY: Dict[str, str] = {
+    "tshirt": "Apparel & Accessories > Clothing > Shirts & Tops",
+    "long_sleeve": "Apparel & Accessories > Clothing > Shirts & Tops",
+    "hoodie": "Apparel & Accessories > Clothing > Activewear > Hoodies & Sweatshirts",
+    "sweatshirt": "Apparel & Accessories > Clothing > Activewear > Hoodies & Sweatshirts",
+    "mug": "Home & Garden > Kitchen & Dining > Tableware > Drinkware > Mugs",
+    "tumbler": "Home & Garden > Kitchen & Dining > Tableware > Drinkware",
+    "travel_mug": "Home & Garden > Kitchen & Dining > Tableware > Drinkware > Travel Mugs",
+    "poster": "Home & Garden > Decor > Artwork > Posters, Prints, & Visual Artwork",
+    "framed_poster": "Home & Garden > Decor > Artwork > Posters, Prints, & Visual Artwork",
+    "canvas": "Home & Garden > Decor > Artwork > Posters, Prints, & Visual Artwork",
+    "blanket": "Home & Garden > Linens & Bedding > Blankets",
+    "tote": "Apparel & Accessories > Handbags, Wallets & Cases > Handbags",
+    "phone_case": "Electronics > Electronics Accessories > Mobile Phone Accessories > Mobile Phone Cases",
+    "sticker": "Arts & Entertainment > Hobbies & Creative Arts > Collectibles",
+}
+
+
+def resolve_shopify_product_type(template: ProductTemplate) -> str:
+    family = content_engine.infer_product_family(template)
+    mapped = str(SHOPIFY_PRODUCT_TYPE_BY_FAMILY.get(family) or "").strip()
+    if mapped:
+        return mapped
+    return (template.product_type_label or template.shopify_product_type or content_engine.family_title_suffix(template) or "Product").strip()
+
+
+def resolve_shopify_category_label(template: ProductTemplate) -> str:
+    family = content_engine.infer_product_family(template)
+    return str(SHOPIFY_CATEGORY_LABEL_BY_FAMILY.get(family) or "").strip()
+
 
 # -----------------------------
 # Logging / helpers
@@ -1169,9 +1229,11 @@ def build_normalized_shopify_organization(template: ProductTemplate, artwork: Ar
     normalized_theme_keys = _normalize_taxonomy_keys(theme_inputs, THEME_NORMALIZATION_PATTERNS)
     normalized_audience_keys = _normalize_taxonomy_keys(audience_inputs, AUDIENCE_NORMALIZATION_PATTERNS)
     normalized_season_keys = _normalize_taxonomy_keys(season_inputs, SEASON_NORMALIZATION_PATTERNS) or ["evergreen"]
-    merchandising_collection_handles: List[str] = []
-    if "giftable-art" in normalized_theme_keys:
-        merchandising_collection_handles.append(MANUAL_MERCH_COLLECTIONS["featured"]["handle"])
+    merchandising_collection_handles: List[str] = [
+        MANUAL_MERCH_COLLECTIONS["featured"]["handle"],
+        MANUAL_MERCH_COLLECTIONS["new-drops"]["handle"],
+        MANUAL_MERCH_COLLECTIONS["best-sellers"]["handle"],
+    ]
     smart_collection_tags = [f"family-{family.replace('_', '-')}"]
     if department_key:
         smart_collection_tags.append(f"dept-{department_key}")
@@ -1179,6 +1241,8 @@ def build_normalized_shopify_organization(template: ProductTemplate, artwork: Ar
     smart_collection_tags.extend(f"audience-{key}" for key in normalized_audience_keys)
     smart_collection_tags.extend(f"season-{key}" for key in normalized_season_keys)
     deduped_smart_tags = list(dict.fromkeys(smart_collection_tags))
+    recommended_product_type = resolve_shopify_product_type(template)
+    recommended_shopify_category_label = resolve_shopify_category_label(template)
     return {
         "family_key": family,
         "family_label": family_label,
@@ -1186,11 +1250,16 @@ def build_normalized_shopify_organization(template: ProductTemplate, artwork: Ar
         "primary_collection_title": str(family_cfg.get("title") or ""),
         "department_key": department_key,
         "department_label": department_label,
+        "shop_menu_group": department_label or "Catalog",
         "normalized_theme_keys": normalized_theme_keys,
         "normalized_audience_keys": normalized_audience_keys,
         "normalized_season_keys": normalized_season_keys,
         "merchandising_collection_handles": merchandising_collection_handles,
         "smart_collection_tags": deduped_smart_tags,
+        "recommended_manual_collections": merchandising_collection_handles,
+        "recommended_smart_collection_tags": deduped_smart_tags,
+        "recommended_product_type": recommended_product_type,
+        "recommended_shopify_category_label": recommended_shopify_category_label,
     }
 
 
@@ -1346,6 +1415,11 @@ def _refine_rendered_title(*, artwork_title: str, rendered_title: str, product_l
     candidate = _dedupe_rendered_title(rendered_title)
     candidate = re.sub(r"\b(signature product|untitled design|untitled)\b", "", candidate, flags=re.IGNORECASE)
     candidate = _dedupe_rendered_title(candidate).strip(" -")
+    filler_words = {"happy", "animated", "abstract"}
+    parts = candidate.split()
+    while len(parts) > 2 and parts and parts[0].lower() in filler_words:
+        parts = parts[1:]
+    candidate = " ".join(parts).strip()
     if not candidate:
         candidate = artwork_title.strip()
     if product_label and not title_semantically_includes_product_label(candidate, product_label):
@@ -2967,7 +3041,7 @@ def build_seo_context(template: ProductTemplate, artwork: Artwork) -> Dict[str, 
     context = content_engine.build_listing_context(template, artwork)
     organization = build_normalized_shopify_organization(template, artwork)
     merged_style = [*template.style_keywords, *_split_keywords((artwork.metadata or {}).get("style_keywords"))]
-    product_type = (template.product_type_label or template.shopify_product_type or context.get("family_label") or "Product").strip()
+    product_type = resolve_shopify_product_type(template)
     context.update(
         {
             "product_type_label": product_type,
@@ -2982,6 +3056,8 @@ def build_seo_context(template: ProductTemplate, artwork: Artwork) -> Dict[str, 
             "normalized_audience_keys": ",".join(organization.get("normalized_audience_keys", [])),
             "normalized_season_keys": ",".join(organization.get("normalized_season_keys", [])),
             "merchandising_collection_handles": ",".join(organization.get("merchandising_collection_handles", [])),
+            "recommended_product_type": str(organization.get("recommended_product_type") or ""),
+            "recommended_shopify_category_label": str(organization.get("recommended_shopify_category_label") or ""),
         }
     )
     return context
@@ -3061,7 +3137,14 @@ def _render_listing_tags(template: ProductTemplate, artwork: Artwork) -> List[st
         *_split_keywords(metadata.get("style_keywords")),
     ]
     optional_bucket = [metadata.get("audience"), metadata.get("occasion"), "inkvibe", "gift idea", *DEFAULT_TAGS]
-    bucket_order = [subject_bucket, theme_style_bucket, family_bucket, optional_bucket]
+    taxonomy_bucket: List[Any] = [f"family:{family.replace('_', '-')}"]
+    department_key = str(organization.get("department_key") or "").strip()
+    if department_key:
+        taxonomy_bucket.append(f"dept:{department_key}")
+    taxonomy_bucket.extend(f"theme:{key}" for key in organization.get("normalized_theme_keys", []))
+    taxonomy_bucket.extend(f"audience:{key}" for key in organization.get("normalized_audience_keys", []))
+    taxonomy_bucket.extend(f"season:{key}" for key in organization.get("normalized_season_keys", []))
+    bucket_order = [taxonomy_bucket, family_bucket, subject_bucket, theme_style_bucket, optional_bucket]
     tags: List[str] = []
     seen: set[str] = set()
     max_tags = 14
@@ -4901,6 +4984,7 @@ def create_in_shopify_only(
     title = render_product_title(template, artwork)
     description_html = render_product_description(template, artwork)
     tags = _render_listing_tags(template, artwork)
+    organization = build_normalized_shopify_organization(template, artwork)
     product_options, variants = build_shopify_product_options(template, variant_rows)
     handle = slugify(f"{artwork.slug}-{template.key}")
 
@@ -7473,6 +7557,7 @@ def build_storefront_qa_row(
     title = render_product_title(template, artwork)
     description_html = render_product_description(template, artwork)
     tags = _render_listing_tags(template, artwork)
+    organization = build_normalized_shopify_organization(template, artwork)
     product_options, variant_payloads = build_shopify_product_options(template, variant_rows)
     publish_payload = build_printify_publish_payload(template)
     placement_bits: List[str] = []
@@ -7554,6 +7639,17 @@ def build_storefront_qa_row(
         collection_title=collection_title,
         campaign=campaign,
         merch_theme=merch_theme,
+        family=str(organization.get("family_key") or ""),
+        product_type=resolve_shopify_product_type(template),
+        department_key=str(organization.get("department_key") or ""),
+        department_label=str(organization.get("department_label") or ""),
+        primary_collection_handle=str(organization.get("primary_collection_handle") or ""),
+        primary_collection_title=str(organization.get("primary_collection_title") or ""),
+        recommended_manual_collections=", ".join(organization.get("recommended_manual_collections", [])),
+        recommended_smart_collection_tags=", ".join(organization.get("recommended_smart_collection_tags", [])),
+        normalized_theme_keys=", ".join(organization.get("normalized_theme_keys", [])),
+        normalized_audience_keys=", ".join(organization.get("normalized_audience_keys", [])),
+        normalized_season_keys=", ".join(organization.get("normalized_season_keys", [])),
     )
 
 
