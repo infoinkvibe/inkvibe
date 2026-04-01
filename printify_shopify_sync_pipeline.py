@@ -796,6 +796,11 @@ class StorefrontQaRow:
     normalized_theme_keys: str = ""
     normalized_audience_keys: str = ""
     normalized_season_keys: str = ""
+    metadata_resolution_source: str = ""
+    metadata_generated_inline: bool = False
+    metadata_sidecar_written: bool = False
+    copy_provenance: str = ""
+    ai_product_copy_cache_reason: str = ""
 
 
 @dataclass
@@ -1709,7 +1714,21 @@ def resolve_artwork_metadata_with_source(
 ) -> Tuple[Dict[str, Any], Dict[str, str]]:
     sidecar_path = path.with_suffix(".json")
     if sidecar_path.exists() and sidecar_path.is_file():
-        return load_artwork_metadata(sidecar_path), {"source": "sidecar", "key": sidecar_path.name}
+        sidecar_metadata = load_artwork_metadata(sidecar_path)
+        normalized_stem = slugify(path.stem)
+        stronger_wins = bool(normalized_stem and metadata_map.get(normalized_stem))
+        if stronger_wins:
+            logger.info(
+                "Content metadata resolution artwork=%s source=sidecar stronger_source_won_over=metadata_map weaker_key=%s",
+                path.name,
+                normalized_stem,
+            )
+        return sidecar_metadata, {
+            "source": "sidecar",
+            "key": sidecar_path.name,
+            "reason": "sidecar_file_present",
+            "stronger_source_won_over": "metadata_map" if stronger_wins else "",
+        }
 
     def _lookup(candidate: str) -> Optional[Tuple[Dict[str, Any], str]]:
         normalized = slugify(candidate)
@@ -1726,19 +1745,19 @@ def resolve_artwork_metadata_with_source(
         matched = _lookup(canonical_slug)
         if matched:
             metadata, key = matched
-            return metadata, {"source": "slug", "key": key}
+            return metadata, {"source": "slug", "key": key, "reason": "slug_lookup_match"}
 
     filename_stem = path.stem
     exact_stem_match = metadata_map.get(filename_stem)
     if isinstance(exact_stem_match, dict):
-        return dict(exact_stem_match), {"source": "stem", "key": filename_stem}
+        return dict(exact_stem_match), {"source": "stem", "key": filename_stem, "reason": "filename_stem_exact_match"}
 
     normalized_stem = slugify(filename_stem)
     if normalized_stem:
         matched = _lookup(normalized_stem)
         if matched:
             metadata, key = matched
-            return metadata, {"source": "normalized_stem", "key": key}
+            return metadata, {"source": "normalized_stem", "key": key, "reason": "normalized_filename_stem_match"}
 
     alias_values = [filename_stem, canonical_slug]
     if persisted_aliases:
@@ -1750,19 +1769,24 @@ def resolve_artwork_metadata_with_source(
             normalized_aliases=normalized_aliases,
         )
         if matched_entry is not None and matched_key is not None:
-            return matched_entry, {"source": "alias", "key": matched_key}
+            return matched_entry, {"source": "alias", "key": matched_key, "reason": "alias_unique_match"}
         if ambiguous_keys:
             logger.warning(
-                "Content metadata ambiguous alias artwork=%s aliases=%s candidates=%s",
+                "Content metadata ambiguous alias artwork=%s aliases=%s candidates=%s ignored_for_safety=true reason=ambiguous_alias",
                 path.name,
                 ",".join(sorted(normalized_aliases)),
                 ",".join(ambiguous_keys[:5]),
             )
             fallback_key = normalized_stem or canonical_slug or slugify(path.name) or "unknown"
-            return {}, {"source": "ambiguous_alias", "key": fallback_key}
+            return {}, {
+                "source": "ambiguous_alias",
+                "key": fallback_key,
+                "reason": "ambiguous_alias_candidates",
+                "weak_fallback_reason": "ambiguous_alias",
+            }
 
     fallback_key = normalized_stem or canonical_slug or slugify(path.name) or "unknown"
-    return {}, {"source": "fallback", "key": fallback_key}
+    return {}, {"source": "fallback", "key": fallback_key, "reason": "no_matching_metadata_source", "weak_fallback_reason": "metadata_not_found"}
 
 
 def resolve_artwork_metadata_for_path(path: pathlib.Path, metadata_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -5141,10 +5165,13 @@ def discover_artworks(
         slug = slugify(path.stem)
         metadata, match_info = resolve_artwork_metadata_with_source(path, metadata_map, artwork_slug=slug)
         logger.info(
-            "Content metadata match artwork=%s source=%s key=%s",
+            "Content metadata match artwork=%s source=%s key=%s reason=%s weak_fallback_reason=%s stronger_source_won_over=%s",
             path.name,
             match_info.get("source", "unknown"),
             match_info.get("key", ""),
+            match_info.get("reason", ""),
+            match_info.get("weak_fallback_reason", ""),
+            match_info.get("stronger_source_won_over", ""),
         )
         title = str(metadata.get("title", "")).strip() or filename_slug_to_title(path.stem)
         artwork = Artwork(
@@ -7541,6 +7568,19 @@ def validate_storefront_mockups(*, template: ProductTemplate, publish_payload: D
     return warnings, errors
 
 
+def _derive_copy_provenance_for_qa(*, artwork: Artwork, template: ProductTemplate) -> Tuple[str, str]:
+    metadata = artwork.metadata or {}
+    configured_reason = str(metadata.get("ai_product_copy_cache_reason") or "").strip()
+    bucket = metadata.get("ai_product_copy")
+    if not isinstance(bucket, dict) or not bucket:
+        return "deterministic_fallback", configured_reason or "cache_bucket_missing"
+    template_key_fragment = f":{template.key}:"
+    for key in bucket.keys():
+        if isinstance(key, str) and template_key_fragment in key:
+            return "ai_product_copy_cache", configured_reason or "cache_entry_present"
+    return "ai_product_copy_cache_other_template", configured_reason or "cache_entry_not_template_scoped"
+
+
 def build_storefront_qa_row(
     *,
     artwork: Artwork,
@@ -7601,6 +7641,7 @@ def build_storefront_qa_row(
         (pricing_summary["sale_min"] is not None) and (pricing_summary["compare_min"] > pricing_summary["sale_min"])
     )
     recommended_action = "review" if error_messages else ("consider_tuning" if warning_messages else "none")
+    copy_provenance, copy_cache_reason = _derive_copy_provenance_for_qa(artwork=artwork, template=template)
 
     return StorefrontQaRow(
         artwork_filename=artwork.src_path.name,
@@ -7650,6 +7691,11 @@ def build_storefront_qa_row(
         normalized_theme_keys=", ".join(organization.get("normalized_theme_keys", [])),
         normalized_audience_keys=", ".join(organization.get("normalized_audience_keys", [])),
         normalized_season_keys=", ".join(organization.get("normalized_season_keys", [])),
+        metadata_resolution_source=artwork.metadata_resolution_source,
+        metadata_generated_inline=artwork.metadata_generated_inline,
+        metadata_sidecar_written=artwork.metadata_sidecar_written,
+        copy_provenance=copy_provenance,
+        ai_product_copy_cache_reason=copy_cache_reason,
     )
 
 

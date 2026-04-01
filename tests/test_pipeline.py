@@ -1105,7 +1105,7 @@ def test_artwork_metadata_alias_match_for_uuid_filename(tmp_path: Path):
     assert match["key"] == "ai-generated-8321310"
 
 
-def test_sidecar_still_wins_over_alias_match(tmp_path: Path):
+def test_sidecar_still_wins_over_alias_match(tmp_path: Path, caplog: pytest.LogCaptureFixture):
     image = tmp_path / "7a90f8b0-5687-4cbf-81a5-3eba04940253.png"
     sidecar = tmp_path / "7a90f8b0-5687-4cbf-81a5-3eba04940253.json"
     Image.new("RGBA", (900, 900), (0, 0, 0, 255)).save(image)
@@ -1117,12 +1117,15 @@ def test_sidecar_still_wins_over_alias_match(tmp_path: Path):
             "aliases": ["7a90f8b0-5687-4cbf-81a5-3eba04940253"],
         }
     }
+    caplog.set_level(logging.INFO, logger="inkvibeauto")
     resolved, match = resolve_artwork_metadata_with_source(image, metadata_map, artwork_slug="7a90f8b0-5687-4cbf-81a5-3eba04940253")
     assert resolved["title"] == "Sidecar Wolf"
     assert match["source"] == "sidecar"
+    assert match["stronger_source_won_over"] == "metadata_map"
+    assert "stronger_source_won_over=metadata_map" in caplog.text
 
 
-def test_artwork_metadata_ambiguous_alias_falls_back_safely(tmp_path: Path):
+def test_artwork_metadata_ambiguous_alias_falls_back_safely(tmp_path: Path, caplog: pytest.LogCaptureFixture):
     image = tmp_path / "wolf-scene.png"
     Image.new("RGBA", (900, 900), (0, 0, 0, 255)).save(image)
     metadata_map = {
@@ -1137,10 +1140,13 @@ def test_artwork_metadata_ambiguous_alias_falls_back_safely(tmp_path: Path):
             "aliases": ["wolf-scene"],
         },
     }
+    caplog.set_level(logging.WARNING, logger="inkvibeauto")
     resolved, match = resolve_artwork_metadata_with_source(image, metadata_map, artwork_slug="wolf-scene")
     assert resolved == {}
     assert match["source"] == "ambiguous_alias"
     assert match["key"] == "wolf-scene"
+    assert match["weak_fallback_reason"] == "ambiguous_alias"
+    assert "ignored_for_safety=true reason=ambiguous_alias" in caplog.text
 
 
 def test_inline_metadata_helpers_detect_sluglike_and_generic_fallbacks(tmp_path: Path):
@@ -7567,11 +7573,15 @@ def test_run_storefront_qa_non_mutating_and_exports(tmp_path: Path):
         export_json_path=str(json_path),
     )
     assert len(rows) == 1
+    assert rows[0].metadata_resolution_source == "fallback"
+    assert rows[0].copy_provenance == "deterministic_fallback"
     assert csv_path.exists()
     assert json_path.exists()
     exported = csv_path.read_text(encoding="utf-8")
     assert "artwork_filename" in exported
     assert "qa_status" in exported
+    assert "metadata_resolution_source" in exported
+    assert "copy_provenance" in exported
 
 
 def test_run_storefront_qa_cli_path_does_not_mutate(monkeypatch, tmp_path: Path):
