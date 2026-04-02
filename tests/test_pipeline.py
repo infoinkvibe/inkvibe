@@ -7339,6 +7339,7 @@ def test_family_collection_mapping_routes_active_families_correctly():
     assert actual["tshirt_premium_soft"] == "t-shirts"
     assert actual["longsleeve_gildan"] == "long-sleeve-shirts"
     assert actual["hoodie_gildan"] == "hoodies"
+    assert actual["hoodie_midweight_alt"] == "hoodies"
     assert actual["sweatshirt_gildan"] == "sweatshirts"
     assert actual["sweatshirt_gildan_alt"] == "sweatshirts"
     assert actual["mug_new"] == "mugs"
@@ -8265,6 +8266,45 @@ def test_rollout_adds_exactly_one_alternate_sweatshirt_template():
         if template.key.startswith("sweatshirt_") and template.key != "sweatshirt_gildan"
     }
     assert sweatshirt_keys == {"sweatshirt_gildan_alt"}
+
+
+def test_alt_hoodie_template_rollout_is_active_and_conservative():
+    templates = load_templates(Path("product_templates.json"))
+    by_key = {template.key: template for template in templates}
+    assert "hoodie_midweight_alt" in by_key
+
+    alt = by_key["hoodie_midweight_alt"]
+    base = by_key["hoodie_gildan"]
+    assert alt.active is True
+    assert alt.publish_after_create is True
+    assert alt.printify_blueprint_id == base.printify_blueprint_id == 77
+    assert alt.printify_print_provider_id == 30
+    assert alt.printify_print_provider_id != base.printify_print_provider_id
+    assert alt.product_type_label == "Midweight Hoodie"
+    assert alt.max_enabled_variants <= base.max_enabled_variants
+    assert set(alt.enabled_colors).issubset(set(base.enabled_colors + base.expanded_enabled_colors))
+    assert set(alt.enabled_sizes).issubset(set(base.enabled_sizes))
+    assert len(alt.placements) == 1
+    assert alt.placements[0].placement_name == "front"
+    assert alt.placements[0].width_px == 4500
+    assert alt.placements[0].height_px == 5400
+    assert alt.preferred_mockup_types == ["lifestyle", "flat"]
+    assert alt.preferred_featured_image_strategy == "variant_color_then_mockup_type"
+    assert alt.provider_selection_strategy == "prefer_printify_choice_then_ranked"
+    assert alt.fallback_provider_allowed is True
+    assert alt.default_price == "41.99"
+    assert alt.compare_at_price == "49.99"
+    assert alt.min_profit_after_shipping == "3.00"
+
+
+def test_rollout_adds_exactly_one_alternate_hoodie_template():
+    templates = load_templates(Path("product_templates.json"))
+    hoodie_keys = {
+        template.key
+        for template in templates
+        if template.key.startswith("hoodie_") and template.key != "hoodie_gildan"
+    }
+    assert hoodie_keys == {"hoodie_midweight_alt"}
 
 
 def test_top10_template_keys_exist_and_curated():
