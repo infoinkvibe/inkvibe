@@ -524,6 +524,78 @@
     "reprice_variants_to_margin_floor": true
   },
   {
+    "key": "mug_15oz_ceramic",
+    "printify_blueprint_id": 68,
+    "printify_print_provider_id": 1,
+    "title_pattern": "{artwork_title} {product_type_label}",
+    "description_pattern": "<p>{generated_description}</p>",
+    "enabled_colors": [],
+    "enabled_sizes": [
+      "15oz"
+    ],
+    "placements": [
+      {
+        "placement_name": "front",
+        "width_px": 2850,
+        "height_px": 1210,
+        "allow_upscale": false,
+        "placement_scale": 0.78,
+        "placement_x": 0.5,
+        "placement_y": 0.5,
+        "placement_angle": 0,
+        "artwork_fit_mode": "contain"
+      }
+    ],
+    "base_price": "13.99",
+    "markup_type": "percent",
+    "markup_value": "35",
+    "rounding_mode": "whole_dollar",
+    "seo_keywords": [
+      "15oz ceramic mug",
+      "large coffee mug",
+      "giftable drinkware"
+    ],
+    "audience": "coffee and tea drinkers seeking a larger daily mug",
+    "product_type_label": "15oz Mug",
+    "style_keywords": [
+      "clean",
+      "playful"
+    ],
+    "tags": [
+      "mug",
+      "15oz mug",
+      "ceramic mug"
+    ],
+    "enabled_variant_option_filters": {
+      "color": [],
+      "size": [
+        "15oz"
+      ]
+    },
+    "max_enabled_variants": 1,
+    "shopify_product_type": "Drinkware",
+    "preferred_mockup_colors": [
+      "White"
+    ],
+    "preferred_default_variant_color": "White",
+    "preferred_mockup_types": [
+      "studio",
+      "lifestyle"
+    ],
+    "preferred_featured_image_strategy": "variant_color_then_mockup_type",
+    "provider_selection_strategy": "pinned_then_printify_choice_then_lowest_cost",
+    "pinned_provider_id": 1,
+    "pinned_blueprint_id": 68,
+    "fallback_provider_allowed": true,
+    "active": true,
+    "default_price": "18.99",
+    "compare_at_price": "22.99",
+    "min_profit_after_shipping": "4.00",
+    "target_margin_after_shipping": "6.00",
+    "disable_variants_below_margin_floor": true,
+    "reprice_variants_to_margin_floor": true
+  },
+  {
     "key": "poster_basic",
     "printify_blueprint_id": 852,
     "printify_print_provider_id": 73,

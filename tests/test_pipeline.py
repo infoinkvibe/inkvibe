@@ -5788,6 +5788,7 @@ def test_unresolved_families_remain_inactive():
     assert by_key["framed_poster_basic"].active is True
     assert by_key["tumbler_20oz_basic"].active is True
     assert by_key["travel_mug_basic"].active is True
+    assert by_key["mug_15oz_ceramic"].active is True
 
 
 def test_tote_front_primary_and_publish_only_primary_behavior_preserved():
@@ -5856,6 +5857,8 @@ def test_blanket_and_related_template_deferment_and_resolution_guards_remain_unc
     assert by_key["tumbler_20oz_basic"].printify_print_provider_id == 410
     assert by_key["travel_mug_basic"].printify_blueprint_id == 1513
     assert by_key["travel_mug_basic"].printify_print_provider_id == 217
+    assert by_key["mug_15oz_ceramic"].printify_blueprint_id == 68
+    assert by_key["mug_15oz_ceramic"].printify_print_provider_id == 1
     assert by_key["canvas_basic"].min_source_width == 4500
     assert by_key["canvas_basic"].min_source_height == 5400
     assert by_key["framed_poster_basic"].min_source_width == 4500
@@ -5891,6 +5894,16 @@ def test_next_wave_templates_define_provider_blueprint_and_variant_guards():
     assert travel.enabled_variant_option_filters.get("size") == ["20oz"]
     assert travel.max_enabled_variants == 1
     assert travel.disable_variants_below_margin_floor is True
+
+    mug_15oz = by_key["mug_15oz_ceramic"]
+    assert mug_15oz.printify_blueprint_id == 68
+    assert mug_15oz.printify_print_provider_id == 1
+    assert mug_15oz.pinned_blueprint_id == 68
+    assert mug_15oz.pinned_provider_id == 1
+    assert mug_15oz.enabled_variant_option_filters.get("size") == ["15oz"]
+    assert mug_15oz.max_enabled_variants == 1
+    assert mug_15oz.disable_variants_below_margin_floor is True
+    assert mug_15oz.shopify_product_type == "Drinkware"
 
 
 def test_canvas_template_uses_live_mapping_not_stale_hint():
@@ -7328,6 +7341,7 @@ def test_family_collection_mapping_routes_active_families_correctly():
     assert actual["hoodie_gildan"] == "hoodies"
     assert actual["sweatshirt_gildan"] == "sweatshirts"
     assert actual["mug_new"] == "mugs"
+    assert actual["mug_15oz_ceramic"] == "mugs"
     assert actual["poster_basic"] == "posters"
     assert actual["framed_poster_basic"] == "framed-posters"
     assert actual["tote_basic"] == "tote-bags"
@@ -8272,8 +8286,29 @@ def test_template_audience_regression_for_mug_canvas_and_framed_poster():
     by_key = {template.key: template for template in templates}
 
     assert by_key["mug_new"].audience == "coffee drinkers and office gift shoppers"
+    assert by_key["mug_15oz_ceramic"].audience == "coffee and tea drinkers seeking a larger daily mug"
     assert by_key["canvas_basic"].audience == "gallery wall decor shoppers and gift buyers"
     assert by_key["framed_poster_basic"].audience == "framed wall art shoppers and gift buyers"
+
+
+def test_mug_15oz_template_uses_conservative_single_size_single_front_rollout():
+    templates = load_templates(Path("product_templates.json"))
+    by_key = {template.key: template for template in templates}
+    mug = by_key["mug_15oz_ceramic"]
+
+    assert mug.product_type_label == "15oz Mug"
+    assert mug.enabled_sizes == ["15oz"]
+    assert mug.enabled_variant_option_filters == {"color": [], "size": ["15oz"]}
+    assert mug.max_enabled_variants == 1
+    assert len(mug.placements) == 1
+    assert mug.placements[0].placement_name == "front"
+    assert mug.placements[0].artwork_fit_mode == "contain"
+    assert mug.placements[0].allow_upscale is False
+    assert mug.preferred_mockup_types == ["studio", "lifestyle"]
+    assert mug.markup_type == "percent"
+    assert mug.markup_value == "35"
+    assert mug.default_price == "18.99"
+    assert mug.compare_at_price == "22.99"
 
 
 def test_template_audience_regression_for_phone_case_and_tumbler():
