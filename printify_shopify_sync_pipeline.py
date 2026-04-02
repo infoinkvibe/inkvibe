@@ -3146,6 +3146,7 @@ def _render_listing_tags(template: ProductTemplate, artwork: Artwork) -> List[st
     organization = build_normalized_shopify_organization(template, artwork)
     taxonomy_tags = list(organization.get("smart_collection_tags", []))
     ai_copy = _maybe_render_ai_product_copy(template, artwork, context)
+    target_max_tags = 12
     if ai_copy and ai_copy.tags:
         merged: List[str] = []
         seen: set[str] = set()
@@ -3155,7 +3156,7 @@ def _render_listing_tags(template: ProductTemplate, artwork: Artwork) -> List[st
                 continue
             seen.add(cleaned)
             merged.append(cleaned)
-            if len(merged) >= 14:
+            if len(merged) >= target_max_tags:
                 break
         if merged:
             return merged
@@ -3190,7 +3191,7 @@ def _render_listing_tags(template: ProductTemplate, artwork: Artwork) -> List[st
     bucket_order = [taxonomy_bucket, family_bucket, subject_bucket, theme_style_bucket, optional_bucket]
     tags: List[str] = []
     seen: set[str] = set()
-    max_tags = 14
+    max_tags = target_max_tags
 
     def _push_tag(raw: Any, *, allow_generic: bool = False) -> None:
         nonlocal tags
@@ -4732,7 +4733,13 @@ def sync_shopify_collection(
 def _variant_option_value(variant: Dict[str, Any], key: str) -> str:
     options = variant.get("options") or {}
     if isinstance(options, dict):
-        return str(options.get(key, "")).strip()
+        direct = str(options.get(key, "")).strip()
+        if direct:
+            return direct
+        canonical_key = _canonical_option_token(key)
+        for option_key, option_value in options.items():
+            if _canonical_option_token(str(option_key)) == canonical_key:
+                return str(option_value or "").strip()
     return str(variant.get(key, "")).strip()
 
 
@@ -4987,27 +4994,42 @@ def _shopify_money_string_from_minor(minor_units: int) -> str:
     return f"{Decimal(minor_units) / Decimal('100'):.2f}"
 
 
-def build_shopify_product_options(template: ProductTemplate, variant_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    colors = sorted({c for c in (_variant_option_value(v, "color") for v in variant_rows) if c})
-    sizes = sorted({s for s in (_variant_option_value(v, "size") for v in variant_rows) if s})
+def _qa_option_dimension_labels(template: ProductTemplate, variant_rows: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
+    family = _template_intended_family(template)
+    preferred_dimensions: List[Tuple[str, str]]
+    if family == "sticker":
+        preferred_dimensions = [("shape", "Shape"), ("size", "Size"), ("quantity", "Quantity")]
+    elif family == "phone_case":
+        preferred_dimensions = [("model", "Model"), ("surface", "Finish"), ("size", "Size"), ("color", "Color")]
+    elif family in {"tumbler", "travel_mug"}:
+        preferred_dimensions = [("size", "Size"), ("capacity", "Capacity"), ("color", "Color"), ("finish", "Finish")]
+    else:
+        preferred_dimensions = [("color", "Color"), ("size", "Size")]
 
+    dimensions: List[Tuple[str, str]] = []
+    for key, label in preferred_dimensions:
+        if any(_variant_option_value(variant, key) for variant in variant_rows):
+            dimensions.append((key, label))
+    return dimensions
+
+
+def build_shopify_product_options(template: ProductTemplate, variant_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    selected_dimensions = _qa_option_dimension_labels(template, variant_rows)
     product_options: List[Dict[str, Any]] = []
-    if colors:
-        product_options.append({"name": "Color", "values": [{"name": value} for value in colors]})
-    if sizes:
-        product_options.append({"name": "Size", "values": [{"name": value} for value in sizes]})
+    for option_key, option_label in selected_dimensions:
+        values = sorted({_variant_option_value(variant, option_key) for variant in variant_rows if _variant_option_value(variant, option_key)})
+        if values:
+            product_options.append({"name": option_label, "values": [{"name": value} for value in values]})
     if not product_options:
         product_options.append({"name": "Title", "values": [{"name": "Default Title"}]})
 
     variants: List[Dict[str, Any]] = []
     for variant in variant_rows:
         option_values: List[Dict[str, str]] = []
-        color = _variant_option_value(variant, "color")
-        size = _variant_option_value(variant, "size")
-        if colors and color:
-            option_values.append({"optionName": "Color", "name": color})
-        if sizes and size:
-            option_values.append({"optionName": "Size", "name": size})
+        for option_key, option_label in selected_dimensions:
+            option_value = _variant_option_value(variant, option_key)
+            if option_value:
+                option_values.append({"optionName": option_label, "name": option_value})
         if not option_values:
             option_values.append({"optionName": "Title", "name": "Default Title"})
 
@@ -7561,13 +7583,11 @@ def validate_storefront_options(*, template: ProductTemplate, variant_rows: List
     option_names = [str(opt.get("name") or "") for opt in product_options if isinstance(opt, dict)]
     if not variant_rows:
         errors.append("options_zero_enabled_variants")
-    colors_present = any(_variant_option_value(v, "color") for v in variant_rows)
-    sizes_present = any(_variant_option_value(v, "size") for v in variant_rows)
-    if colors_present and "Color" not in option_names:
-        errors.append("options_missing_color_name")
-    if sizes_present and "Size" not in option_names:
-        errors.append("options_missing_size_name")
-    if (colors_present or sizes_present) and "Title" in option_names:
+    expected_dimensions = _qa_option_dimension_labels(template, variant_rows)
+    for _, expected_label in expected_dimensions:
+        if expected_label not in option_names:
+            errors.append(f"options_missing_{expected_label.lower()}_name")
+    if expected_dimensions and "Title" in option_names:
         warnings.append("options_default_title_with_real_dimensions")
     seen_combos: set[Tuple[str, ...]] = set()
     for payload in variant_payloads:
@@ -7593,7 +7613,6 @@ def validate_storefront_mockups(*, template: ProductTemplate, publish_payload: D
         warnings.append("mockups_no_placement_context")
     if not template.placements:
         errors.append("mockups_template_has_no_placements")
-    warnings.append("mockups_channel_provider_dependent_selection")
     return warnings, errors
 
 
@@ -7783,14 +7802,15 @@ def run_storefront_qa(
                 metadata=sanitize_metadata_for_publish(metadata),
             )
             template = build_resolved_template(template_by_key[launch_row.template_key], launch_row.overrides)
+            resolved_template = select_provider_for_template(printify=printify, template=template)
             variant_rows = choose_variants_from_catalog(
-                printify.list_variants(template.printify_blueprint_id, template.printify_print_provider_id),
-                template,
+                printify.list_variants(resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id),
+                resolved_template,
             )
             qa_rows.append(
                 build_storefront_qa_row(
                     artwork=artwork,
-                    template=template,
+                    template=resolved_template,
                     variant_rows=variant_rows,
                     launch_plan_row=str(launch_row.row_number),
                     launch_plan_row_id=launch_row.row_id,
@@ -7803,11 +7823,12 @@ def run_storefront_qa(
     else:
         for artwork in artworks:
             for template in templates:
+                resolved_template = select_provider_for_template(printify=printify, template=template)
                 variant_rows = choose_variants_from_catalog(
-                    printify.list_variants(template.printify_blueprint_id, template.printify_print_provider_id),
-                    template,
+                    printify.list_variants(resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id),
+                    resolved_template,
                 )
-                qa_rows.append(build_storefront_qa_row(artwork=artwork, template=template, variant_rows=variant_rows))
+                qa_rows.append(build_storefront_qa_row(artwork=artwork, template=resolved_template, variant_rows=variant_rows))
 
     _log_storefront_qa_summary(qa_rows)
     if export_csv_path:
