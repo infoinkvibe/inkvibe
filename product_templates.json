@@ -577,11 +577,15 @@
     "max_enabled_variants": 12,
     "tags": [
       "canvas",
-      "wall art"
+      "wall art",
+      "gallery decor",
+      "giftable canvas"
     ],
     "seo_keywords": [
       "canvas wall art",
-      "home decor"
+      "gallery wall decor",
+      "canvas print decor",
+      "giftable canvas art"
     ],
     "audience": "home decor fans",
     "product_type_label": "Canvas Print",
@@ -654,11 +658,15 @@
     "max_enabled_variants": 12,
     "tags": [
       "phone case",
-      "tech accessory"
+      "tech accessory",
+      "everyday accessory",
+      "giftable case"
     ],
     "seo_keywords": [
       "protective phone case",
-      "giftable phone accessory"
+      "everyday phone accessory",
+      "giftable phone case",
+      "stylish phone cover"
     ],
     "audience": "everyday phone users",
     "product_type_label": "Phone Case",
@@ -712,11 +720,15 @@
     "max_enabled_variants": 4,
     "tags": [
       "sticker",
-      "kiss-cut"
+      "kiss-cut",
+      "laptop sticker",
+      "giftable sticker"
     ],
     "seo_keywords": [
       "vinyl sticker",
-      "laptop sticker"
+      "kiss-cut sticker",
+      "laptop sticker",
+      "giftable sticker pack"
     ],
     "audience": "sticker collectors",
     "product_type_label": "Kiss-Cut Sticker",
@@ -786,11 +798,15 @@
     "max_enabled_variants": 6,
     "tags": [
       "blanket",
-      "home comfort"
+      "home comfort",
+      "throw blanket",
+      "giftable blanket"
     ],
     "seo_keywords": [
       "throw blanket",
-      "cozy home gift"
+      "cozy throw blanket",
+      "home decor blanket",
+      "giftable cozy blanket"
     ],
     "audience": "home decor shoppers",
     "product_type_label": "Blanket",

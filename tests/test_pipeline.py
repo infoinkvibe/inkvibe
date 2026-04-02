@@ -8221,6 +8221,42 @@ def test_template_metadata_defaults_are_populated_for_poster_and_tote():
     assert tote.audience == "everyday carry and gift shoppers"
 
 
+def test_active_sparse_templates_have_minimum_seo_and_tag_depth():
+    templates = load_templates(Path("product_templates.json"))
+    by_key = {template.key: template for template in templates}
+
+    expected_metadata = {
+        "canvas_basic": {
+            "tags": {"canvas", "wall art", "gallery decor", "giftable canvas"},
+            "seo_keywords": {"canvas wall art", "gallery wall decor", "canvas print decor", "giftable canvas art"},
+        },
+        "phone_case_basic": {
+            "tags": {"phone case", "tech accessory", "everyday accessory", "giftable case"},
+            "seo_keywords": {
+                "protective phone case",
+                "everyday phone accessory",
+                "giftable phone case",
+                "stylish phone cover",
+            },
+        },
+        "sticker_kisscut": {
+            "tags": {"sticker", "kiss-cut", "laptop sticker", "giftable sticker"},
+            "seo_keywords": {"vinyl sticker", "kiss-cut sticker", "laptop sticker", "giftable sticker pack"},
+        },
+        "blanket_basic": {
+            "tags": {"blanket", "home comfort", "throw blanket", "giftable blanket"},
+            "seo_keywords": {"throw blanket", "cozy throw blanket", "home decor blanket", "giftable cozy blanket"},
+        },
+    }
+
+    for key, expected in expected_metadata.items():
+        template = by_key[key]
+        assert len(template.tags) >= 4
+        assert len(template.seo_keywords) >= 4
+        assert expected["tags"].issubset(set(template.tags))
+        assert expected["seo_keywords"].issubset(set(template.seo_keywords))
+
+
 def test_guardrail_zero_enabled_variants_skip_before_payload_validation():
     class StubPrintify:
         dry_run = False
