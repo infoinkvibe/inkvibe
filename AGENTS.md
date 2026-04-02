@@ -22,15 +22,27 @@ If a task can be completed with a narrow change, do that instead of restructurin
 
 ## Current validated production baseline
 
-Current validated 7-template working baseline:
+Current validated active baseline (14 templates from `product_templates.json`):
 
 - tshirt_gildan
+- longsleeve_gildan
 - sweatshirt_gildan
 - hoodie_gildan
 - mug_new
+- tumbler_20oz_basic
+- travel_mug_basic
 - poster_basic
+- framed_poster_basic
+- canvas_basic
 - phone_case_basic
+- tote_basic
+- blanket_basic
 - sticker_kisscut
+
+Baseline notes:
+- `longsleeve_gildan` is intentionally active and aligned with publish-on-create behavior.
+- This is now a multi-category baseline (apparel, drinkware, decor, accessories), not the old 7-template set.
+- Treat this list as the source-of-truth validated set unless `product_templates.json` changes again.
 
 Expected rerun behavior for this baseline:
 - fresh create runs should succeed
@@ -42,12 +54,13 @@ Expected rerun behavior for this baseline:
 
 Current development priority order:
 
-1. Fix metadata / copy-source correctness so the right artwork always gets the right title, description, tags, and AI-generated copy.
-2. Continue improving product-page copy quality for the strongest categories and newly supported AI-copy families.
-3. Improve SEO/tag quality and merchandising QA.
-4. Preserve all existing automation behavior.
-5. Only after correctness and merchandising quality are stronger should more backend automation be expanded.
-6. Collections can be revisited later, after listing correctness and quality are stable.
+1. Preserve working create/update/skip/rebuild behavior across the current active template set.
+2. Protect metadata provenance correctness: the right artwork must always receive the right listing copy and metadata source.
+3. Preserve AI-copy cache identity safety and observability (no cross-artwork cache leakage; clear cache hit/miss/bypass reasons).
+4. Preserve storefront QA/export provenance and report schema stability while improving merchandising quality.
+5. Continue targeted template metadata quality improvements (SEO/tags/audience/copy quality) in narrow, low-risk patches.
+6. Expand coverage only through safe adjacent-family rollout discipline: one new family/template at a time in small PRs with regression checks.
+7. Keep collections and broader automation expansion secondary to correctness and stability.
 
 ## Current rerun/update priority
 
@@ -128,6 +141,9 @@ These are preferred areas for improvement:
 - fallback copy behavior
 - caching of generated copy
 - QA/reporting visibility
+- storefront QA/export observability and schema protection
+- targeted template metadata quality upgrades (SEO/tags/audience)
+- adjacent-family enablement in narrow, one-family rollout PRs
 - test coverage for copy-related logic
 
 ## Expected architecture behavior
@@ -159,6 +175,9 @@ Current supported AI-copy families:
 
 Current excluded family:
 - sticker
+
+Rollout note:
+- `longsleeve_gildan` is active for template execution, but AI-copy support should only be added when explicitly validated in a narrow rollout PR.
 
 If implementing or changing AI-assisted product copy:
 
@@ -250,15 +269,18 @@ Do not spend disproportionate effort on sticker merchandising unless explicitly 
 
 For rerun-related patches, validate:
 - first run create behavior remains intact
-- rerun of unchanged artwork/templates mostly skips or updates
+- rerun of unchanged artwork/templates mostly skips or updates across the active baseline
 - rebuild remains available only for genuine incompatibility/edit-lock fallback
 
 For metadata/copy correctness patches, validate:
 - exact sidecar match wins over fuzzy/fallback matching
 - ambiguous slug/fallback matching does not cross-assign wrong metadata
 - AI copy cache does not leak across artworks
+- cache identity mismatch paths are observable and safe (bypass + fallback behavior)
 - correct artwork/template cache reuse still works
+- storefront QA/export provenance fields remain backward-compatible
 - no regression to existing rerun skip behavior
+- adjacent-family rollout changes are isolated and verified one family/template at a time
 
 ## Testing expectations
 
