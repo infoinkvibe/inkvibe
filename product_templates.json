@@ -952,7 +952,7 @@
     ],
     "publish_to_shopify": false,
     "push_via_printify": true,
-    "publish_after_create": false,
+    "publish_after_create": true,
     "publish_title": true,
     "publish_description": true,
     "publish_images": true,
@@ -996,7 +996,7 @@
     "disable_variants_below_margin_floor": true,
     "reprice_variants_to_margin_floor": false,
     "mark_template_nonviable_if_needed": true,
-    "active": false
+    "active": true
   },
   {
     "key": "framed_poster_basic",
