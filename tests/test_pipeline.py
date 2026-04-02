@@ -8197,7 +8197,8 @@ def test_top10_template_keys_exist_and_curated():
         "blanket_basic",
     }
     assert required.issubset(set(by_key))
-    assert by_key["longsleeve_gildan"].active is False
+    assert by_key["longsleeve_gildan"].active is True
+    assert by_key["longsleeve_gildan"].publish_after_create is True
     assert by_key["tshirt_gildan"].enabled_colors == ["Black", "White", "Navy", "Sport Grey", "Sand"]
     assert by_key["tshirt_gildan"].enabled_sizes == ["S", "M", "L", "XL", "2XL", "3XL"]
     assert by_key["phone_case_basic"].max_enabled_variants <= 12
@@ -8205,6 +8206,18 @@ def test_top10_template_keys_exist_and_curated():
     assert by_key["sticker_kisscut"].printify_print_provider_id == 36
     assert by_key["sticker_kisscut"].max_enabled_variants == 4
     assert by_key["poster_basic"].enabled_sizes == ["11″ x 14″ (Vertical)", "12″ x 16″ (Vertical)", "16″ x 20″ (Vertical)"]
+
+
+def test_longsleeve_template_file_stays_in_sync_with_product_templates_for_rollout():
+    product_templates = load_templates(Path("product_templates.json"))
+    longsleeve_templates = load_templates(Path("longsleeve_template.json"))
+    longsleeve_primary = next(t for t in product_templates if t.key == "longsleeve_gildan")
+    longsleeve_standalone = next(t for t in longsleeve_templates if t.key == "longsleeve_gildan")
+    assert longsleeve_primary.printify_blueprint_id == longsleeve_standalone.printify_blueprint_id == 80
+    assert longsleeve_primary.printify_print_provider_id == longsleeve_standalone.printify_print_provider_id == 30
+    assert longsleeve_primary.publish_after_create is True
+    assert longsleeve_standalone.publish_after_create is True
+    assert longsleeve_primary.active is True
 
 
 def test_template_metadata_defaults_are_populated_for_poster_and_tote():
