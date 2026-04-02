@@ -2386,14 +2386,19 @@ def validate_catalog_family_schema(
         capacity_values = option_values_summary.get("size", []) + option_values_summary.get("capacity", [])
         has_capacity_values = any(_looks_like_drinkware_capacity(value) for value in capacity_values)
         has_color_or_finish = any(token in option_name_tokens for token in ("color", "finish", "surface"))
+        has_minimal_capacity_schema = has_capacity_dimension and has_capacity_values
         if intended_family == "tumbler":
             title_keywords = ("tumbler", "skinny tumbler")
             wrong_keywords = ("travel mug", "phone case", "sticker", "hoodie", "t-shirt")
             mismatch_reason = "Tumbler schema mismatch: missing tumbler capacity schema/title hints."
+            has_structural_schema = has_minimal_capacity_schema and has_color_or_finish
         else:
             title_keywords = ("travel mug", "commuter mug")
             wrong_keywords = ("tumbler", "phone case", "sticker", "hoodie", "t-shirt")
             mismatch_reason = "Travel mug schema mismatch: missing travel-mug capacity schema/title hints."
+            # Some valid travel-mug catalog mappings expose only a single capacity
+            # option (for example, 15oz) without a separate color/finish dimension.
+            has_structural_schema = has_minimal_capacity_schema
         has_title_signal = any(token in title_tokens for token in title_keywords)
         wrong_family_title = any(token in title_tokens for token in wrong_keywords)
         if wrong_family_title:
@@ -2402,7 +2407,7 @@ def validate_catalog_family_schema(
                 plausible=False,
                 reason=f"{'Tumbler' if intended_family == 'tumbler' else 'Travel mug'} schema mismatch: blueprint/provider title indicates a different product family.",
             )
-        if not ((has_capacity_dimension and has_capacity_values and has_color_or_finish) or has_title_signal):
+        if not (has_structural_schema or has_title_signal):
             return CatalogFamilyValidationResult(
                 intended_family=intended_family,
                 plausible=False,
