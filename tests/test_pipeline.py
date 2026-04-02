@@ -7340,6 +7340,7 @@ def test_family_collection_mapping_routes_active_families_correctly():
     assert actual["longsleeve_gildan"] == "long-sleeve-shirts"
     assert actual["hoodie_gildan"] == "hoodies"
     assert actual["sweatshirt_gildan"] == "sweatshirts"
+    assert actual["sweatshirt_gildan_alt"] == "sweatshirts"
     assert actual["mug_new"] == "mugs"
     assert actual["mug_15oz_ceramic"] == "mugs"
     assert actual["poster_basic"] == "posters"
@@ -8226,6 +8227,44 @@ def test_premium_soft_tee_template_rollout_is_active_and_conservative():
     assert premium.target_margin_after_shipping == "5.00"
     assert premium.disable_variants_below_margin_floor is True
     assert premium.reprice_variants_to_margin_floor is True
+
+
+def test_alt_sweatshirt_template_rollout_is_active_and_conservative():
+    templates = load_templates(Path("product_templates.json"))
+    by_key = {template.key: template for template in templates}
+    assert "sweatshirt_gildan_alt" in by_key
+
+    alt = by_key["sweatshirt_gildan_alt"]
+    base = by_key["sweatshirt_gildan"]
+    assert alt.active is True
+    assert alt.publish_after_create is True
+    assert alt.printify_blueprint_id == base.printify_blueprint_id == 49
+    assert alt.printify_print_provider_id == base.printify_print_provider_id == 99
+    assert alt.product_type_label == "Crewneck Sweatshirt"
+    assert alt.max_enabled_variants <= base.max_enabled_variants
+    assert set(alt.enabled_colors).issubset(set(base.enabled_colors + base.expanded_enabled_colors))
+    assert set(alt.enabled_sizes).issubset(set(base.enabled_sizes))
+    assert len(alt.placements) == 1
+    assert alt.placements[0].placement_name == "front"
+    assert alt.placements[0].width_px == 4500
+    assert alt.placements[0].height_px == 5400
+    assert alt.preferred_mockup_types == ["lifestyle", "flat"]
+    assert alt.preferred_featured_image_strategy == "variant_color_then_mockup_type"
+    assert alt.provider_selection_strategy == "prefer_printify_choice_then_ranked"
+    assert alt.fallback_provider_allowed is True
+    assert alt.default_price == "36.99"
+    assert alt.compare_at_price == "42.99"
+    assert alt.min_profit_after_shipping == "3.00"
+
+
+def test_rollout_adds_exactly_one_alternate_sweatshirt_template():
+    templates = load_templates(Path("product_templates.json"))
+    sweatshirt_keys = {
+        template.key
+        for template in templates
+        if template.key.startswith("sweatshirt_") and template.key != "sweatshirt_gildan"
+    }
+    assert sweatshirt_keys == {"sweatshirt_gildan_alt"}
 
 
 def test_top10_template_keys_exist_and_curated():
