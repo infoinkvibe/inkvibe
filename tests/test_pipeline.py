@@ -4856,6 +4856,16 @@ def test_validate_catalog_family_schema_accepts_travel_mug_schema():
     assert result.plausible is True
 
 
+def test_validate_catalog_family_schema_accepts_travel_mug_single_capacity_schema():
+    template = ProductTemplate("travel_mug_basic", 70, 1, "{artwork_title}", "{artwork_title}", product_type_label="Travel Mug")
+    variants = [
+        {"id": 1, "is_available": True, "options": {"Size": "15oz"}},
+    ]
+    result = validate_catalog_family_schema(template=template, variants=variants, blueprint_title="Insulated Mug")
+    assert result.intended_family == "travel_mug"
+    assert result.plausible is True
+
+
 def test_validate_catalog_family_schema_accepts_throw_pillow_schema():
     template = ProductTemplate("throw_pillow_basic", 9, 1, "{artwork_title}", "{artwork_title}", product_type_label="Throw Pillow")
     variants = [{"options": {"size": '18" x 18"', "material": "Spun Polyester"}}]
@@ -5020,6 +5030,50 @@ def test_select_provider_for_template_discovers_travel_mug_mapping_when_template
     resolved = select_provider_for_template(printify=DummyPrintify(), template=template)
     assert resolved.printify_blueprint_id == 777
     assert resolved.printify_print_provider_id == 11
+
+
+def test_preflight_travel_mug_keeps_valid_15oz_mapping_without_runtime_override():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [
+                {"id": 70, "title": "Insulated Travel Mug"},
+                {"id": 1513, "title": "Legacy Travel Mug"},
+            ]
+
+        def list_print_providers(self, blueprint_id):
+            if blueprint_id == 70:
+                return [{"id": 1, "title": "SPOKE"}]
+            if blueprint_id == 1513:
+                return [{"id": 217, "title": "District Photo"}]
+            return []
+
+        def list_variants(self, blueprint_id, provider_id):
+            if blueprint_id == 70 and provider_id == 1:
+                return [{"id": 1, "is_available": True, "cost": 1200, "price": 2100, "options": {"Size": "15oz"}}]
+            if blueprint_id == 1513 and provider_id == 217:
+                return [{"id": 2, "is_available": True, "cost": 1400, "price": 2300, "options": {"Size": "20oz"}}]
+            return []
+
+    template = ProductTemplate(
+        "travel_mug_basic",
+        70,
+        1,
+        "{artwork_title}",
+        "{artwork_title}",
+        enabled_variant_option_filters={"size": ["15oz"]},
+        provider_selection_strategy="prefer_printify_choice_then_ranked",
+    )
+    passed, issues, report_rows = preflight_active_templates(printify=DummyPrintify(), templates=[template], explicit_template_keys=[])
+    assert len(passed) == 1
+    assert issues == []
+    row = report_rows[0]
+    assert row.template_hint_blueprint_id == 70
+    assert row.template_hint_provider_id == 1
+    assert row.blueprint_id == 70
+    assert row.provider_id == 1
+    assert row.runtime_mapping_overrode_hint is False
+    assert row.fallback_discovery_triggered is False
+    assert row.fallback_discovery_reason == ""
 
 
 def test_canvas_size_normalization_matches_provider_quotes_and_orientation_labels():
