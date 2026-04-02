@@ -4779,24 +4779,24 @@ def test_preflight_sticker_remains_inactive_with_correct_family_when_requested_s
     assert report_rows[0].intended_family == "sticker"
 
 
-def test_preflight_travel_mug_selects_variants_with_20oz_capacity_filter():
+def test_preflight_travel_mug_selects_variants_with_15oz_capacity_filter():
     class DummyPrintify:
         def list_blueprints(self):
-            return [{"id": 1513, "title": "Travel Mug"}]
+            return [{"id": 70, "title": "Travel Mug"}]
 
         def list_print_providers(self, blueprint_id):
-            return [{"id": 217, "title": "SPOKE Custom Products"}]
+            return [{"id": 1, "title": "Printify Choice"}]
 
         def list_variants(self, blueprint_id, provider_id):
-            return [{"id": 1, "is_available": True, "cost": 1200, "price": 2100, "options": {"Capacity": "20oz", "Color": "White"}}]
+            return [{"id": 1, "is_available": True, "cost": 1200, "price": 2100, "options": {"Capacity": "15oz", "Color": "White"}}]
 
     template = ProductTemplate(
         "travel_mug_basic",
-        1513,
-        217,
+        70,
+        1,
         "{artwork_title}",
         "{artwork_title}",
-        enabled_variant_option_filters={"size": ["20oz"]},
+        enabled_variant_option_filters={"size": ["15oz"]},
         provider_selection_strategy="pinned_then_printify_choice_then_lowest_cost",
     )
     passed, issues, report_rows = preflight_active_templates(printify=DummyPrintify(), templates=[template], explicit_template_keys=[])
@@ -4847,9 +4847,9 @@ def test_validate_catalog_family_schema_accepts_tumbler_schema():
 
 
 def test_validate_catalog_family_schema_accepts_travel_mug_schema():
-    template = ProductTemplate("travel_mug_basic", 1513, 217, "{artwork_title}", "{artwork_title}", product_type_label="Travel Mug")
+    template = ProductTemplate("travel_mug_basic", 70, 1, "{artwork_title}", "{artwork_title}", product_type_label="Travel Mug")
     variants = [
-        {"id": 1, "is_available": True, "options": {"Capacity": "20oz", "Color": "White"}},
+        {"id": 1, "is_available": True, "options": {"Capacity": "15oz", "Color": "White"}},
     ]
     result = validate_catalog_family_schema(template=template, variants=variants, blueprint_title="Travel Mug")
     assert result.intended_family == "travel_mug"
@@ -5855,8 +5855,8 @@ def test_blanket_and_related_template_deferment_and_resolution_guards_remain_unc
     assert by_key["tote_basic"].printify_print_provider_id == 74
     assert by_key["tumbler_20oz_basic"].printify_blueprint_id == 1927
     assert by_key["tumbler_20oz_basic"].printify_print_provider_id == 410
-    assert by_key["travel_mug_basic"].printify_blueprint_id == 1513
-    assert by_key["travel_mug_basic"].printify_print_provider_id == 217
+    assert by_key["travel_mug_basic"].printify_blueprint_id == 70
+    assert by_key["travel_mug_basic"].printify_print_provider_id == 1
     assert by_key["mug_15oz_ceramic"].printify_blueprint_id == 68
     assert by_key["mug_15oz_ceramic"].printify_print_provider_id == 1
     assert by_key["canvas_basic"].min_source_width == 4500
@@ -5887,12 +5887,15 @@ def test_next_wave_templates_define_provider_blueprint_and_variant_guards():
     assert tumbler.reprice_variants_to_margin_floor is True
 
     travel = by_key["travel_mug_basic"]
-    assert travel.printify_blueprint_id == 1513
-    assert travel.printify_print_provider_id == 217
-    assert travel.pinned_blueprint_id == 1513
-    assert travel.pinned_provider_id == 217
-    assert travel.enabled_variant_option_filters.get("size") == ["20oz"]
+    assert travel.printify_blueprint_id == 70
+    assert travel.printify_print_provider_id == 1
+    assert travel.pinned_blueprint_id == 70
+    assert travel.pinned_provider_id == 1
+    assert travel.enabled_sizes == ["15oz"]
+    assert travel.enabled_variant_option_filters.get("size") == ["15oz"]
     assert travel.max_enabled_variants == 1
+    assert len(travel.placements) == 1
+    assert travel.placements[0].placement_name == "front"
     assert travel.disable_variants_below_margin_floor is True
     assert travel.preferred_mockup_types == ["lifestyle", "studio"]
     assert travel.preferred_mockup_position == "mug_front"

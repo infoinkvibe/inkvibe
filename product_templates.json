@@ -1556,18 +1556,18 @@
   },
   {
     "key": "travel_mug_basic",
-    "printify_blueprint_id": 1513,
-    "printify_print_provider_id": 217,
+    "printify_blueprint_id": 70,
+    "printify_print_provider_id": 1,
     "title_pattern": "{artwork_title} Travel Mug",
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],
     "enabled_sizes": [
-      "20oz"
+      "15oz"
     ],
     "enabled_variant_option_filters": {
       "color": [],
       "size": [
-        "20oz"
+        "15oz"
       ]
     },
     "max_enabled_variants": 1,
@@ -1619,8 +1619,8 @@
     ],
     "preferred_featured_image_strategy": "variant_color_then_mockup_type",
     "provider_selection_strategy": "pinned_then_printify_choice_then_lowest_cost",
-    "pinned_provider_id": 217,
-    "pinned_blueprint_id": 1513,
+    "pinned_provider_id": 1,
+    "pinned_blueprint_id": 70,
     "fallback_provider_allowed": true,
     "publish_to_shopify": false,
     "push_via_printify": true,
