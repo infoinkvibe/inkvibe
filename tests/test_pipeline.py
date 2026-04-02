@@ -2143,10 +2143,11 @@ def test_storefront_tag_builder_keeps_subject_theme_and_avoids_excess(tmp_path: 
     template.tags = ["wall art", "wall decor", "design", "artwork"]
     tags = _render_listing_tags(template, art)
     warnings, _ = validate_storefront_tags(tags=tags, template=template, artwork=art)
-    assert len(tags) <= 14
+    assert len(tags) <= 12
     assert any("fox" in tag for tag in tags)
     assert any(tag in {"wildlife portrait", "warm dusk palette", "botanical", "textured"} for tag in tags)
     assert "tag_count_high" not in warnings
+    assert "tag_count_near_limit" not in warnings
     assert "tags_missing_artwork_theme_signal" not in warnings
 
 
@@ -2574,9 +2575,10 @@ def test_theme_signal_injected_without_bloating_tag_count(tmp_path: Path):
     template.tags = ["design", "artwork", "style", "printify"]
     tags = _render_listing_tags(template, art)
     warnings, _ = validate_storefront_tags(tags=tags, template=template, artwork=art)
-    assert len(tags) <= 14
+    assert len(tags) <= 12
     assert any(tag in {"wildlife portrait", "animal art"} for tag in tags)
     assert "tags_missing_artwork_theme_signal" not in warnings
+    assert "tag_count_near_limit" not in warnings
 
 
 def test_storefront_tag_qa_accepts_contextual_theme_phrases(tmp_path: Path):
@@ -7727,7 +7729,62 @@ def test_storefront_mockup_qa_captures_publish_flags():
     )
     assert not errors
     assert "mockups_publish_mockups_override_set" in warnings
-    assert "mockups_channel_provider_dependent_selection" in warnings
+    assert "mockups_channel_provider_dependent_selection" not in warnings
+
+
+def test_storefront_options_qa_sticker_keeps_shape_size_quantity_dimensions():
+    template = _qa_template()
+    template.key = "sticker_kisscut"
+    variant_rows = [
+        {"id": 1, "is_available": True, "options": {"Shape": "Kiss-Cut", "Size": '3" × 3"', "Quantity": "1 pc"}, "price": 500},
+        {"id": 2, "is_available": True, "options": {"Shape": "Kiss-Cut", "Size": '4" × 4"', "Quantity": "1 pc"}, "price": 700},
+        {"id": 3, "is_available": True, "options": {"Shape": "Kiss-Cut", "Size": '4" × 4"', "Quantity": "10 pcs"}, "price": 1600},
+    ]
+    product_options, variant_payloads = build_shopify_product_options(template, variant_rows)
+    warnings, errors, names = validate_storefront_options(
+        template=template,
+        variant_rows=variant_rows,
+        product_options=product_options,
+        variant_payloads=variant_payloads,
+    )
+    assert not warnings
+    assert not errors
+    assert names == ["Shape", "Size", "Quantity"]
+    assert variant_payloads[0]["optionValues"] == [
+        {"optionName": "Shape", "name": "Kiss-Cut"},
+        {"optionName": "Size", "name": '3" × 3"'},
+        {"optionName": "Quantity", "name": "1 pc"},
+    ]
+
+
+def test_run_storefront_qa_resolves_catalog_mapping_before_listing_variants(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    class DummyPrintify:
+        dry_run = False
+
+        def list_blueprints(self):
+            return [{"id": 77, "title": "Midweight Hoodie"}]
+
+        def list_print_providers(self, blueprint_id):
+            assert blueprint_id == 77
+            return [{"id": 99, "title": "Printify Choice"}, {"id": 30, "title": "Unreachable Provider"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            if provider_id == 30:
+                raise RuntimeError("Provider 30 unavailable for hoodie")
+            return [{"id": 1, "is_available": True, "options": {"Color": "Black", "Size": "M"}, "price": 2100}]
+
+    monkeypatch.setattr("printify_shopify_sync_pipeline.AI_PRODUCT_COPY_SETTINGS.enabled", False)
+    monkeypatch.setattr("printify_shopify_sync_pipeline.AI_PRODUCT_COPY_SETTINGS.api_key", "")
+
+    artwork = _qa_artwork(tmp_path)
+    template = _qa_template()
+    template.key = "hoodie_midweight_alt"
+    template.printify_blueprint_id = 77
+    template.printify_print_provider_id = 30
+    template.provider_selection_strategy = "prefer_printify_choice_then_ranked"
+    rows = run_storefront_qa(printify=DummyPrintify(), artworks=[artwork], templates=[template])
+    assert len(rows) == 1
+    assert rows[0].provider_id == 99
 
 
 def test_run_storefront_qa_non_mutating_and_exports(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
