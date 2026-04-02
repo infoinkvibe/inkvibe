@@ -7323,6 +7323,7 @@ def test_family_collection_mapping_routes_active_families_correctly():
     templates = load_templates(Path("product_templates.json"))
     actual = {template.key: resolve_family_collection_target(template).get("handle", "") for template in templates}
     assert actual["tshirt_gildan"] == "t-shirts"
+    assert actual["tshirt_premium_soft"] == "t-shirts"
     assert actual["longsleeve_gildan"] == "long-sleeve-shirts"
     assert actual["hoodie_gildan"] == "hoodies"
     assert actual["sweatshirt_gildan"] == "sweatshirts"
@@ -8179,6 +8180,38 @@ def test_tshirt_template_added_and_longsleeve_copy_is_distinct(tmp_path: Path):
     assert ("t-shirt" in tee_desc) or ("tee" in tee_desc)
     assert any("long sleeve" in tag.lower() for tag in long_tags)
     assert any(("t-shirt" in tag.lower()) or ("tee" in tag.lower()) for tag in tee_tags)
+
+
+def test_premium_soft_tee_template_rollout_is_active_and_conservative():
+    templates = load_templates(Path("product_templates.json"))
+    by_key = {template.key: template for template in templates}
+    assert "tshirt_premium_soft" in by_key
+
+    premium = by_key["tshirt_premium_soft"]
+    base_tee = by_key["tshirt_gildan"]
+
+    assert premium.active is True
+    assert premium.publish_after_create is True
+    assert premium.printify_blueprint_id == 5
+    assert premium.printify_print_provider_id == 99
+    assert premium.product_type_label == "Premium Soft T-Shirt"
+    assert premium.max_enabled_variants <= base_tee.max_enabled_variants
+    assert set(premium.enabled_colors).issubset(set(base_tee.enabled_colors + base_tee.expanded_enabled_colors))
+    assert set(premium.enabled_sizes).issubset(set(base_tee.enabled_sizes))
+
+    assert len(premium.placements) == 1
+    assert premium.placements[0].placement_name == "front"
+    assert premium.placements[0].width_px == 4500
+    assert premium.placements[0].height_px == 5400
+
+    assert premium.preferred_mockup_types == ["lifestyle", "flat"]
+    assert premium.preferred_featured_image_strategy == "variant_color_then_mockup_type"
+    assert premium.provider_selection_strategy == "prefer_printify_choice_then_ranked"
+    assert premium.fallback_provider_allowed is True
+    assert premium.min_margin_after_shipping == "3.00"
+    assert premium.target_margin_after_shipping == "5.00"
+    assert premium.disable_variants_below_margin_floor is True
+    assert premium.reprice_variants_to_margin_floor is True
 
 
 def test_top10_template_keys_exist_and_curated():
