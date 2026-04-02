@@ -8221,6 +8221,15 @@ def test_template_metadata_defaults_are_populated_for_poster_and_tote():
     assert tote.audience == "everyday carry and gift shoppers"
 
 
+def test_template_audience_regression_for_mug_canvas_and_framed_poster():
+    templates = load_templates(Path("product_templates.json"))
+    by_key = {template.key: template for template in templates}
+
+    assert by_key["mug_new"].audience == "coffee drinkers and office gift shoppers"
+    assert by_key["canvas_basic"].audience == "gallery wall decor shoppers and gift buyers"
+    assert by_key["framed_poster_basic"].audience == "framed wall art shoppers and gift buyers"
+
+
 def test_active_sparse_templates_have_minimum_seo_and_tag_depth():
     templates = load_templates(Path("product_templates.json"))
     by_key = {template.key: template for template in templates}
