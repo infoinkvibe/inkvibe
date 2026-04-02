@@ -8230,6 +8230,14 @@ def test_template_audience_regression_for_mug_canvas_and_framed_poster():
     assert by_key["framed_poster_basic"].audience == "framed wall art shoppers and gift buyers"
 
 
+def test_template_audience_regression_for_phone_case_and_tumbler():
+    templates = load_templates(Path("product_templates.json"))
+    by_key = {template.key: template for template in templates}
+
+    assert by_key["phone_case_basic"].audience == "gift shoppers seeking stylish protective phone accessories"
+    assert by_key["tumbler_20oz_basic"].audience == "on-the-go drinkware shoppers and gift buyers"
+
+
 def test_active_sparse_templates_have_minimum_seo_and_tag_depth():
     templates = load_templates(Path("product_templates.json"))
     by_key = {template.key: template for template in templates}
