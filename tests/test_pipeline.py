@@ -5894,6 +5894,8 @@ def test_next_wave_templates_define_provider_blueprint_and_variant_guards():
     assert travel.enabled_variant_option_filters.get("size") == ["20oz"]
     assert travel.max_enabled_variants == 1
     assert travel.disable_variants_below_margin_floor is True
+    assert travel.preferred_mockup_types == ["lifestyle", "studio"]
+    assert travel.preferred_mockup_position == "mug_front"
 
     mug_15oz = by_key["mug_15oz_ceramic"]
     assert mug_15oz.printify_blueprint_id == 68

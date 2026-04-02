@@ -1614,8 +1614,8 @@
     ],
     "preferred_default_variant_color": "White",
     "preferred_mockup_types": [
-      "studio",
-      "lifestyle"
+      "lifestyle",
+      "studio"
     ],
     "preferred_featured_image_strategy": "variant_color_then_mockup_type",
     "provider_selection_strategy": "pinned_then_printify_choice_then_lowest_cost",
@@ -1636,6 +1636,7 @@
     "disable_variants_below_margin_floor": true,
     "reprice_variants_to_margin_floor": true,
     "mark_template_nonviable_if_needed": true,
-    "active": true
+    "active": true,
+    "preferred_mockup_position": "mug_front"
   }
 ]
