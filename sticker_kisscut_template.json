@@ -33,12 +33,12 @@
   "publish_images": true,
   "publish_variants": true,
   "publish_tags": true,
-  "default_price": "8.99",
+  "default_price": "9.99",
   "base_price": "4.99",
   "markup_type": "fixed",
   "markup_value": "4.00",
   "rounding_mode": "x_99",
-  "compare_at_price": "11.99",
+  "compare_at_price": "12.99",
   "placements": [
     {
       "placement_name": "front",

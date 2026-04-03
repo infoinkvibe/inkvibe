@@ -309,8 +309,8 @@
     "provider_selection_strategy": "prefer_printify_choice_then_ranked",
     "fallback_provider_allowed": true,
     "active": true,
-    "default_price": "36.99",
-    "compare_at_price": "42.99",
+    "default_price": "37.99",
+    "compare_at_price": "43.99",
     "expanded_enabled_colors": [
       "Dark Heather",
       "Maroon"
@@ -330,7 +330,7 @@
       "Maroon",
       "White"
     ],
-    "min_profit_after_shipping": "3.00"
+    "min_profit_after_shipping": "4.00"
   },
   {
     "key": "sweatshirt_gildan_alt",
@@ -410,8 +410,8 @@
     "provider_selection_strategy": "prefer_printify_choice_then_ranked",
     "fallback_provider_allowed": true,
     "active": true,
-    "default_price": "36.99",
-    "compare_at_price": "42.99",
+    "default_price": "37.99",
+    "compare_at_price": "43.99",
     "expanded_enabled_colors": [
       "Dark Heather"
     ],
@@ -428,7 +428,7 @@
       "Black",
       "Navy"
     ],
-    "min_profit_after_shipping": "3.00"
+    "min_profit_after_shipping": "4.00"
   },
   {
     "key": "hoodie_gildan",
@@ -962,8 +962,8 @@
     "pinned_blueprint_id": 852,
     "fallback_provider_allowed": true,
     "active": true,
-    "default_price": "34.99",
-    "compare_at_price": "39.99"
+    "default_price": "38.99",
+    "compare_at_price": "44.99"
   },
   {
     "key": "tote_basic",
@@ -1238,12 +1238,12 @@
     "publish_images": true,
     "publish_variants": true,
     "publish_tags": true,
-    "default_price": "8.99",
+    "default_price": "9.99",
     "base_price": "4.99",
     "markup_type": "fixed",
     "markup_value": "4.00",
     "rounding_mode": "x_99",
-    "compare_at_price": "11.99",
+    "compare_at_price": "12.99",
     "placements": [
       {
         "placement_name": "front",
