@@ -6485,6 +6485,125 @@ def test_wallart_auto_master_logs_action_context(tmp_path: Path, caplog):
     assert "fallback_reason=insufficient_artwork_resolution_cover_mode" in caplog.text
 
 
+def test_process_artwork_wallart_auto_master_threads_options_without_nameerror(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    class DummyPrintify:
+        dry_run = False
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 99, "title": "Provider"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [{"id": 1, "is_available": True, "options": {}, "price": 1200}]
+
+    monkeypatch.setattr(
+        pipeline,
+        "_resolve_template_catalog_mapping",
+        lambda printify, template, discovery_mode="normal": (
+            template,
+            types.SimpleNamespace(
+                template_hint_blueprint_id=template.printify_blueprint_id,
+                template_hint_provider_id=template.printify_print_provider_id,
+                resolved_blueprint_id=template.printify_blueprint_id,
+                resolved_provider_id=template.printify_print_provider_id,
+                discovery_used="pinned",
+                pinned_attempted_first=True,
+                fallback_discovery_triggered=False,
+                fallback_discovery_reason="",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "validate_catalog_family_schema",
+        lambda **kwargs: types.SimpleNamespace(plausible=True, reason="", intended_family="wallart"),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "choose_variants_from_catalog_with_diagnostics",
+        lambda variants, template: (
+            variants,
+            types.SimpleNamespace(
+                resolved_model_dimension="",
+                final_selected_models=[],
+                zero_selection_reason="",
+            ),
+        ),
+    )
+    monkeypatch.setattr(pipeline, "reorder_variants_for_storefront_display", lambda template, artwork, variant_rows: variant_rows)
+    monkeypatch.setattr(
+        pipeline,
+        "evaluate_artwork_eligibility_for_template",
+        lambda artwork, template, placement: types.SimpleNamespace(
+            eligible=False,
+            reason_code="insufficient_artwork_resolution",
+            source_size=(3000, 3000),
+            required_size=(4500, 5400),
+            fit_mode="cover",
+            rule_failed="cover_requires_full_dimensions",
+        ),
+    )
+
+    prepare_calls = {"count": 0}
+
+    def _prepare(artwork, template, placement, export_dir, options):
+        prepare_calls["count"] += 1
+        assert options.auto_wallart_master is True
+        assert options.allow_upscale is True
+        return PreparedArtwork(
+            artwork=artwork,
+            template=template,
+            placement=placement,
+            export_path=tmp_path / "wallart-export.png",
+            width_px=placement.width_px,
+            height_px=placement.height_px,
+        )
+
+    monkeypatch.setattr(pipeline, "prepare_artwork_export", _prepare)
+    monkeypatch.setattr(pipeline, "upload_assets_to_printify", lambda *a, **k: {"front": {"id": "upload-1"}})
+    monkeypatch.setattr(
+        pipeline,
+        "upsert_in_printify",
+        lambda **kwargs: {
+            "status": "ok",
+            "action": "create",
+            "printify_product_id": "p1",
+            "publish_attempted": False,
+            "publish_verified": False,
+        },
+    )
+
+    artwork = _create_artwork(tmp_path, 3000, 3000)
+    template = ProductTemplate(
+        key="canvas_basic",
+        printify_blueprint_id=42,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[PlacementRequirement("front", 4500, 5400, artwork_fit_mode="cover")],
+    )
+    state = ensure_state_shape({})
+
+    pipeline.process_artwork(
+        printify=DummyPrintify(),
+        shopify=None,
+        shop_id=None,
+        artwork=artwork,
+        templates=[template],
+        state=state,
+        force=False,
+        export_dir=tmp_path / "exports",
+        state_path=tmp_path / "state.json",
+        artwork_options=ArtworkProcessingOptions(allow_upscale=True, auto_wallart_master=True),
+        upload_strategy="auto",
+        r2_config=None,
+    )
+
+    assert prepare_calls["count"] == 1
+    assert state["processed"][artwork.slug]["products"][0]["result"]["printify"]["status"] == "prepared_only"
+
+
 def test_resolve_artwork_for_blanket_cover_succeeds_when_source_is_large_enough(tmp_path: Path):
     path = tmp_path / "blanket-large.png"
     Image.new("RGBA", (8000, 6400), (255, 0, 0, 255)).save(path)

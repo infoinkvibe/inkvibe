@@ -8762,9 +8762,10 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     placement=placement,
                 )
                 if not eligibility_result.eligible:
+                    placement_allows_upscale = artwork_options.allow_upscale or placement.allow_upscale
                     if (
-                        auto_wallart_master
-                        and allow_upscale
+                        artwork_options.auto_wallart_master
+                        and placement_allows_upscale
                         and resolved_template.key in WALLART_AUTO_MASTER_TEMPLATE_KEYS
                         and eligibility_result.reason_code == "insufficient_artwork_resolution"
                     ):
@@ -8777,6 +8778,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                             eligibility_result.required_size[0],
                             eligibility_result.required_size[1],
                         )
+                        eligibility_result = None
                         continue
                     failed_eligibility_placement_name = placement.placement_name
                     break
