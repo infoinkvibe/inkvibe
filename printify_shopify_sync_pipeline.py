@@ -3897,15 +3897,28 @@ def run_free_shipping_profit_audit(
     for template in templates:
         if not template.active:
             continue
+        resolved_template, resolution_diag = _resolve_template_catalog_mapping(
+            printify=printify,
+            template=template,
+            discovery_mode="normal",
+        )
         try:
-            catalog_variants = printify.list_variants(template.printify_blueprint_id, template.printify_print_provider_id)
+            catalog_variants = printify.list_variants(
+                resolved_template.printify_blueprint_id,
+                resolved_template.printify_print_provider_id,
+            )
         except Exception as exc:
             rows.append(
                 {
                     "template_key": template.key,
                     "active": True,
-                    "blueprint_id": template.printify_blueprint_id,
-                    "provider_id": template.printify_print_provider_id,
+                    "blueprint_id": resolved_template.printify_blueprint_id,
+                    "provider_id": resolved_template.printify_print_provider_id,
+                    "template_hint_blueprint_id": template.printify_blueprint_id,
+                    "template_hint_provider_id": template.printify_print_provider_id,
+                    "catalog_discovery_used": resolution_diag.discovery_used,
+                    "fallback_discovery_triggered": resolution_diag.fallback_discovery_triggered,
+                    "fallback_discovery_reason": resolution_diag.fallback_discovery_reason,
                     "selected_count": 0,
                     "final_enabled_count": 0,
                     "lowest_profit_after_shipping_minor": 0,
@@ -3938,8 +3951,13 @@ def run_free_shipping_profit_audit(
             {
                 "template_key": template.key,
                 "active": True,
-                "blueprint_id": template.printify_blueprint_id,
-                "provider_id": template.printify_print_provider_id,
+                "blueprint_id": resolved_template.printify_blueprint_id,
+                "provider_id": resolved_template.printify_print_provider_id,
+                "template_hint_blueprint_id": template.printify_blueprint_id,
+                "template_hint_provider_id": template.printify_print_provider_id,
+                "catalog_discovery_used": resolution_diag.discovery_used,
+                "fallback_discovery_triggered": resolution_diag.fallback_discovery_triggered,
+                "fallback_discovery_reason": resolution_diag.fallback_discovery_reason,
                 "selected_count": len(selected),
                 "final_enabled_count": len(guarded),
                 "option_names": "|".join(diagnostics.option_names),

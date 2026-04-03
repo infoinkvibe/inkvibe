@@ -1440,6 +1440,88 @@ def test_free_shipping_profit_audit_flags_policy_thin_templates_and_exports(tmp_
     assert {row["template_key"] for row in payload} == {"sticker_kisscut", "longsleeve_gildan"}
 
 
+def test_free_shipping_profit_audit_resolves_effective_provider_for_midweight_alt():
+    class AuditPrintify:
+        dry_run = True
+
+        def list_blueprints(self):
+            return []
+
+        def list_print_providers(self, blueprint_id):
+            assert blueprint_id == 77
+            return [
+                {"id": 30, "title": "Stale Provider"},
+                {"id": 99, "title": "Printify Choice"},
+            ]
+
+        def list_variants(self, blueprint_id, provider_id):
+            if (blueprint_id, provider_id) == (77, 30):
+                raise RuntimeError("HTTP 404 for /catalog/blueprints/77/print_providers/30/variants.json")
+            assert (blueprint_id, provider_id) == (77, 99)
+            return [
+                {"id": 101, "is_available": True, "options": {"color": "Black", "size": "L"}, "price": 2000, "cost": 1800, "shipping": 500},
+            ]
+
+    templates = load_templates(Path("product_templates.json"))
+    scoped = [template for template in templates if template.key == "hoodie_midweight_alt"]
+    rows = run_free_shipping_profit_audit(
+        printify=AuditPrintify(),
+        templates=scoped,
+        free_shipping_min_profit_minor=400,
+    )
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["template_key"] == "hoodie_midweight_alt"
+    assert row["status"] == "ok"
+    assert row["template_hint_provider_id"] == 30
+    assert row["provider_id"] == 99
+    assert "404" not in str(row.get("message", ""))
+
+
+def test_free_shipping_profit_audit_profitability_floor_targets_for_cleanup_templates():
+    class AuditPrintify:
+        dry_run = True
+
+        def list_blueprints(self):
+            return []
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 99, "title": "Printify Choice"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            assert provider_id == 99
+            if blueprint_id == 49:  # sweatshirt_gildan + sweatshirt_gildan_alt
+                return [{"id": 201, "is_available": True, "options": {"color": "Black", "size": "L"}, "price": 2000, "cost": 1000, "shipping": 200}]
+            if blueprint_id == 852:  # poster_basic
+                return [{"id": 301, "is_available": True, "options": {"size": "16″ x 20″ (Vertical)"}, "price": 2000, "cost": 1000, "shipping": 200}]
+            if blueprint_id == 906:  # sticker_kisscut
+                return [{"id": 401, "is_available": True, "options": {"size": '4" × 4"', "quantity": "100 pcs"}, "price": 200, "cost": 100, "shipping": 100}]
+            if blueprint_id == 80:  # longsleeve_gildan
+                return [{"id": 501, "is_available": True, "options": {"color": "Black", "size": "L"}, "price": 2200, "cost": 1000, "shipping": 200}]
+            return []
+
+    target_keys = {
+        "sweatshirt_gildan",
+        "sweatshirt_gildan_alt",
+        "poster_basic",
+        "sticker_kisscut",
+        "longsleeve_gildan",
+    }
+    templates = load_templates(Path("product_templates.json"))
+    scoped = [template for template in templates if template.key in target_keys]
+    rows = run_free_shipping_profit_audit(
+        printify=AuditPrintify(),
+        templates=scoped,
+        free_shipping_min_profit_minor=400,
+    )
+    by_key = {row["template_key"]: row for row in rows}
+    for template_key in target_keys:
+        assert by_key[template_key]["status"] == "ok"
+        assert by_key[template_key]["active"] is True
+        assert by_key[template_key]["meets_free_shipping_policy"] is True
+        assert by_key[template_key]["lowest_profit_after_shipping_minor"] >= 400
+
+
 def test_tote_guardrails_report_economics_and_ceiling_failure_reason():
     tote = ProductTemplate(
         key="tote_basic",
@@ -8820,9 +8902,9 @@ def test_alt_sweatshirt_template_rollout_is_active_and_conservative():
     assert alt.preferred_featured_image_strategy == "variant_color_then_mockup_type"
     assert alt.provider_selection_strategy == "prefer_printify_choice_then_ranked"
     assert alt.fallback_provider_allowed is True
-    assert alt.default_price == "36.99"
-    assert alt.compare_at_price == "42.99"
-    assert alt.min_profit_after_shipping == "3.00"
+    assert alt.default_price == "37.99"
+    assert alt.compare_at_price == "43.99"
+    assert alt.min_profit_after_shipping == "4.00"
 
 
 def test_rollout_adds_exactly_one_alternate_sweatshirt_template():
