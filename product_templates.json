@@ -124,10 +124,10 @@
     "title_pattern": "{artwork_title} {product_type_label}",
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [
-      "Black",
-      "White",
-      "Navy",
-      "Sport Grey"
+      "Solid Black",
+      "Solid White",
+      "Solid Midnight Navy",
+      "Heather Grey"
     ],
     "enabled_sizes": [
       "S",
@@ -188,12 +188,12 @@
     "shirt_subject_fill_target": 0.7,
     "max_upscale_factor": 6.0,
     "preferred_mockup_colors": [
-      "Black",
-      "Navy",
-      "Sport Grey",
-      "White"
+      "Solid Black",
+      "Solid Midnight Navy",
+      "Heather Dark Grey",
+      "Solid White"
     ],
-    "preferred_default_variant_color": "Black",
+    "preferred_default_variant_color": "Solid Black",
     "preferred_mockup_types": [
       "lifestyle",
       "flat"
@@ -212,19 +212,19 @@
     "compare_at_price": "31.99",
     "max_allowed_price": "36.99",
     "expanded_enabled_colors": [
-      "Dark Heather"
+      "Heather Dark Grey"
     ],
     "storefront_display_color_priority": [
-      "Dark Heather",
-      "Black",
-      "Navy",
-      "Sport Grey",
-      "White"
+      "Heather Dark Grey",
+      "Solid Black",
+      "Solid Midnight Navy",
+      "Heather Grey",
+      "Solid White"
     ],
     "storefront_display_color_rotation_seed": "tshirt_premium_soft_v1",
     "storefront_default_color_candidates": [
-      "Dark Heather",
-      "White"
+      "Heather Dark Grey",
+      "Solid White"
     ],
     "min_profit_after_shipping": "3.00"
   },
@@ -739,7 +739,7 @@
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],
     "enabled_sizes": [
-      "15oz"
+      "11oz"
     ],
     "placements": [
       {
@@ -759,25 +759,25 @@
     "markup_value": "35",
     "rounding_mode": "whole_dollar",
     "seo_keywords": [
-      "15oz ceramic mug",
-      "large coffee mug",
+      "11oz ceramic mug",
+      "daily coffee mug",
       "giftable drinkware"
     ],
-    "audience": "coffee and tea drinkers seeking a larger daily mug",
-    "product_type_label": "15oz Mug",
+    "audience": "coffee and tea drinkers seeking a daily ceramic mug",
+    "product_type_label": "11oz Mug",
     "style_keywords": [
       "clean",
       "playful"
     ],
     "tags": [
       "mug",
-      "15oz mug",
+      "11oz mug",
       "ceramic mug"
     ],
     "enabled_variant_option_filters": {
       "color": [],
       "size": [
-        "15oz"
+        "11oz"
       ]
     },
     "max_enabled_variants": 1,
@@ -795,7 +795,7 @@
     "pinned_provider_id": 1,
     "pinned_blueprint_id": 68,
     "fallback_provider_allowed": true,
-    "active": true,
+    "active": false,
     "default_price": "18.99",
     "compare_at_price": "22.99",
     "min_profit_after_shipping": "4.00",
@@ -1385,7 +1385,7 @@
     "target_margin_after_shipping": "5.00",
     "shipping_basis_for_margin": "cost",
     "disable_variants_below_margin_floor": true,
-    "reprice_variants_to_margin_floor": false,
+    "reprice_variants_to_margin_floor": true,
     "mark_template_nonviable_if_needed": true,
     "active": true
   },
