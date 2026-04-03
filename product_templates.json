@@ -732,6 +732,108 @@
     "reprice_variants_to_margin_floor": true
   },
   {
+    "key": "accent_mug_basic",
+    "printify_blueprint_id": 635,
+    "printify_print_provider_id": 39,
+    "title_pattern": "{artwork_title} Accent Coffee Mug",
+    "description_pattern": "<p>{generated_description}</p>",
+    "enabled_colors": [
+      "Black",
+      "Blue",
+      "Light Blue",
+      "Light Green",
+      "Maroon",
+      "Orange",
+      "Pink",
+      "Red",
+      "Yellow"
+    ],
+    "enabled_sizes": [
+      "11oz",
+      "15oz"
+    ],
+    "placements": [
+      {
+        "placement_name": "front",
+        "width_px": 2700,
+        "height_px": 1120,
+        "file_type": "png",
+        "allow_upscale": false,
+        "placement_scale": 0.78,
+        "placement_x": 0.5,
+        "placement_y": 0.5,
+        "placement_angle": 0,
+        "artwork_fit_mode": "contain"
+      }
+    ],
+    "base_price": "13.99",
+    "markup_type": "percent",
+    "markup_value": "35",
+    "rounding_mode": "whole_dollar",
+    "seo_keywords": [
+      "accent coffee mug",
+      "11oz and 15oz mug",
+      "color handle mug",
+      "giftable drinkware"
+    ],
+    "audience": "coffee and tea drinkers shopping for colorful everyday drinkware",
+    "product_type_label": "Accent Coffee Mug",
+    "style_keywords": [
+      "clean",
+      "giftable"
+    ],
+    "tags": [
+      "accent coffee mug",
+      "coffee mug",
+      "drinkware",
+      "giftable mug"
+    ],
+    "enabled_variant_option_filters": {
+      "color": [
+        "Black",
+        "Blue",
+        "Light Blue",
+        "Light Green",
+        "Maroon",
+        "Orange",
+        "Pink",
+        "Red",
+        "Yellow"
+      ],
+      "size": [
+        "11oz",
+        "15oz"
+      ]
+    },
+    "max_enabled_variants": 18,
+    "shopify_product_type": "Drinkware",
+    "preferred_mockup_colors": [
+      "Black",
+      "Blue",
+      "Red",
+      "Yellow"
+    ],
+    "preferred_default_variant_color": "Black",
+    "preferred_mockup_types": [
+      "studio",
+      "lifestyle"
+    ],
+    "preferred_featured_image_strategy": "variant_color_then_mockup_type",
+    "preferred_mockup_position": "mug_front",
+    "provider_selection_strategy": "pinned_then_printify_choice_then_lowest_cost",
+    "pinned_provider_id": 39,
+    "pinned_blueprint_id": 635,
+    "fallback_provider_allowed": true,
+    "active": true,
+    "default_price": "19.99",
+    "compare_at_price": "24.99",
+    "min_profit_after_shipping": "4.00",
+    "target_margin_after_shipping": "6.00",
+    "disable_variants_below_margin_floor": true,
+    "reprice_variants_to_margin_floor": true,
+    "mark_template_nonviable_if_needed": true
+  },
+  {
     "key": "mug_15oz_ceramic",
     "printify_blueprint_id": 68,
     "printify_print_provider_id": 1,
