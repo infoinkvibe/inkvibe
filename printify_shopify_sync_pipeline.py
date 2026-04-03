@@ -850,6 +850,7 @@ class PreparedArtwork:
     poster_requested_upscale_factor: float = 1.0
     poster_applied_upscale_factor: float = 1.0
     poster_fill_optimization_used: bool = False
+    wallart_derivation_reason: str = ""
 
 
 @dataclass
@@ -859,6 +860,7 @@ class ArtworkProcessingOptions:
     skip_undersized: bool = False
     placement_preview: bool = False
     preview_dir: pathlib.Path = pathlib.Path("exports/previews")
+    auto_wallart_master: bool = False
 
 
 @dataclass
@@ -888,6 +890,7 @@ class ArtworkResolution:
     poster_requested_upscale_factor: float = 1.0
     poster_applied_upscale_factor: float = 1.0
     poster_fill_optimization_used: bool = False
+    wallart_derivation_reason: str = ""
 
 
 @dataclass
@@ -935,6 +938,9 @@ POSTER_FILL_TARGET_PCT_DEFAULT = 0.94
 POSTER_SMALL_SOURCE_SAFE_MAX_UPSCALE_FACTOR = 1.85
 POSTER_SMALL_SOURCE_MIN_SOURCE_RATIO = 0.22
 POSTER_SMALL_SOURCE_PORTRAIT_ASPECT_MAX = 0.8
+WALLART_AUTO_MASTER_TEMPLATE_KEYS = {"canvas_basic", "blanket_basic", "framed_poster_basic"}
+WALLART_AUTO_MASTER_MAX_UPSCALE_FACTOR = 6.0
+WALLART_AUTO_MASTER_MIN_SOURCE_RATIO = 0.16
 
 
 LAUNCH_PLAN_OVERRIDE_COLUMNS = [
@@ -5772,6 +5778,7 @@ def resolve_artwork_for_placement(
     max_upscale_factor: Optional[float] = None,
     aggressive_subject_trim_mode: Optional[str] = None,
     subject_fill_target: Optional[float] = None,
+    auto_wallart_master: bool = False,
 ) -> ArtworkResolution:
     with Image.open(artwork.src_path) as opened:
         image = ImageOps.exif_transpose(opened).convert("RGBA")
@@ -5835,6 +5842,7 @@ def resolve_artwork_for_placement(
     poster_applied_upscale_factor = 1.0
     poster_trim_fill_optimization_applied = False
     poster_enhancement_status = "not_considered"
+    wallart_derivation_reason = ""
     effective_allow_upscale = allow_upscale
     effective_max_upscale_factor = max_upscale_factor
     if template_key == "poster_basic":
@@ -5967,6 +5975,70 @@ def resolve_artwork_for_placement(
                 )
 
     too_small = fit_mode == "cover" and (image.width < placement.width_px or image.height < placement.height_px)
+    wallart_auto_master_eligible = (
+        auto_wallart_master
+        and allow_upscale
+        and template_key in WALLART_AUTO_MASTER_TEMPLATE_KEYS
+        and fit_mode == "cover"
+        and too_small
+    )
+    if wallart_auto_master_eligible:
+        wallart_derivation_reason = "insufficient_artwork_resolution_cover_mode"
+        source_before_trim = (image.width, image.height)
+        trim_result = _trim_artwork_bounds(
+            image,
+            min_alpha=max(1, trim_min_alpha),
+            padding_pct=max(0.005, trim_padding_pct),
+            min_reduction_pct=min(trim_min_reduction_pct, 0.005),
+        )
+        image = trim_result.image
+        if trim_result.applied:
+            trimmed_size = trim_result.trimmed_size
+            trim_applied = True
+            trim_skip_reason = None
+        else:
+            trim_skip_reason = trim_result.skip_reason or trim_skip_reason
+        requested_wallart_upscale = max(placement.width_px / image.width, placement.height_px / image.height)
+        source_ratio = min(image.width / placement.width_px, image.height / placement.height_px)
+        cap_applied = requested_wallart_upscale > WALLART_AUTO_MASTER_MAX_UPSCALE_FACTOR
+        if source_ratio >= WALLART_AUTO_MASTER_MIN_SOURCE_RATIO and requested_wallart_upscale <= WALLART_AUTO_MASTER_MAX_UPSCALE_FACTOR:
+            effective_allow_upscale = True
+            effective_max_upscale_factor = WALLART_AUTO_MASTER_MAX_UPSCALE_FACTOR
+            logger.info(
+                "Wall-art derived master enabled template=%s placement=%s fallback_reason=%s source=%sx%s trimmed=%s required=%sx%s requested_upscale_factor=%.3f applied_upscale_factor=%.3f upscale_cap_applied=%s max_allowed=%.3f path=cover_crop preserve_transparency=%s",
+                template_key,
+                placement.placement_name,
+                wallart_derivation_reason,
+                source_before_trim[0],
+                source_before_trim[1],
+                f"{image.width}x{image.height}",
+                placement.width_px,
+                placement.height_px,
+                requested_wallart_upscale,
+                min(requested_wallart_upscale, WALLART_AUTO_MASTER_MAX_UPSCALE_FACTOR),
+                cap_applied,
+                WALLART_AUTO_MASTER_MAX_UPSCALE_FACTOR,
+                str(artwork.src_path.suffix.lower() == ".png").lower(),
+            )
+            too_small = False
+        else:
+            effective_allow_upscale = False
+            logger.warning(
+                "Wall-art derived master skipped template=%s placement=%s fallback_reason=%s source=%sx%s trimmed=%sx%s required=%sx%s requested_upscale_factor=%.3f max_allowed=%.3f min_source_ratio=%.3f required_min_ratio=%.3f reason=outside_safe_limits final_action=skip_insufficient_resolution",
+                template_key,
+                placement.placement_name,
+                wallart_derivation_reason,
+                source_before_trim[0],
+                source_before_trim[1],
+                image.width,
+                image.height,
+                placement.width_px,
+                placement.height_px,
+                requested_wallart_upscale,
+                WALLART_AUTO_MASTER_MAX_UPSCALE_FACTOR,
+                source_ratio,
+                WALLART_AUTO_MASTER_MIN_SOURCE_RATIO,
+            )
 
     logger.info(
         "Artwork %s placement=%s fit_mode=%s original=%sx%s trimmed=%s required=%sx%s",
@@ -6093,6 +6165,8 @@ def resolve_artwork_for_placement(
         top = max(0, (placement.height_px - resized.height) // 2)
         final.alpha_composite(resized, (left, top))
         action = "contained_padded_upscale" if upscaled else "contained_padded"
+    if wallart_auto_master_eligible and upscaled:
+        action = "derived_wallart_master_upscale"
 
     logger.info(
         "Artwork resolution action=%s placement=%s fit_mode=%s original=%sx%s trimmed=%s resized=%sx%s final_canvas=%sx%s upscaled=%s requested_upscale_factor=%.3f applied_upscale_factor=%.3f upscale_capped=%s effective_upscale_factor=%.3f",
@@ -6183,6 +6257,7 @@ def resolve_artwork_for_placement(
         poster_requested_upscale_factor=poster_requested_upscale_factor if template_key == "poster_basic" else 1.0,
         poster_applied_upscale_factor=applied_upscale_factor if template_key == "poster_basic" else 1.0,
         poster_fill_optimization_used=poster_trim_fill_optimization_applied if template_key == "poster_basic" else False,
+        wallart_derivation_reason=wallart_derivation_reason,
     )
 
 
@@ -6236,6 +6311,7 @@ def prepare_artwork_export(
         max_upscale_factor=_resolve_max_upscale_factor(template, placement),
         aggressive_subject_trim_mode=aggressive_subject_trim_mode,
         subject_fill_target=subject_fill_target,
+        auto_wallart_master=options.auto_wallart_master,
     )
     if not trim_artwork_bounds and shirt_only_trim_requested and not is_shirt_template:
         resolution.trim_skip_reason = "non_shirt_template"
@@ -6287,6 +6363,7 @@ def prepare_artwork_export(
         poster_requested_upscale_factor=resolution.poster_requested_upscale_factor,
         poster_applied_upscale_factor=resolution.poster_applied_upscale_factor,
         poster_fill_optimization_used=resolution.poster_fill_optimization_used,
+        wallart_derivation_reason=resolution.wallart_derivation_reason,
     )
 
 
@@ -8685,6 +8762,22 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     placement=placement,
                 )
                 if not eligibility_result.eligible:
+                    if (
+                        auto_wallart_master
+                        and allow_upscale
+                        and resolved_template.key in WALLART_AUTO_MASTER_TEMPLATE_KEYS
+                        and eligibility_result.reason_code == "insufficient_artwork_resolution"
+                    ):
+                        logger.info(
+                            "Bypassing eligibility gate for wall-art derived master template=%s placement=%s source=%sx%s required=%sx%s",
+                            resolved_template.key,
+                            placement.placement_name,
+                            eligibility_result.source_size[0],
+                            eligibility_result.source_size[1],
+                            eligibility_result.required_size[0],
+                            eligibility_result.required_size[1],
+                        )
+                        continue
                     failed_eligibility_placement_name = placement.placement_name
                     break
             if eligibility_result is not None and not eligibility_result.eligible:
@@ -9245,6 +9338,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force", action="store_true", help="Reprocess artworks already present in state.json")
     parser.add_argument("--allow-upscale", action="store_true", help="Allow undersized artwork to be upscaled to placement dimensions")
     parser.add_argument("--upscale-method", choices=["nearest", "lanczos"], default="lanczos", help="Resampling method used when upscaling")
+    parser.add_argument(
+        "--auto-wallart-master",
+        action="store_true",
+        help="Opt-in: allow canvas_basic/blanket_basic/framed_poster_basic to derive a bounded upscaled wall-art master instead of immediate cover-mode resolution skip (requires --allow-upscale).",
+    )
     parser.add_argument("--skip-undersized", action="store_true", help="Skip undersized artwork/template placements instead of failing")
     parser.add_argument("--templates", default=str(TEMPLATES_CONFIG), help="Path to product_templates.json")
     parser.add_argument("--image-dir", default=str(IMAGE_DIR), help="Image source directory")
@@ -9750,7 +9848,7 @@ def apply_high_volume_mode_defaults(
     }
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", export_preflight_report_path: str = "", allow_preflight_failures: bool = False, preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, enable_ai_product_copy: Optional[bool] = None, ai_product_copy_model: str = "", generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "", max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS, interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS, catalog_cache_dir: str = CATALOG_CACHE_DIR_DEFAULT, catalog_cache_ttl_hours: int = CACHE_TTL_HOURS_DEFAULT, no_catalog_cache: bool = False, chunk_size: int = 0, pause_between_chunks_seconds: float = 0.0, catalog_request_spacing_ms: int = 0, template_spacing_ms: int = 0, artwork_spacing_ms: int = 0, resume_only_pending: bool = False, high_volume_mode: bool = False, publish_batch_size: int = 5, pause_between_publish_batches_seconds: float = 2.0, defer_publish: bool = False, resume_publish_only: bool = False, progress: Optional[bool] = None) -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", auto_wallart_master: bool = False, skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", export_preflight_report_path: str = "", allow_preflight_failures: bool = False, preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, enable_ai_product_copy: Optional[bool] = None, ai_product_copy_model: str = "", generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "", max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS, interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS, catalog_cache_dir: str = CATALOG_CACHE_DIR_DEFAULT, catalog_cache_ttl_hours: int = CACHE_TTL_HOURS_DEFAULT, no_catalog_cache: bool = False, chunk_size: int = 0, pause_between_chunks_seconds: float = 0.0, catalog_request_spacing_ms: int = 0, template_spacing_ms: int = 0, artwork_spacing_ms: int = 0, resume_only_pending: bool = False, high_volume_mode: bool = False, publish_batch_size: int = 5, pause_between_publish_batches_seconds: float = 2.0, defer_publish: bool = False, resume_publish_only: bool = False, progress: Optional[bool] = None) -> None:
     max_retry_sleep_seconds = max(0.0, float(max_retry_sleep_seconds))
     interactive_retry_cap_seconds = max(0.0, float(interactive_retry_cap_seconds))
     if resume_only_pending:
@@ -9777,6 +9875,8 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         pause_between_publish_batches_seconds = float(hv_defaults["pause_between_publish_batches_seconds"])
     if publish_mode not in {"default", "publish", "skip"}:
         raise RuntimeError(f"Unsupported publish mode: {publish_mode}")
+    if auto_wallart_master and not allow_upscale:
+        logger.warning("Wall-art auto master requested but --allow-upscale is disabled; auto-wallart-master will remain inactive.")
     configure_ai_product_copy(enabled=enable_ai_product_copy, model=ai_product_copy_model)
 
     if export_launch_plan_template:
@@ -10163,7 +10263,14 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         save_json_atomic(state_path, state)
         log_run_summary(summary)
         return
-    artwork_options = ArtworkProcessingOptions(allow_upscale=allow_upscale, upscale_method=upscale_method, skip_undersized=skip_undersized, placement_preview=placement_preview, preview_dir=export_dir / "previews")
+    artwork_options = ArtworkProcessingOptions(
+        allow_upscale=allow_upscale,
+        upscale_method=upscale_method,
+        skip_undersized=skip_undersized,
+        placement_preview=placement_preview,
+        preview_dir=export_dir / "previews",
+        auto_wallart_master=auto_wallart_master,
+    )
     combinations_processed = 0
     stop_requested = False
     effective_chunk_size = max(0, int(chunk_size))
@@ -10484,6 +10591,7 @@ if __name__ == "__main__":
             force=args.force,
             allow_upscale=args.allow_upscale,
             upscale_method=args.upscale_method,
+            auto_wallart_master=args.auto_wallart_master,
             skip_undersized=args.skip_undersized,
             image_dir=pathlib.Path(args.image_dir),
             export_dir=pathlib.Path(args.export_dir),
