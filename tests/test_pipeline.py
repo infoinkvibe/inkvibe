@@ -6,6 +6,7 @@ import sys
 import types
 from dataclasses import fields
 from pathlib import Path
+from typing import Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -6396,6 +6397,94 @@ def test_resolve_artwork_for_blanket_undersized_cover_raises_structured_resoluti
     assert classify_failure(exc) == "insufficient_artwork_resolution"
 
 
+@pytest.mark.parametrize(
+    ("template_key", "required_size"),
+    [
+        ("canvas_basic", (4500, 5400)),
+        ("blanket_basic", (6000, 4800)),
+        ("framed_poster_basic", (4500, 5400)),
+    ],
+)
+def test_wallart_auto_master_derives_master_for_supported_families(tmp_path: Path, template_key: str, required_size: Tuple[int, int]):
+    path = tmp_path / f"{template_key}-small.png"
+    Image.new("RGBA", (3000, 3000), (255, 0, 0, 200)).save(path)
+    artwork = Artwork(f"{template_key}-small", path, "Wall Art", "", [], 3000, 3000)
+    placement = PlacementRequirement("front", required_size[0], required_size[1], artwork_fit_mode="cover")
+
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        template_key=template_key,
+        allow_upscale=True,
+        upscale_method="lanczos",
+        skip_undersized=False,
+        auto_wallart_master=True,
+    )
+
+    assert result.action == "derived_wallart_master_upscale"
+    assert result.final_size == required_size
+    assert result.upscaled is True
+    assert result.wallart_derivation_reason == "insufficient_artwork_resolution_cover_mode"
+
+
+def test_wallart_auto_master_disabled_preserves_cover_skip_behavior(tmp_path: Path):
+    path = tmp_path / "canvas-small.png"
+    Image.new("RGBA", (3000, 3000), (255, 0, 0, 255)).save(path)
+    artwork = Artwork("canvas-small", path, "Canvas Small", "", [], 3000, 3000)
+    placement = PlacementRequirement("front", 4500, 5400, artwork_fit_mode="cover")
+
+    with pytest.raises(InsufficientArtworkResolutionError):
+        resolve_artwork_for_placement(
+            artwork,
+            placement,
+            template_key="canvas_basic",
+            allow_upscale=False,
+            upscale_method="lanczos",
+            skip_undersized=False,
+            auto_wallart_master=False,
+        )
+
+
+def test_wallart_auto_master_too_small_source_still_skips(tmp_path: Path):
+    path = tmp_path / "canvas-tiny.png"
+    Image.new("RGBA", (500, 500), (255, 0, 0, 255)).save(path)
+    artwork = Artwork("canvas-tiny", path, "Canvas Tiny", "", [], 500, 500)
+    placement = PlacementRequirement("front", 4500, 5400, artwork_fit_mode="cover")
+
+    with pytest.raises(InsufficientArtworkResolutionError):
+        resolve_artwork_for_placement(
+            artwork,
+            placement,
+            template_key="canvas_basic",
+            allow_upscale=True,
+            upscale_method="lanczos",
+            skip_undersized=False,
+            auto_wallart_master=True,
+        )
+
+
+def test_wallart_auto_master_logs_action_context(tmp_path: Path, caplog):
+    path = tmp_path / "framed-small.png"
+    Image.new("RGBA", (3000, 3000), (255, 0, 0, 180)).save(path)
+    artwork = Artwork("framed-small", path, "Framed Small", "", [], 3000, 3000)
+    placement = PlacementRequirement("front", 4500, 5400, artwork_fit_mode="cover")
+    caplog.set_level(logging.INFO)
+
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        template_key="framed_poster_basic",
+        allow_upscale=True,
+        upscale_method="lanczos",
+        skip_undersized=False,
+        auto_wallart_master=True,
+    )
+
+    assert result.action == "derived_wallart_master_upscale"
+    assert "Wall-art derived master enabled" in caplog.text
+    assert "fallback_reason=insufficient_artwork_resolution_cover_mode" in caplog.text
+
+
 def test_resolve_artwork_for_blanket_cover_succeeds_when_source_is_large_enough(tmp_path: Path):
     path = tmp_path / "blanket-large.png"
     Image.new("RGBA", (8000, 6400), (255, 0, 0, 255)).save(path)
@@ -7926,6 +8015,15 @@ def test_parse_args_family_aware_flags(monkeypatch):
     assert args.art_family_mode == "split"
     assert args.art_generate_poster_master is True
     assert args.art_mug_tote_master == "square"
+
+
+def test_parse_args_auto_wallart_master_flag(monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    monkeypatch.setattr(sys, "argv", ["prog", "--allow-upscale", "--auto-wallart-master"])
+    args = pipeline.parse_args()
+    assert args.allow_upscale is True
+    assert args.auto_wallart_master is True
 
 
 def test_artwork_generation_target_planning_modes():
