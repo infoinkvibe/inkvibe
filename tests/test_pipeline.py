@@ -1493,9 +1493,11 @@ def test_free_shipping_profit_audit_profitability_floor_targets_for_cleanup_temp
             if blueprint_id == 49:  # sweatshirt_gildan + sweatshirt_gildan_alt
                 return [{"id": 201, "is_available": True, "options": {"color": "Black", "size": "L"}, "price": 2000, "cost": 1000, "shipping": 200}]
             if blueprint_id == 852:  # poster_basic
-                return [{"id": 301, "is_available": True, "options": {"size": "16″ x 20″ (Vertical)"}, "price": 2000, "cost": 1000, "shipping": 200}]
+                # Deliberately thin before guardrail repricing; should be brought up to policy floor.
+                return [{"id": 301, "is_available": True, "options": {"size": "16″ x 20″ (Vertical)"}, "price": 2000, "cost": 3500, "shipping": 700}]
             if blueprint_id == 906:  # sticker_kisscut
-                return [{"id": 401, "is_available": True, "options": {"size": '4" × 4"', "quantity": "100 pcs"}, "price": 200, "cost": 100, "shipping": 100}]
+                # Deliberately 100 minor units under policy before repricing (margin=300 at 12.99 list).
+                return [{"id": 401, "is_available": True, "options": {"size": '4" × 4"', "quantity": "100 pcs"}, "price": 200, "cost": 600, "shipping": 300}]
             if blueprint_id == 80:  # longsleeve_gildan
                 return [{"id": 501, "is_available": True, "options": {"color": "Black", "size": "L"}, "price": 2200, "cost": 1000, "shipping": 200}]
             return []
@@ -1520,6 +1522,11 @@ def test_free_shipping_profit_audit_profitability_floor_targets_for_cleanup_temp
         assert by_key[template_key]["active"] is True
         assert by_key[template_key]["meets_free_shipping_policy"] is True
         assert by_key[template_key]["lowest_profit_after_shipping_minor"] >= 400
+        assert by_key[template_key]["too_thin_for_free_shipping_policy"] is False
+
+    # Cleanup templates now must clear the policy floor under deterministic guardrails.
+    assert by_key["poster_basic"]["lowest_profit_after_shipping_minor"] == 400
+    assert by_key["sticker_kisscut"]["lowest_profit_after_shipping_minor"] == 400
 
 
 def test_tote_guardrails_report_economics_and_ceiling_failure_reason():
@@ -1657,6 +1664,26 @@ def test_sticker_template_uses_explicit_quantity_and_size_filters():
     assert sticker.enabled_variant_option_filters["size"] == ['3" × 3"', '4" × 4"']
     assert sticker.enabled_variant_option_filters["quantity"] == ["10 pcs", "50 pcs", "100 pcs"]
     assert sticker.max_enabled_variants == 6
+
+
+def test_cleanup_templates_have_profitability_floor_or_are_inactive():
+    templates = load_templates(Path("product_templates.json"))
+    by_key = {template.key: template for template in templates}
+
+    poster = by_key["poster_basic"]
+    sticker = by_key["sticker_kisscut"]
+    free_shipping_floor = "4.00"
+
+    if poster.active:
+        assert poster.min_margin_after_shipping == free_shipping_floor
+        assert poster.target_margin_after_shipping == free_shipping_floor
+        assert poster.reprice_variants_to_margin_floor is True
+        assert poster.disable_variants_below_margin_floor is True
+    if sticker.active:
+        assert sticker.min_margin_after_shipping == free_shipping_floor
+        assert sticker.target_margin_after_shipping == free_shipping_floor
+        assert sticker.enabled_variant_option_filters["size"] == ['3" × 3"', '4" × 4"']
+        assert sticker.enabled_variant_option_filters["quantity"] == ["10 pcs", "50 pcs", "100 pcs"]
 
 
 def test_sticker_variant_selection_is_deterministic_with_explicit_filters():
@@ -6120,6 +6147,8 @@ def test_phone_and_sticker_template_files_stay_in_sync_with_product_templates():
     assert sticker_primary.printify_blueprint_id == sticker_standalone.printify_blueprint_id == 906
     assert sticker_primary.printify_print_provider_id == sticker_standalone.printify_print_provider_id == 36
     assert sticker_primary.max_enabled_variants == sticker_standalone.max_enabled_variants == 6
+    assert sticker_primary.min_margin_after_shipping == sticker_standalone.min_margin_after_shipping == "4.00"
+    assert sticker_primary.target_margin_after_shipping == sticker_standalone.target_margin_after_shipping == "4.00"
     assert sticker_primary.enabled_variant_option_filters == sticker_standalone.enabled_variant_option_filters
 
 
