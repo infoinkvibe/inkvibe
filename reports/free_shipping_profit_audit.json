@@ -1,0 +1,42 @@
+[
+  {
+    "template_key": "sticker_kisscut",
+    "active": true,
+    "blueprint_id": 906,
+    "provider_id": 36,
+    "selected_count": 3,
+    "final_enabled_count": 3,
+    "option_names": "quantity|size",
+    "requested_option_filters": "{\"quantity\": [\"10 pcs\", \"50 pcs\", \"100 pcs\"], \"size\": [\"3\\\" × 3\\\"\", \"4\\\" × 4\\\"\"]}",
+    "lowest_profit_after_shipping_minor": 599,
+    "lowest_profit_variant_id": 1,
+    "min_profit_after_shipping_minor": 200,
+    "free_shipping_min_profit_minor": 550,
+    "meets_guardrail_floor": true,
+    "meets_free_shipping_policy": true,
+    "policy_gap_minor": 0,
+    "too_thin_for_free_shipping_policy": false,
+    "status": "ok",
+    "message": ""
+  },
+  {
+    "template_key": "longsleeve_gildan",
+    "active": true,
+    "blueprint_id": 80,
+    "provider_id": 30,
+    "selected_count": 2,
+    "final_enabled_count": 2,
+    "option_names": "color|size",
+    "requested_option_filters": "{\"color\": [\"Black\", \"Dark Heather\", \"Navy\", \"Sport Grey\", \"White\"], \"size\": [\"S\", \"M\", \"L\", \"XL\", \"2XL\", \"3XL\"]}",
+    "lowest_profit_after_shipping_minor": 500,
+    "lowest_profit_variant_id": 10,
+    "min_profit_after_shipping_minor": 300,
+    "free_shipping_min_profit_minor": 550,
+    "meets_guardrail_floor": true,
+    "meets_free_shipping_policy": false,
+    "policy_gap_minor": 50,
+    "too_thin_for_free_shipping_policy": true,
+    "status": "ok",
+    "message": ""
+  }
+]

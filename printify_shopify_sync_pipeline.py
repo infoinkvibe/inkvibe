@@ -3882,6 +3882,94 @@ def export_preflight_report(path: pathlib.Path, rows: List[TemplatePreflightRepo
     write_csv_report(path, [row.__dict__ for row in rows])
 
 
+def _min_profit_minor_for_template(template: ProductTemplate) -> int:
+    min_profit_config = template.min_profit_after_shipping if template.min_profit_after_shipping is not None else template.min_margin_after_shipping
+    return int((_decimal_from_value(min_profit_config, default="0") * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def run_free_shipping_profit_audit(
+    *,
+    printify: PrintifyClient,
+    templates: List[ProductTemplate],
+    free_shipping_min_profit_minor: int,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for template in templates:
+        if not template.active:
+            continue
+        try:
+            catalog_variants = printify.list_variants(template.printify_blueprint_id, template.printify_print_provider_id)
+        except Exception as exc:
+            rows.append(
+                {
+                    "template_key": template.key,
+                    "active": True,
+                    "blueprint_id": template.printify_blueprint_id,
+                    "provider_id": template.printify_print_provider_id,
+                    "selected_count": 0,
+                    "final_enabled_count": 0,
+                    "lowest_profit_after_shipping_minor": 0,
+                    "lowest_profit_variant_id": 0,
+                    "min_profit_after_shipping_minor": _min_profit_minor_for_template(template),
+                    "free_shipping_min_profit_minor": free_shipping_min_profit_minor,
+                    "meets_guardrail_floor": False,
+                    "meets_free_shipping_policy": False,
+                    "policy_gap_minor": free_shipping_min_profit_minor,
+                    "too_thin_for_free_shipping_policy": True,
+                    "status": "catalog_error",
+                    "message": str(exc),
+                }
+            )
+            continue
+
+        selected, diagnostics = choose_variants_from_catalog_with_diagnostics(catalog_variants, template)
+        guarded, margin_report = apply_variant_margin_guardrails(template, selected)
+        variant_diagnostics = margin_report.get("variant_diagnostics", [])
+        lowest = min(
+            variant_diagnostics,
+            key=lambda row: int(row.get("after_shipping_margin_after_reprice_minor", 0)),
+            default={},
+        )
+        lowest_profit_minor = int(lowest.get("after_shipping_margin_after_reprice_minor", 0))
+        template_guardrail_min_minor = int(lowest.get("min_margin_after_shipping_minor", _min_profit_minor_for_template(template)))
+        meets_guardrail_floor = bool(guarded) and lowest_profit_minor >= template_guardrail_min_minor
+        meets_policy = bool(guarded) and lowest_profit_minor >= free_shipping_min_profit_minor
+        rows.append(
+            {
+                "template_key": template.key,
+                "active": True,
+                "blueprint_id": template.printify_blueprint_id,
+                "provider_id": template.printify_print_provider_id,
+                "selected_count": len(selected),
+                "final_enabled_count": len(guarded),
+                "option_names": "|".join(diagnostics.option_names),
+                "requested_option_filters": json.dumps(diagnostics.requested_option_filters, ensure_ascii=False, sort_keys=True),
+                "lowest_profit_after_shipping_minor": lowest_profit_minor,
+                "lowest_profit_variant_id": int(lowest.get("variant_id", 0)),
+                "min_profit_after_shipping_minor": template_guardrail_min_minor,
+                "free_shipping_min_profit_minor": free_shipping_min_profit_minor,
+                "meets_guardrail_floor": meets_guardrail_floor,
+                "meets_free_shipping_policy": meets_policy,
+                "policy_gap_minor": max(0, free_shipping_min_profit_minor - lowest_profit_minor),
+                "too_thin_for_free_shipping_policy": bool(guarded) and not meets_policy,
+                "status": "ok" if guarded else "nonviable_after_guardrails",
+                "message": margin_report.get("skip_reason", ""),
+            }
+        )
+    return rows
+
+
+def export_free_shipping_profit_audit(
+    *,
+    csv_path: pathlib.Path,
+    json_path: pathlib.Path,
+    rows: List[Dict[str, Any]],
+) -> None:
+    write_csv_report(csv_path, rows)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(rows, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
 def _is_truthy_csv(value: str) -> bool:
     normalized = str(value or "").strip().lower()
     return normalized in {"1", "true", "yes", "y", "on"}
@@ -9420,6 +9508,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--export-failure-report", default="", help="Optional CSV export path for failed combinations")
     parser.add_argument("--export-run-report", default="", help="Optional CSV export path for all processed combinations")
     parser.add_argument("--export-preflight-report", default="", help="Optional CSV export path for template preflight report rows")
+    parser.add_argument("--run-free-shipping-profit-audit", action="store_true", help="Run a per-template free-shipping profitability audit and exit")
+    parser.add_argument("--free-shipping-profit-min", default="4.00", help="Minimum profit-after-shipping policy floor (USD) for free-shipping viability audit")
+    parser.add_argument("--free-shipping-profit-audit-csv", default="reports/free_shipping_profit_audit.csv", help="CSV path for free-shipping profitability audit output")
+    parser.add_argument("--free-shipping-profit-audit-json", default="reports/free_shipping_profit_audit.json", help="JSON path for free-shipping profitability audit output")
     parser.add_argument("--allow-preflight-failures", "--audit-all-templates", dest="allow_preflight_failures", action="store_true", help="Audit mode: continue run even when explicitly requested templates fail preflight")
     parser.add_argument("--preview-listing-copy", action="store_true", help="Render listing title/description/tags previews without creating/updating products")
     parser.add_argument("--generate-artwork-metadata", action="store_true", help="Generate reviewable artwork sidecar metadata from local image analysis")
@@ -9850,7 +9942,7 @@ def apply_high_volume_mode_defaults(
     }
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", auto_wallart_master: bool = False, skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", export_preflight_report_path: str = "", allow_preflight_failures: bool = False, preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, enable_ai_product_copy: Optional[bool] = None, ai_product_copy_model: str = "", generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "", max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS, interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS, catalog_cache_dir: str = CATALOG_CACHE_DIR_DEFAULT, catalog_cache_ttl_hours: int = CACHE_TTL_HOURS_DEFAULT, no_catalog_cache: bool = False, chunk_size: int = 0, pause_between_chunks_seconds: float = 0.0, catalog_request_spacing_ms: int = 0, template_spacing_ms: int = 0, artwork_spacing_ms: int = 0, resume_only_pending: bool = False, high_volume_mode: bool = False, publish_batch_size: int = 5, pause_between_publish_batches_seconds: float = 2.0, defer_publish: bool = False, resume_publish_only: bool = False, progress: Optional[bool] = None) -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", auto_wallart_master: bool = False, skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", export_preflight_report_path: str = "", run_free_shipping_profit_audit_only: bool = False, free_shipping_profit_min: str = "4.00", free_shipping_profit_audit_csv_path: str = "reports/free_shipping_profit_audit.csv", free_shipping_profit_audit_json_path: str = "reports/free_shipping_profit_audit.json", allow_preflight_failures: bool = False, preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, enable_ai_product_copy: Optional[bool] = None, ai_product_copy_model: str = "", generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "", max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS, interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS, catalog_cache_dir: str = CATALOG_CACHE_DIR_DEFAULT, catalog_cache_ttl_hours: int = CACHE_TTL_HOURS_DEFAULT, no_catalog_cache: bool = False, chunk_size: int = 0, pause_between_chunks_seconds: float = 0.0, catalog_request_spacing_ms: int = 0, template_spacing_ms: int = 0, artwork_spacing_ms: int = 0, resume_only_pending: bool = False, high_volume_mode: bool = False, publish_batch_size: int = 5, pause_between_publish_batches_seconds: float = 2.0, defer_publish: bool = False, resume_publish_only: bool = False, progress: Optional[bool] = None) -> None:
     max_retry_sleep_seconds = max(0.0, float(max_retry_sleep_seconds))
     interactive_retry_cap_seconds = max(0.0, float(interactive_retry_cap_seconds))
     if resume_only_pending:
@@ -10130,6 +10222,26 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             logger.warning("No runnable active templates after preflight validation; audit mode continuing with report-only completion.")
             return
         raise RuntimeError("No runnable active templates after preflight validation.")
+    if run_free_shipping_profit_audit_only:
+        free_shipping_min_minor = int((_decimal_from_value(free_shipping_profit_min, default="4.00") * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        audit_rows = run_free_shipping_profit_audit(
+            printify=printify,
+            templates=templates,
+            free_shipping_min_profit_minor=free_shipping_min_minor,
+        )
+        export_free_shipping_profit_audit(
+            csv_path=pathlib.Path(free_shipping_profit_audit_csv_path),
+            json_path=pathlib.Path(free_shipping_profit_audit_json_path),
+            rows=audit_rows,
+        )
+        logger.info(
+            "Free-shipping profitability audit exported csv=%s json=%s rows=%s policy_min_minor=%s",
+            free_shipping_profit_audit_csv_path,
+            free_shipping_profit_audit_json_path,
+            len(audit_rows),
+            free_shipping_min_minor,
+        )
+        return
 
     shop_id = resolve_shop_id(printify, PRINTIFY_SHOP_ID)
     shopify = ShopifyClient(SHOPIFY_ADMIN_TOKEN, dry_run=dry_run) if SHOPIFY_ADMIN_TOKEN else None
@@ -10642,6 +10754,10 @@ if __name__ == "__main__":
             export_failure_report=args.export_failure_report,
             export_run_report=args.export_run_report,
             export_preflight_report_path=args.export_preflight_report,
+            run_free_shipping_profit_audit_only=args.run_free_shipping_profit_audit,
+            free_shipping_profit_min=args.free_shipping_profit_min,
+            free_shipping_profit_audit_csv_path=args.free_shipping_profit_audit_csv,
+            free_shipping_profit_audit_json_path=args.free_shipping_profit_audit_json,
             allow_preflight_failures=args.allow_preflight_failures,
             preview_listing_copy_only=args.preview_listing_copy,
             generate_artwork_metadata=args.generate_artwork_metadata,
