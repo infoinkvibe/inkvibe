@@ -4810,6 +4810,59 @@ def test_preflight_travel_mug_selects_variants_with_15oz_capacity_filter():
     assert report_rows[0].selected_count == 1
 
 
+def test_preflight_accent_mug_filters_curated_variants_and_mockup_qa_stays_clean():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [{"id": 635, "title": "Accent Coffee Mug"}]
+
+        def list_print_providers(self, blueprint_id):
+            assert blueprint_id == 635
+            return [{"id": 39, "title": "SwiftPOD"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            assert (blueprint_id, provider_id) == (635, 39)
+            colors = ["Black", "Blue", "Light Blue", "Light Green", "Maroon", "Orange", "Pink", "Red", "Yellow", "White"]
+            sizes = ["11oz", "15oz"]
+            variants = []
+            variant_id = 1
+            for color in colors:
+                for size in sizes:
+                    variants.append(
+                        {
+                            "id": variant_id,
+                            "is_available": True,
+                            "cost": 1100 if size == "11oz" else 1300,
+                            "price": 1900 if size == "11oz" else 2100,
+                            "options": {"Color": color, "Size": size},
+                        }
+                    )
+                    variant_id += 1
+            return variants
+
+    template = next(t for t in load_templates(Path("product_templates.json")) if t.key == "accent_mug_basic")
+    passed, issues, report_rows = preflight_active_templates(printify=DummyPrintify(), templates=[template], explicit_template_keys=[])
+    assert issues == []
+    assert len(passed) == 1
+    row = report_rows[0]
+    assert row.classification == ""
+    assert row.selected_count == 18
+    assert row.final_enabled_count > 0
+    option_values = json.loads(row.option_values_summary)
+    assert option_values["Color"] == ["Black", "Blue", "Light Blue", "Light Green", "Maroon", "Orange", "Pink", "Red", "Yellow", "White"]
+    assert option_values["Size"] == ["11oz", "15oz"]
+    requested_filters = json.loads(row.requested_option_filters)
+    assert requested_filters["color"] == ["Black", "Blue", "Light Blue", "Light Green", "Maroon", "Orange", "Pink", "Red", "Yellow"]
+    assert requested_filters["size"] == ["11oz", "15oz"]
+
+    warnings, errors = validate_storefront_mockups(
+        template=template,
+        publish_payload={"title": True, "description": True, "images": True, "variants": True, "tags": True},
+        placement_context="front:mode=contain:scale=0.780:xy=(0.500,0.500)",
+    )
+    assert warnings == []
+    assert errors == []
+
+
 def test_preflight_tshirt_premium_soft_matches_provider_color_values():
     class DummyPrintify:
         def list_blueprints(self):
@@ -5811,6 +5864,51 @@ def test_mug_sample_template_points_to_real_pair_and_safe_cap():
     assert mug.printify_blueprint_id == 68
     assert mug.printify_print_provider_id == 1
     assert mug.max_enabled_variants is not None and mug.max_enabled_variants <= 24
+
+
+def test_accent_mug_template_rollout_is_active_and_uses_curated_sizes_colors():
+    templates = load_templates(Path("product_templates.json"))
+    by_key = {template.key: template for template in templates}
+    assert "accent_mug_basic" in by_key
+
+    accent = by_key["accent_mug_basic"]
+    assert accent.active is True
+    assert accent.printify_blueprint_id == 635
+    assert accent.printify_print_provider_id == 39
+    assert accent.pinned_blueprint_id == 635
+    assert accent.pinned_provider_id == 39
+    assert accent.product_type_label == "Accent Coffee Mug"
+    assert "Accent Coffee Mug" in accent.title_pattern
+    assert accent.enabled_sizes == ["11oz", "15oz"]
+    assert accent.enabled_variant_option_filters.get("size") == ["11oz", "15oz"]
+    assert accent.enabled_colors == [
+        "Black",
+        "Blue",
+        "Light Blue",
+        "Light Green",
+        "Maroon",
+        "Orange",
+        "Pink",
+        "Red",
+        "Yellow",
+    ]
+    assert accent.enabled_variant_option_filters.get("color") == accent.enabled_colors
+    assert accent.max_enabled_variants == 18
+    assert len(accent.placements) == 1
+    assert accent.placements[0].placement_name == "front"
+    assert accent.placements[0].artwork_fit_mode == "contain"
+    assert accent.placements[0].allow_upscale is False
+    assert accent.preferred_mockup_types == ["studio", "lifestyle"]
+    assert accent.preferred_mockup_position == "mug_front"
+    assert accent.preferred_default_variant_color == "Black"
+    assert accent.shopify_product_type == "Drinkware"
+
+    assert by_key["mug_new"].printify_blueprint_id == 68
+    assert by_key["mug_new"].printify_print_provider_id == 1
+    assert by_key["travel_mug_basic"].printify_blueprint_id == 70
+    assert by_key["travel_mug_basic"].printify_print_provider_id == 1
+    assert by_key["tumbler_20oz_basic"].printify_blueprint_id == 1927
+    assert by_key["tumbler_20oz_basic"].printify_print_provider_id == 410
 
 
 def test_tote_sample_template_uses_valid_live_resolved_mapping():
