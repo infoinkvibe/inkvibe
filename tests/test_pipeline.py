@@ -77,6 +77,8 @@ from printify_shopify_sync_pipeline import (
     sanitize_metadata_for_publish,
     persist_inline_metadata_sidecar,
     apply_variant_margin_guardrails,
+    run_free_shipping_profit_audit,
+    export_free_shipping_profit_audit,
     filename_title_quality_reason,
     resolve_artwork_title,
     discover_artworks,
@@ -1400,6 +1402,44 @@ def test_variant_margin_guardrails_reprice_disable_and_longsleeve_behavior():
     assert report_long["final_enabled_count"] == 0
 
 
+def test_free_shipping_profit_audit_flags_policy_thin_templates_and_exports(tmp_path: Path):
+    class AuditPrintify:
+        dry_run = True
+
+        def list_variants(self, blueprint_id, provider_id):
+            if blueprint_id == 906:
+                return [
+                    {"id": 1, "is_available": True, "options": {"size": '3" × 3"', "quantity": "10 pcs"}, "price": 100, "shipping": 200},
+                    {"id": 2, "is_available": True, "options": {"size": '4" × 4"', "quantity": "50 pcs"}, "price": 100, "shipping": 200},
+                    {"id": 3, "is_available": True, "options": {"size": '4" × 4"', "quantity": "100 pcs"}, "price": 100, "shipping": 200},
+                ]
+            return [
+                {"id": 10, "is_available": True, "options": {"color": "Black", "size": "M"}, "price": 2100, "shipping": 699},
+                {"id": 11, "is_available": True, "options": {"color": "White", "size": "L"}, "price": 2200, "shipping": 699},
+            ]
+
+    templates = load_templates(Path("product_templates.json"))
+    scoped = [template for template in templates if template.key in {"sticker_kisscut", "longsleeve_gildan"}]
+    rows = run_free_shipping_profit_audit(
+        printify=AuditPrintify(),
+        templates=scoped,
+        free_shipping_min_profit_minor=550,
+    )
+    by_key = {row["template_key"]: row for row in rows}
+    assert by_key["sticker_kisscut"]["meets_guardrail_floor"] is True
+    assert by_key["sticker_kisscut"]["meets_free_shipping_policy"] is True
+    assert by_key["longsleeve_gildan"]["meets_guardrail_floor"] is True
+    assert by_key["longsleeve_gildan"]["too_thin_for_free_shipping_policy"] is True
+
+    csv_path = tmp_path / "reports" / "free_shipping_profit_audit.csv"
+    json_path = tmp_path / "reports" / "free_shipping_profit_audit.json"
+    export_free_shipping_profit_audit(csv_path=csv_path, json_path=json_path, rows=rows)
+    assert csv_path.exists()
+    assert json_path.exists()
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert {row["template_key"] for row in payload} == {"sticker_kisscut", "longsleeve_gildan"}
+
+
 def test_tote_guardrails_report_economics_and_ceiling_failure_reason():
     tote = ProductTemplate(
         key="tote_basic",
@@ -1527,6 +1567,39 @@ def test_sticker_template_remains_without_expanded_colors():
     templates = load_templates(Path("product_templates.json"))
     sticker = next(template for template in templates if template.key == "sticker_kisscut")
     assert sticker.expanded_enabled_colors == []
+
+
+def test_sticker_template_uses_explicit_quantity_and_size_filters():
+    templates = load_templates(Path("product_templates.json"))
+    sticker = next(template for template in templates if template.key == "sticker_kisscut")
+    assert sticker.enabled_variant_option_filters["size"] == ['3" × 3"', '4" × 4"']
+    assert sticker.enabled_variant_option_filters["quantity"] == ["10 pcs", "50 pcs", "100 pcs"]
+    assert sticker.max_enabled_variants == 6
+
+
+def test_sticker_variant_selection_is_deterministic_with_explicit_filters():
+    template = ProductTemplate(
+        key="sticker_kisscut",
+        printify_blueprint_id=906,
+        printify_print_provider_id=36,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        enabled_variant_option_filters={"size": ['3" × 3"', '4" × 4"'], "quantity": ["10 pcs", "50 pcs", "100 pcs"]},
+        max_enabled_variants=6,
+    )
+    variants = [
+        {"id": 1, "is_available": True, "options": {"shape": "Die-Cut", "size": '3" × 3"', "quantity": "1 pc"}},
+        {"id": 2, "is_available": True, "options": {"shape": "Die-Cut", "size": '3" × 3"', "quantity": "10 pcs"}},
+        {"id": 3, "is_available": True, "options": {"shape": "Die-Cut", "size": '4" × 4"', "quantity": "10 pcs"}},
+        {"id": 4, "is_available": True, "options": {"shape": "Die-Cut", "size": '4" × 4"', "quantity": "50 pcs"}},
+        {"id": 5, "is_available": True, "options": {"shape": "Die-Cut", "size": '4" × 4"', "quantity": "100 pcs"}},
+        {"id": 6, "is_available": True, "options": {"shape": "Die-Cut", "size": '6" × 6"', "quantity": "100 pcs"}},
+        {"id": 7, "is_available": True, "options": {"shape": "Die-Cut", "size": '3" × 3"', "quantity": "50 pcs"}},
+    ]
+    chosen, _ = choose_variants_from_catalog_with_diagnostics(variants, template)
+    chosen_ids = {row["id"] for row in chosen}
+    assert chosen_ids == {2, 3, 4, 5, 7}
+    assert all(row["options"]["quantity"] in {"10 pcs", "50 pcs", "100 pcs"} for row in chosen)
 
 
 def test_storefront_display_color_rotation_is_template_scoped_to_apparel():
@@ -5964,7 +6037,8 @@ def test_phone_and_sticker_template_files_stay_in_sync_with_product_templates():
     assert phone_standalone.active is True
     assert sticker_primary.printify_blueprint_id == sticker_standalone.printify_blueprint_id == 906
     assert sticker_primary.printify_print_provider_id == sticker_standalone.printify_print_provider_id == 36
-    assert sticker_primary.max_enabled_variants == sticker_standalone.max_enabled_variants == 4
+    assert sticker_primary.max_enabled_variants == sticker_standalone.max_enabled_variants == 6
+    assert sticker_primary.enabled_variant_option_filters == sticker_standalone.enabled_variant_option_filters
 
 
 def test_unresolved_families_remain_inactive():
@@ -7754,6 +7828,31 @@ def test_family_collection_mapping_routes_active_families_correctly():
     assert actual["throw_pillow_basic"] == "throw-pillows"
 
 
+def test_active_taxonomy_product_type_strings_remain_consistent(tmp_path: Path):
+    templates = load_templates(Path("product_templates.json"))
+    by_key = {template.key: template for template in templates}
+    expected = {
+        "blanket_basic": "Blankets",
+        "canvas_basic": "Canvas Prints",
+        "framed_poster_basic": "Framed Posters",
+        "hoodie_gildan": "Hoodies",
+        "longsleeve_gildan": "Long Sleeve Shirts",
+        "mug_new": "Mugs",
+        "phone_case_basic": "Phone Cases",
+        "poster_basic": "Posters",
+        "sticker_kisscut": "Stickers",
+        "sweatshirt_gildan": "Sweatshirts",
+        "tshirt_gildan": "T-Shirts",
+        "tote_basic": "Tote Bags",
+        "travel_mug_basic": "Travel Mugs",
+        "tumbler_20oz_basic": "Tumblers",
+    }
+    for template_key, expected_type in expected.items():
+        template = by_key[template_key]
+        normalized = build_normalized_shopify_organization(template, _create_artwork(tmp_path, 1000, 1000))
+        assert normalized["recommended_product_type"] == expected_type
+
+
 def test_preferred_mockup_color_selection_prefers_non_white_when_available():
     template = ProductTemplate(
         key="tshirt_gildan",
@@ -8798,7 +8897,7 @@ def test_top10_template_keys_exist_and_curated():
     assert by_key["phone_case_basic"].max_enabled_variants <= 12
     assert by_key["sticker_kisscut"].printify_blueprint_id == 906
     assert by_key["sticker_kisscut"].printify_print_provider_id == 36
-    assert by_key["sticker_kisscut"].max_enabled_variants == 4
+    assert by_key["sticker_kisscut"].max_enabled_variants == 6
     assert by_key["poster_basic"].enabled_sizes == ["11″ x 14″ (Vertical)", "12″ x 16″ (Vertical)", "16″ x 20″ (Vertical)"]
 
 

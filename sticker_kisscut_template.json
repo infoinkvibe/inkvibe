@@ -9,7 +9,7 @@
   "description_pattern": "<p>{generated_description}</p>",
   "enabled_colors": [],
   "enabled_sizes": [],
-  "max_enabled_variants": 4,
+  "max_enabled_variants": 6,
   "tags": [
     "sticker",
     "kiss-cut"
@@ -33,12 +33,12 @@
   "publish_images": true,
   "publish_variants": true,
   "publish_tags": true,
-  "default_price": "5.99",
-  "base_price": "2.99",
+  "default_price": "8.99",
+  "base_price": "4.99",
   "markup_type": "fixed",
-  "markup_value": "3.00",
+  "markup_value": "4.00",
   "rounding_mode": "x_99",
-  "compare_at_price": "7.99",
+  "compare_at_price": "11.99",
   "placements": [
     {
       "placement_name": "front",
@@ -57,8 +57,13 @@
   "mark_template_nonviable_if_needed": true,
   "enabled_variant_option_filters": {
     "size": [
-      "3\" \u00d7 3\"",
-      "4\" \u00d7 4\""
+      "3\" × 3\"",
+      "4\" × 4\""
+    ],
+    "quantity": [
+      "10 pcs",
+      "50 pcs",
+      "100 pcs"
     ]
   }
 }

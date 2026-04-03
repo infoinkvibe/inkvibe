@@ -4,7 +4,7 @@
     "printify_blueprint_id": 80,
     "printify_print_provider_id": 30,
     "title_pattern": "{artwork_title} {product_type_label}",
-    "description_pattern": "<p>{artwork_title} on a comfortable {product_type_label}.</p><p>Best for casual everyday wear. Style notes: minimal, giftable.</p>",
+    "description_pattern": "<p>{artwork_title} printed on a comfortable {product_type_label} made for everyday layering.</p><p>Soft feel, casual warmth, and an easy giftable fit for daily wear.</p>",
     "enabled_colors": [
       "Black",
       "Dark Heather",
@@ -69,6 +69,8 @@
     "shipping_basis_for_margin": "cost",
     "disable_variants_below_margin_floor": true,
     "reprice_variants_to_margin_floor": true,
-    "mark_template_nonviable_if_needed": true
+    "mark_template_nonviable_if_needed": true,
+    "default_price": "31.99",
+    "compare_at_price": "37.99"
   }
 ]

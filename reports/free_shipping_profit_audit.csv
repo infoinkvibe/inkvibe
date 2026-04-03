@@ -1,0 +1,3 @@
+template_key,active,blueprint_id,provider_id,selected_count,final_enabled_count,option_names,requested_option_filters,lowest_profit_after_shipping_minor,lowest_profit_variant_id,min_profit_after_shipping_minor,free_shipping_min_profit_minor,meets_guardrail_floor,meets_free_shipping_policy,policy_gap_minor,too_thin_for_free_shipping_policy,status,message
+sticker_kisscut,True,906,36,3,3,quantity|size,"{""quantity"": [""10 pcs"", ""50 pcs"", ""100 pcs""], ""size"": [""3\"" × 3\"""", ""4\"" × 4\""""]}",599,1,200,550,True,True,0,False,ok,
+longsleeve_gildan,True,80,30,2,2,color|size,"{""color"": [""Black"", ""Dark Heather"", ""Navy"", ""Sport Grey"", ""White""], ""size"": [""S"", ""M"", ""L"", ""XL"", ""2XL"", ""3XL""]}",500,10,300,550,True,False,50,True,ok,
