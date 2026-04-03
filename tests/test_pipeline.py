@@ -4810,6 +4810,29 @@ def test_preflight_travel_mug_selects_variants_with_15oz_capacity_filter():
     assert report_rows[0].selected_count == 1
 
 
+def test_preflight_tshirt_premium_soft_matches_provider_color_values():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [{"id": 5, "title": "Premium Soft Tee"}]
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 99, "title": "Printify Choice"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [
+                {"id": 1, "is_available": True, "cost": 1400, "price": 2100, "options": {"Color": "Solid Black", "Size": "M"}},
+                {"id": 2, "is_available": True, "cost": 1400, "price": 2100, "options": {"Color": "Solid Midnight Navy", "Size": "L"}},
+                {"id": 3, "is_available": True, "cost": 1400, "price": 2100, "options": {"Color": "Heather Grey", "Size": "XL"}},
+            ]
+
+    template = next(t for t in load_templates(Path("product_templates.json")) if t.key == "tshirt_premium_soft")
+    passed, issues, report_rows = preflight_active_templates(printify=DummyPrintify(), templates=[template], explicit_template_keys=[])
+    assert issues == []
+    assert len(passed) == 1
+    assert report_rows[0].classification == ""
+    assert report_rows[0].selected_count == 3
+
+
 def test_validate_catalog_family_schema_rejects_wrong_family_for_canvas():
     template = ProductTemplate("canvas_basic", 13, 1, "{artwork_title}", "{artwork_title}", product_type_label="Canvas Print")
     variants = [{"id": 1, "is_available": True, "options": {"Device Model": "iPhone 15", "Finish": "Glossy"}}]
@@ -5077,6 +5100,17 @@ def test_preflight_travel_mug_keeps_valid_15oz_mapping_without_runtime_override(
     assert row.runtime_mapping_overrode_hint is False
     assert row.fallback_discovery_triggered is False
     assert row.fallback_discovery_reason == ""
+
+
+def test_longsleeve_template_reprices_to_keep_enabled_variants():
+    template = next(t for t in load_templates(Path("product_templates.json")) if t.key == "longsleeve_gildan")
+    adjusted, report = apply_variant_margin_guardrails(
+        template,
+        [{"id": 77, "price": 2499, "cost": 2499, "shipping": 700, "is_available": True}],
+    )
+    assert template.reprice_variants_to_margin_floor is True
+    assert report["final_enabled_count"] == 1
+    assert adjusted and adjusted[0]["price"] > 2499
 
 
 def test_canvas_size_normalization_matches_provider_quotes_and_orientation_labels():
@@ -5845,7 +5879,7 @@ def test_unresolved_families_remain_inactive():
     assert by_key["framed_poster_basic"].active is True
     assert by_key["tumbler_20oz_basic"].active is True
     assert by_key["travel_mug_basic"].active is True
-    assert by_key["mug_15oz_ceramic"].active is True
+    assert by_key["mug_15oz_ceramic"].active is False
 
 
 def test_tote_front_primary_and_publish_only_primary_behavior_preserved():
@@ -5962,7 +5996,7 @@ def test_next_wave_templates_define_provider_blueprint_and_variant_guards():
     assert mug_15oz.printify_print_provider_id == 1
     assert mug_15oz.pinned_blueprint_id == 68
     assert mug_15oz.pinned_provider_id == 1
-    assert mug_15oz.enabled_variant_option_filters.get("size") == ["15oz"]
+    assert mug_15oz.enabled_variant_option_filters.get("size") == ["11oz"]
     assert mug_15oz.max_enabled_variants == 1
     assert mug_15oz.disable_variants_below_margin_floor is True
     assert mug_15oz.shopify_product_type == "Drinkware"
@@ -8545,7 +8579,10 @@ def test_premium_soft_tee_template_rollout_is_active_and_conservative():
     assert premium.printify_print_provider_id == 99
     assert premium.product_type_label == "Premium Soft T-Shirt"
     assert premium.max_enabled_variants <= base_tee.max_enabled_variants
-    assert set(premium.enabled_colors).issubset(set(base_tee.enabled_colors + base_tee.expanded_enabled_colors))
+    assert premium.enabled_colors == ["Solid Black", "Solid White", "Solid Midnight Navy", "Heather Grey"]
+    assert premium.expanded_enabled_colors == ["Heather Dark Grey"]
+    assert premium.preferred_default_variant_color == "Solid Black"
+    assert "Solid Black" in premium.preferred_mockup_colors
     assert set(premium.enabled_sizes).issubset(set(base_tee.enabled_sizes))
 
     assert len(premium.placements) == 1
@@ -8698,7 +8735,7 @@ def test_template_audience_regression_for_mug_canvas_and_framed_poster():
     by_key = {template.key: template for template in templates}
 
     assert by_key["mug_new"].audience == "coffee drinkers and office gift shoppers"
-    assert by_key["mug_15oz_ceramic"].audience == "coffee and tea drinkers seeking a larger daily mug"
+    assert by_key["mug_15oz_ceramic"].audience == "coffee and tea drinkers seeking a daily ceramic mug"
     assert by_key["canvas_basic"].audience == "gallery wall decor shoppers and gift buyers"
     assert by_key["framed_poster_basic"].audience == "framed wall art shoppers and gift buyers"
 
@@ -8708,9 +8745,10 @@ def test_mug_15oz_template_uses_conservative_single_size_single_front_rollout():
     by_key = {template.key: template for template in templates}
     mug = by_key["mug_15oz_ceramic"]
 
-    assert mug.product_type_label == "15oz Mug"
-    assert mug.enabled_sizes == ["15oz"]
-    assert mug.enabled_variant_option_filters == {"color": [], "size": ["15oz"]}
+    assert mug.active is False
+    assert mug.product_type_label == "11oz Mug"
+    assert mug.enabled_sizes == ["11oz"]
+    assert mug.enabled_variant_option_filters == {"color": [], "size": ["11oz"]}
     assert mug.max_enabled_variants == 1
     assert len(mug.placements) == 1
     assert mug.placements[0].placement_name == "front"
