@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -44,6 +44,7 @@ from artwork_metadata_generator import (
     write_artwork_sidecar,
 )
 from artwork_generation import (
+    BLANKET_FAMILY,
     ArtworkGenerationRequest,
     GeneratedArtworkAsset,
     TemplateAssetRouting,
@@ -5528,32 +5529,61 @@ def _build_prompt_derived_masters(
     request: ArtworkGenerationRequest,
 ) -> List[GeneratedArtworkAsset]:
     derived_assets: List[GeneratedArtworkAsset] = []
+    blanket_safe_margin_ratio = 0.08
     for asset in assets:
         with Image.open(asset.path) as opened:
             source = ImageOps.exif_transpose(opened).convert("RGBA")
             src_w, src_h = source.size
             family = asset.family or "single"
             target_w, target_h = family_targets.get(family, (0, 0))
-            requested_scale = max(
-                (target_w / src_w) if src_w > 0 and target_w > 0 else 1.0,
-                (target_h / src_h) if src_h > 0 and target_h > 0 else 1.0,
-            )
-            upscale_cap = WALLART_AUTO_MASTER_MAX_UPSCALE_FACTOR if family in {"poster", "single"} else 2.0
-            applied_scale = min(max(1.0, requested_scale), upscale_cap)
-            resized_w = max(1, int(round(src_w * applied_scale)))
-            resized_h = max(1, int(round(src_h * applied_scale)))
-            if resized_w == src_w and resized_h == src_h:
-                derived_image = source.copy()
-                upscaled = False
+            composition_mode = "cover_fill_upscale"
+            if family == BLANKET_FAMILY and target_w > 0 and target_h > 0:
+                composition_mode = "contain_padded_blanket_safe"
+                canvas_w = max(1, int(target_w))
+                canvas_h = max(1, int(target_h))
+                safe_w = max(1, int(round(canvas_w * (1.0 - blanket_safe_margin_ratio * 2.0))))
+                safe_h = max(1, int(round(canvas_h * (1.0 - blanket_safe_margin_ratio * 2.0))))
+                requested_scale = min(
+                    (safe_w / src_w) if src_w > 0 else 1.0,
+                    (safe_h / src_h) if src_h > 0 else 1.0,
+                )
+                upscale_cap = 2.0
+                applied_scale = min(max(1.0, requested_scale), upscale_cap)
+                resized_w = max(1, int(round(src_w * applied_scale)))
+                resized_h = max(1, int(round(src_h * applied_scale)))
+                if resized_w == src_w and resized_h == src_h:
+                    resized = source.copy()
+                    upscaled = False
+                else:
+                    resized = source.resize((resized_w, resized_h), _upscale_filter("lanczos"))
+                    upscaled = True
+                derived_image = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+                offset_x = max(0, (canvas_w - resized_w) // 2)
+                offset_y = max(0, (canvas_h - resized_h) // 2)
+                derived_image.alpha_composite(resized, (offset_x, offset_y))
+                resized.close()
             else:
-                derived_image = source.resize((resized_w, resized_h), _upscale_filter("lanczos"))
-                upscaled = True
+                requested_scale = max(
+                    (target_w / src_w) if src_w > 0 and target_w > 0 else 1.0,
+                    (target_h / src_h) if src_h > 0 and target_h > 0 else 1.0,
+                )
+                upscale_cap = WALLART_AUTO_MASTER_MAX_UPSCALE_FACTOR if family in {"poster", "single"} else 2.0
+                applied_scale = min(max(1.0, requested_scale), upscale_cap)
+                resized_w = max(1, int(round(src_w * applied_scale)))
+                resized_h = max(1, int(round(src_h * applied_scale)))
+                if resized_w == src_w and resized_h == src_h:
+                    derived_image = source.copy()
+                    upscaled = False
+                else:
+                    derived_image = source.resize((resized_w, resized_h), _upscale_filter("lanczos"))
+                    upscaled = True
 
         derived_suffix = "derived"
         if family and family != "single":
             derived_suffix = f"{family}-derived"
         derived_path = asset.path.with_name(f"{asset.path.stem}-{derived_suffix}.png")
         derived_path.parent.mkdir(parents=True, exist_ok=True)
+        derived_w, derived_h = derived_image.size
         derived_image.save(derived_path)
         derived_image.close()
         source.close()
@@ -5566,20 +5596,33 @@ def _build_prompt_derived_masters(
             src_w,
             src_h,
             derived_path,
-            resized_w,
-            resized_h,
+            derived_w,
+            derived_h,
             str(upscaled).lower(),
             requested_scale,
             applied_scale,
             target_w,
             target_h,
         )
+        if family == BLANKET_FAMILY:
+            logger.info(
+                "Prompt blanket-safe composition family=%s concept=%s mode=%s padding_applied=%s margin_ratio=%.3f source=%sx%s derived=%sx%s",
+                family,
+                asset.concept_index,
+                composition_mode,
+                "true",
+                blanket_safe_margin_ratio,
+                src_w,
+                src_h,
+                derived_w,
+                derived_h,
+            )
         derived_assets.append(
             replace(
                 asset,
                 path=derived_path,
-                width=resized_w,
-                height=resized_h,
+                width=derived_w,
+                height=derived_h,
             )
         )
     return derived_assets
@@ -5591,6 +5634,7 @@ def run_prompt_artwork_generation(
     templates: List[ProductTemplate],
 ) -> PromptArtworkGenerationResult:
     template_keys = [template.key for template in templates]
+    logger.info("Prompt-art active templates loaded count=%s templates=%s", len(template_keys), ",".join(template_keys) or "-")
     if request.family_aware:
         plan = plan_family_artwork_targets(
             template_keys=template_keys,
@@ -5614,6 +5658,8 @@ def run_prompt_artwork_generation(
         )
     for reason in plan.rationale:
         logger.info("Artwork generation plan: %s", reason)
+    if plan.template_family_map:
+        logger.info("Prompt-art family classification map=%s", json.dumps(plan.template_family_map, sort_keys=True))
     for target in plan.targets:
         logger.info("Artwork generation target family=%s mode=%s openai_size=%s", target.family, target.mode, target.openai_size)
 
@@ -5670,12 +5716,24 @@ def run_prompt_artwork_generation(
         logger.info("Family routing planned mappings=%s", len(routing))
         for row in routing:
             logger.info(
-                "Template routing template=%s family=%s concept=%s asset=%s",
+                "Template routing template=%s family=%s concept=%s asset=%s asset_family=%s strategy=%s reason=%s",
                 row.template_key,
                 row.family,
                 row.concept_index,
                 row.asset_path.name,
+                row.asset_family or "-",
+                row.routing_strategy,
+                row.routing_reason,
             )
+    if request.family_aware:
+        covered_template_keys = {row.template_key for row in routing}
+        for key in template_keys:
+            if key not in covered_template_keys:
+                logger.warning(
+                    "Prompt-art template excluded from routing template=%s reason=no_generated_asset_for_family family=%s",
+                    key,
+                    plan.template_family_map.get(key) or "unknown",
+                )
     return PromptArtworkGenerationResult(generated_paths=kept_paths, template_routing=routing)
 
 
@@ -10205,6 +10263,11 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
     generated_paths: Optional[List[pathlib.Path]] = None
     generated_template_routing: List[TemplateAssetRouting] = []
     if generate_artwork_from_prompt:
+        logger.info(
+            "Prompt-art templates selected for processing count=%s templates=%s",
+            len(templates),
+            ",".join(template.key for template in templates) or "-",
+        )
         if not art_prompt.strip():
             raise RuntimeError("--art-prompt is required when --generate-artwork-from-prompt is set")
         output_dir = pathlib.Path(art_output_dir) if art_output_dir else image_dir
@@ -10369,6 +10432,12 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         templates=templates,
         explicit_template_keys=template_keys,
     )
+    if generate_artwork_from_prompt:
+        logger.info(
+            "Prompt-art templates remaining after preflight count=%s templates=%s",
+            len(templates),
+            ",".join(template.key for template in templates) or "-",
+        )
     preflight_report_path = pathlib.Path(export_preflight_report_path) if export_preflight_report_path else None
     if allow_preflight_failures and preflight_report_path is None:
         preflight_report_path = export_dir / "preflight_report.csv"
@@ -10684,16 +10753,77 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             artwork_by_resolved = {str(artwork.src_path.resolve()): artwork for artwork in artworks}
             artwork_by_name = {artwork.src_path.name: artwork for artwork in artworks}
             template_by_key = {template.key: template for template in templates}
+            logged_route_skips: Set[Tuple[str, int, str]] = set()
             for route in generated_template_routing:
                 if batch_size > 0 and combinations_processed >= batch_size:
                     stop_requested = True
                     break
                 template = template_by_key.get(route.template_key)
                 if template is None:
+                    skip_key = (route.template_key, int(route.concept_index), route.asset_path.name)
+                    if skip_key not in logged_route_skips:
+                        logged_route_skips.add(skip_key)
+                        logger.warning(
+                            "Prompt-art route excluded template=%s concept=%s asset=%s reason=template_not_runnable_after_preflight",
+                            route.template_key,
+                            route.concept_index,
+                            route.asset_path.name,
+                        )
+                        run_rows.append(
+                            RunReportRow(
+                                timestamp=datetime.now(timezone.utc).isoformat(),
+                                artwork_filename=route.asset_path.name,
+                                artwork_slug=slugify(route.asset_path.stem),
+                                template_key=route.template_key,
+                                status="skipped",
+                                action="prompt_art_route_skip",
+                                blueprint_id=0,
+                                provider_id=0,
+                                upload_strategy=upload_strategy,
+                                product_id="",
+                                publish_attempted=False,
+                                publish_verified=False,
+                                rendered_title="",
+                                reason_code="template_not_runnable_after_preflight",
+                                routed_asset_family=route.asset_family or route.family,
+                                routed_asset_mode=route.routing_strategy,
+                                template_family=route.family,
+                            )
+                        )
                     continue
                 resolved_key = str(route.asset_path.resolve())
                 artwork = artwork_by_resolved.get(resolved_key) or artwork_by_name.get(route.asset_path.name)
                 if artwork is None:
+                    skip_key = (route.template_key, int(route.concept_index), route.asset_path.name)
+                    if skip_key not in logged_route_skips:
+                        logged_route_skips.add(skip_key)
+                        logger.warning(
+                            "Prompt-art route excluded template=%s concept=%s asset=%s reason=routed_asset_not_discovered",
+                            route.template_key,
+                            route.concept_index,
+                            route.asset_path.name,
+                        )
+                        run_rows.append(
+                            RunReportRow(
+                                timestamp=datetime.now(timezone.utc).isoformat(),
+                                artwork_filename=route.asset_path.name,
+                                artwork_slug=slugify(route.asset_path.stem),
+                                template_key=route.template_key,
+                                status="skipped",
+                                action="prompt_art_route_skip",
+                                blueprint_id=template.printify_blueprint_id if template else 0,
+                                provider_id=template.printify_print_provider_id if template else 0,
+                                upload_strategy=upload_strategy,
+                                product_id="",
+                                publish_attempted=False,
+                                publish_verified=False,
+                                rendered_title="",
+                                reason_code="routed_asset_not_discovered",
+                                routed_asset_family=route.asset_family or route.family,
+                                routed_asset_mode=route.routing_strategy,
+                                template_family=route.family,
+                            )
+                        )
                     continue
                 if resume and is_state_key_successful(state, f"{artwork.slug}:{template.key}"):
                     continue
@@ -10726,8 +10856,8 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                     summary=summary,
                     failure_rows=failure_rows,
                     run_rows=run_rows,
-                    routed_asset_family=route.family,
-                    routed_asset_mode="family-aware",
+                    routed_asset_family=route.asset_family or route.family,
+                    routed_asset_mode=route.routing_strategy or "family-aware",
                     progress=progress_tracker,
                 )
                 if summary.failures > before_failures:
