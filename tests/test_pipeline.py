@@ -1989,6 +1989,23 @@ def test_theme_audience_and_season_normalization_defaults_safely(tmp_path: Path)
     assert org["normalized_season_keys"] == ["evergreen"]
 
 
+def test_audience_normalization_does_not_match_case_inside_showcasing(tmp_path: Path):
+    art = _create_artwork(tmp_path, 1200, 1200)
+    art.metadata = {
+        "theme": "Gallery centerpiece",
+        "audience": "wall decor lovers",
+        "description": "Poster copy showcasing vivid room mood and framed-wall ambiance.",
+        "tags": ["showcasing wall art", "gallery decor"],
+    }
+    template = _template_for_variant_tests()
+    template.key = "poster_basic"
+    template.product_type_label = "Poster"
+    template.shopify_product_type = "Posters"
+    org = build_normalized_shopify_organization(template, art)
+    assert "phone-accessory-shoppers" not in org["normalized_audience_keys"]
+    assert "audience-phone-accessory-shoppers" not in org["recommended_smart_collection_tags"]
+
+
 @pytest.mark.parametrize(
     ("template_key", "product_type_label", "shopify_type", "expected_suffix"),
     [
@@ -4602,6 +4619,34 @@ def test_storefront_qa_export_populates_copy_cache_reason(tmp_path: Path):
     exported = json.loads(json_path.read_text(encoding="utf-8"))
     assert exported[0]["copy_provenance"] == "ai_product_copy_cache"
     assert exported[0]["ai_product_copy_cache_reason"] == "cache_hit"
+
+
+def test_storefront_qa_poster_scoped_tags_do_not_inherit_apparel(tmp_path: Path):
+    art = _qa_artwork(
+        tmp_path,
+        metadata={
+            "title": "Sierra Dawn",
+            "description": "A scenic poster showcasing layered mountain light.",
+            "theme": "mountain landscape",
+            "audience": "home decor shoppers",
+            "tags": ["wall art", "mountain decor"],
+            "seo_keywords": ["poster wall decor", "gallery wall mood"],
+        },
+    )
+    template = _qa_template()
+    template.key = "poster_basic"
+    template.product_type_label = "Poster"
+    template.shopify_product_type = "Apparel"  # Covers default/fallback template behavior.
+    row = build_storefront_qa_row(
+        artwork=art,
+        template=template,
+        variant_rows=[{"id": 1, "is_available": True, "options": {"size": "12x16"}, "price": 2200}],
+    )
+    assert "apparel" not in row.tags_preview
+    assert "audience-phone-accessory-shoppers" not in row.recommended_smart_collection_tags
+    assert "family-poster" in row.recommended_smart_collection_tags
+    assert "dept-wall-art" in row.recommended_smart_collection_tags
+    assert row.normalized_audience_keys == "home-decor-shoppers"
 
 
 def test_run_batch_size_and_resume_and_reporting(tmp_path: Path, monkeypatch):

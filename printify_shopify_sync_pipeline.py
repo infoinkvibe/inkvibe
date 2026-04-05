@@ -1008,7 +1008,7 @@ AUDIENCE_NORMALIZATION_PATTERNS: Dict[str, Tuple[str, ...]] = {
     "giftable": ("gift", "giftable"),
     "home-decor-shoppers": ("decor", "home decor", "interior"),
     "coffee-lovers": ("coffee", "tea", "mug"),
-    "phone-accessory-shoppers": ("phone", "case", "mobile accessory"),
+    "phone-accessory-shoppers": ("phone", "phone case", "phone cases", "mobile accessory"),
     "sticker-lovers": ("sticker", "decal"),
 }
 
@@ -1213,9 +1213,10 @@ def _normalize_taxonomy_keys(values: List[Any], allowlist: Dict[str, Tuple[str, 
     haystack = " ".join(normalize_theme_tag(value) for value in values if normalize_theme_tag(value))
     if not haystack:
         return []
+    padded_haystack = f" {haystack} "
     normalized: List[str] = []
     for key, patterns in allowlist.items():
-        if any(pattern in haystack for pattern in patterns):
+        if any(re.search(rf"\b{re.escape(str(pattern).strip())}\b", padded_haystack) for pattern in patterns if str(pattern).strip()):
             normalized.append(key)
     return normalized
 
@@ -3268,7 +3269,9 @@ def _render_listing_tags(template: ProductTemplate, artwork: Artwork) -> List[st
             return merged
     family = content_engine.infer_product_family(template)
     family_label = str(context.get("family_label", "")).strip().lower()
-    family_bucket = [family_label, template.product_type_label, template.shopify_product_type, *content_engine.family_tags(template)]
+    shopify_type = (template.shopify_product_type or "").strip()
+    shopify_type_tag = "" if shopify_type.lower() in {"apparel", "product", "accessories", "merchandise"} else shopify_type
+    family_bucket = [family_label, template.product_type_label, shopify_type_tag, *content_engine.family_tags(template)]
     subject_bucket = [
         metadata.get("title"),
         context.get("artwork_title"),
