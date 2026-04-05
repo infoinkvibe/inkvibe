@@ -121,6 +121,19 @@ python printify_shopify_sync_pipeline.py \
   --export-run-report ./exports/run_report_local3.csv
 ```
 
+Safer prompt-art run with timeout retries + family-aware masters:
+
+```bash
+python printify_shopify_sync_pipeline.py \
+  --generate-artwork-from-prompt \
+  --art-prompt "your concept here" \
+  --art-family-aware \
+  --art-family-mode split \
+  --art-openai-timeout-seconds 180 \
+  --art-openai-max-retries 4 \
+  --art-openai-retry-backoff-seconds 2
+```
+
 Current supported template families include:
 - `hoodie_gildan`
 - `longsleeve_gildan`

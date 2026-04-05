@@ -5,6 +5,7 @@ import logging
 import os
 import pathlib
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -14,6 +15,16 @@ except Exception:  # pragma: no cover
     load_dotenv = None
 
 try:
+    import openai as openai_module
+except Exception:  # pragma: no cover
+    openai_module = None  # type: ignore[assignment]
+
+try:
+    import httpx
+except Exception:  # pragma: no cover
+    httpx = None  # type: ignore[assignment]
+
+try:
     from openai import OpenAI
 except Exception:  # pragma: no cover
     OpenAI = None  # type: ignore[assignment]
@@ -21,6 +32,7 @@ except Exception:  # pragma: no cover
 logger = logging.getLogger("inkvibeauto")
 
 PREVIEW_NAME_PATTERN = re.compile(r"(removebg-preview|preview|thumbnail)", re.IGNORECASE)
+SUPPORTED_OPENAI_IMAGE_SIZES = {"1024x1024", "1024x1536", "1536x1024", "auto"}
 
 
 @dataclass
@@ -48,6 +60,13 @@ class ArtworkGenerationRequest:
     mug_tote_master: str = "apparel"
     apparel_style: str = ""
     poster_style: str = ""
+    openai_timeout_seconds: float = 180.0
+    openai_max_retries: int = 4
+    openai_retry_backoff_seconds: float = 2.0
+    openai_size: str = ""
+    openai_portrait_size: str = "1024x1536"
+    openai_square_size: str = "1024x1024"
+    openai_landscape_size: str = "1536x1024"
 
 
 @dataclass
@@ -119,6 +138,32 @@ def classify_template_family(template_key: str, *, mug_tote_master: str = "appar
     return APPAREL_FAMILY
 
 
+def validate_openai_image_size(size: str) -> str:
+    normalized = (size or "").strip().lower()
+    if normalized not in SUPPORTED_OPENAI_IMAGE_SIZES:
+        supported = ", ".join(sorted(SUPPORTED_OPENAI_IMAGE_SIZES))
+        raise ValueError(f"Unsupported OpenAI image size '{size}'. Supported values: {supported}")
+    return normalized
+
+
+def resolve_openai_size_by_mode(
+    *,
+    openai_size: str = "",
+    portrait_size: str = "1024x1536",
+    square_size: str = "1024x1024",
+    landscape_size: str = "1536x1024",
+) -> Dict[str, str]:
+    global_override = (openai_size or "").strip().lower()
+    if global_override:
+        validated = validate_openai_image_size(global_override)
+        return {"portrait": validated, "square": validated, "landscape": validated}
+    return {
+        "portrait": validate_openai_image_size(portrait_size),
+        "square": validate_openai_image_size(square_size),
+        "landscape": validate_openai_image_size(landscape_size),
+    }
+
+
 def plan_family_artwork_targets(
     *,
     template_keys: Sequence[str],
@@ -126,6 +171,10 @@ def plan_family_artwork_targets(
     generate_poster_master: bool = False,
     generate_apparel_master: bool = False,
     mug_tote_master: str = "apparel",
+    openai_size: str = "",
+    openai_portrait_size: str = "1024x1536",
+    openai_square_size: str = "1024x1024",
+    openai_landscape_size: str = "1536x1024",
 ) -> ArtworkGenerationPlan:
     normalized_mode = (family_mode or "auto").strip().lower()
     template_family_map = {
@@ -162,7 +211,12 @@ def plan_family_artwork_targets(
         required_families.append(POSTER_FAMILY)
         rationale.append("Forced poster master via CLI override.")
 
-    size_by_mode = {"portrait": "1024x1536", "square": "1024x1024"}
+    size_by_mode = resolve_openai_size_by_mode(
+        openai_size=openai_size,
+        portrait_size=openai_portrait_size,
+        square_size=openai_square_size,
+        landscape_size=openai_landscape_size,
+    )
     mode_by_family = {
         APPAREL_FAMILY: "portrait",
         POSTER_FAMILY: "portrait",
@@ -219,12 +273,22 @@ def choose_generation_aspect_modes(*, template_keys: Sequence[str], target_mode:
     return ["portrait"]
 
 
-def plan_generated_artwork_targets(*, template_keys: Sequence[str], target_mode: str = "auto") -> ArtworkGenerationPlan:
+def plan_generated_artwork_targets(
+    *,
+    template_keys: Sequence[str],
+    target_mode: str = "auto",
+    openai_size: str = "",
+    openai_portrait_size: str = "1024x1536",
+    openai_square_size: str = "1024x1024",
+    openai_landscape_size: str = "1536x1024",
+) -> ArtworkGenerationPlan:
     modes = choose_generation_aspect_modes(template_keys=template_keys, target_mode=target_mode)
-    size_by_mode = {
-        "portrait": "1024x1536",
-        "square": "1024x1024",
-    }
+    size_by_mode = resolve_openai_size_by_mode(
+        openai_size=openai_size,
+        portrait_size=openai_portrait_size,
+        square_size=openai_square_size,
+        landscape_size=openai_landscape_size,
+    )
     rationale: List[str] = []
     if len(modes) > 1:
         rationale.append("Mixed template families detected; generating portrait and square source masters.")
@@ -285,6 +349,22 @@ def _openai_image_client(*, api_key: str = "", timeout_seconds: float = 45.0, cl
     return OpenAI(api_key=resolved_key, timeout=timeout_seconds)
 
 
+def _is_retryable_openai_error(exc: Exception) -> bool:
+    retryable_types: List[type] = []
+    if openai_module is not None:
+        for name in ("APITimeoutError", "APIConnectionError"):
+            typ = getattr(openai_module, name, None)
+            if isinstance(typ, type):
+                retryable_types.append(typ)
+    if httpx is not None:
+        for name in ("ReadTimeout", "ConnectTimeout", "TimeoutException", "NetworkError"):
+            typ = getattr(httpx, name, None)
+            if isinstance(typ, type):
+                retryable_types.append(typ)
+    retryable_types.extend([TimeoutError, ConnectionError])
+    return any(isinstance(exc, typ) for typ in retryable_types)
+
+
 def generate_artwork_with_openai(
     *,
     request: ArtworkGenerationRequest,
@@ -295,7 +375,7 @@ def generate_artwork_with_openai(
         raise RuntimeError(f"Unsupported art generator: {request.generator}")
 
     resolved_model = (request.openai_model or os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")).strip()
-    image_client = _openai_image_client(client=client)
+    image_client = _openai_image_client(client=client, timeout_seconds=float(request.openai_timeout_seconds))
     assets: List[GeneratedArtworkAsset] = []
     request.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -311,13 +391,47 @@ def generate_artwork_with_openai(
                 )
                 continue
             prompt = build_generation_prompt(request, mode=target.mode, family=target.family)
-            response = image_client.images.generate(
-                model=resolved_model,
-                prompt=prompt,
-                size=target.openai_size,
-                quality=request.quality,
-                background=request.background,
-            )
+            max_retries = max(0, int(request.openai_max_retries))
+            total_attempts = 1 + max_retries
+            response: Any = None
+            last_error: Optional[Exception] = None
+            for attempt in range(1, total_attempts + 1):
+                try:
+                    response = image_client.images.generate(
+                        model=resolved_model,
+                        prompt=prompt,
+                        size=target.openai_size,
+                        quality=request.quality,
+                        background=request.background,
+                    )
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if not _is_retryable_openai_error(exc) or attempt >= total_attempts:
+                        break
+                    sleep_seconds = max(0.0, float(request.openai_retry_backoff_seconds)) * (2 ** (attempt - 1))
+                    logger.warning(
+                        "OpenAI image generation retry attempt=%s/%s model=%s family=%s mode=%s size=%s concept=%s exception=%s backoff_seconds=%.2f",
+                        attempt + 1,
+                        total_attempts,
+                        resolved_model,
+                        target.family,
+                        target.mode,
+                        target.openai_size,
+                        concept_index,
+                        type(exc).__name__,
+                        sleep_seconds,
+                    )
+                    if sleep_seconds > 0:
+                        time.sleep(sleep_seconds)
+            if last_error is not None:
+                raise RuntimeError(
+                    "OpenAI image generation failed after retries "
+                    f"(family={target.family}, mode={target.mode}, requested_size={target.openai_size}, "
+                    f"model={resolved_model}, concept_index={concept_index}, "
+                    f"exception={type(last_error).__name__}: {last_error})"
+                ) from None
             data = getattr(response, "data", []) or []
             if not data:
                 raise RuntimeError("OpenAI image generation returned no images")
