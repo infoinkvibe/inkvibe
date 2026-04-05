@@ -47,6 +47,7 @@ from artwork_generation import (
     APPAREL_FAMILY,
     BLANKET_FAMILY,
     POSTER_FAMILY,
+    SQUARE_FAMILY,
     ArtworkGenerationRequest,
     GeneratedArtworkAsset,
     TemplateAssetRouting,
@@ -558,6 +559,7 @@ class ProductTemplate:
     storefront_display_color_priority: List[str] = field(default_factory=list)
     storefront_display_color_rotation_seed: Optional[str] = None
     storefront_default_color_candidates: List[str] = field(default_factory=list)
+    artwork_routing_family: Optional[str] = None
 
 
 @dataclass
@@ -5595,6 +5597,21 @@ def run_artwork_metadata_generation(
     )
 
 
+def _template_routing_family(
+    template: ProductTemplate,
+    *,
+    template_family_map: Dict[str, str],
+    mug_tote_master: str,
+) -> str:
+    explicit_family = str(template.artwork_routing_family or "").strip().lower()
+    if explicit_family:
+        return explicit_family
+    return template_family_map.get(template.key) or classify_template_family(
+        template.key,
+        mug_tote_master=mug_tote_master,
+    )
+
+
 def _collect_prompt_family_target_minimums(
     *,
     templates: List[ProductTemplate],
@@ -5605,7 +5622,11 @@ def _collect_prompt_family_target_minimums(
     target_by_family: Dict[str, Tuple[int, int]] = {}
     for template in templates:
         if family_aware:
-            family = template_family_map.get(template.key) or classify_template_family(template.key, mug_tote_master=mug_tote_master)
+            family = _template_routing_family(
+                template,
+                template_family_map=template_family_map,
+                mug_tote_master=mug_tote_master,
+            )
         else:
             family = "single"
         placement_width = max([int(p.width_px) for p in template.placements] or [0])
@@ -5635,7 +5656,11 @@ def _resolve_split_routing_family_map(
         if key in forced_poster_templates:
             resolved[key] = POSTER_FAMILY
             continue
-        template_family = resolved.get(key) or classify_template_family(key, mug_tote_master=mug_tote_master)
+        template_family = _template_routing_family(
+            template,
+            template_family_map=resolved,
+            mug_tote_master=mug_tote_master,
+        )
         min_cover_ratio = float(template.min_effective_cover_ratio or 0.0)
         requires_high_res_cover = bool(template.high_resolution_family) or min_cover_ratio >= 1.0
         if requires_high_res_cover and template_family in {APPAREL_FAMILY, BLANKET_FAMILY, POSTER_FAMILY}:
@@ -5825,6 +5850,11 @@ def run_prompt_artwork_generation(
     templates: List[ProductTemplate],
 ) -> PromptArtworkGenerationResult:
     template_keys = [template.key for template in templates]
+    strict_family_templates = {
+        template.key
+        for template in templates
+        if str(template.artwork_routing_family or "").strip()
+    }
     logger.info("Prompt-art active templates loaded count=%s templates=%s", len(template_keys), ",".join(template_keys) or "-")
     if request.family_aware:
         plan = plan_family_artwork_targets(
@@ -5849,6 +5879,16 @@ def run_prompt_artwork_generation(
         )
     for reason in plan.rationale:
         logger.info("Artwork generation plan: %s", reason)
+    explicit_family_overrides = {
+        template.key: str(template.artwork_routing_family or "").strip().lower()
+        for template in templates
+        if str(template.artwork_routing_family or "").strip()
+    }
+    if explicit_family_overrides:
+        merged_map = dict(plan.template_family_map or {})
+        merged_map.update(explicit_family_overrides)
+        plan.template_family_map = merged_map
+        logger.info("Prompt-art explicit routing family overrides=%s", json.dumps(explicit_family_overrides, sort_keys=True))
     if plan.template_family_map:
         logger.info("Prompt-art family classification map=%s", json.dumps(plan.template_family_map, sort_keys=True))
     routing_family_map = _resolve_split_routing_family_map(
@@ -5912,7 +5952,22 @@ def run_prompt_artwork_generation(
             assets=preferred_assets,
             template_family_map=routing_family_map,
             mug_tote_master=request.mug_tote_master,
+            strict_family_templates=sorted(strict_family_templates),
         )
+        if strict_family_templates:
+            concepts = sorted({int(asset.concept_index) for asset in preferred_assets}) or [1]
+            routed_pairs = {(row.template_key, int(row.concept_index)) for row in routing}
+            missing_pairs = [
+                f"{template_key}@c{concept_index:02d}"
+                for template_key in sorted(strict_family_templates)
+                for concept_index in concepts
+                if (template_key, concept_index) not in routed_pairs
+            ]
+            if missing_pairs:
+                raise RuntimeError(
+                    "Prompt-art strict family routing missing required family master for templates: "
+                    + ", ".join(missing_pairs)
+                )
         blanket_templates = {
             template.key: template
             for template in templates
@@ -7017,6 +7072,12 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
     option_filters = row.get("enabled_variant_option_filters")
     if option_filters is not None and not isinstance(option_filters, dict):
         raise TemplateValidationError(f"Template[{index}] enabled_variant_option_filters must be an object")
+    if row.get("artwork_routing_family") is not None:
+        routing_family = str(row.get("artwork_routing_family", "")).strip().lower()
+        if routing_family not in {APPAREL_FAMILY, POSTER_FAMILY, BLANKET_FAMILY, SQUARE_FAMILY, "single"}:
+            raise TemplateValidationError(
+                f"Template[{index}] artwork_routing_family must be one of {[APPAREL_FAMILY, POSTER_FAMILY, BLANKET_FAMILY, SQUARE_FAMILY, 'single']}"
+            )
 
 
 def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
@@ -7119,6 +7180,7 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
                 storefront_display_color_priority=[str(v) for v in row.get("storefront_display_color_priority", [])],
                 storefront_display_color_rotation_seed=str(row.get("storefront_display_color_rotation_seed", "")).strip() or None,
                 storefront_default_color_candidates=[str(v) for v in row.get("storefront_default_color_candidates", [])],
+                artwork_routing_family=str(row.get("artwork_routing_family", "")).strip().lower() or None,
                 placements=[PlacementRequirement(**p) for p in row.get("placements", [])],
             )
         )

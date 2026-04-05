@@ -230,6 +230,28 @@ def test_template_validation_rejects_missing_fields(tmp_path: Path):
         load_templates(config)
 
 
+def test_template_validation_rejects_unknown_artwork_routing_family(tmp_path: Path):
+    config = tmp_path / "product_templates.json"
+    config.write_text(
+        json.dumps(
+            [
+                {
+                    "key": "poster_custom",
+                    "printify_blueprint_id": 852,
+                    "printify_print_provider_id": 73,
+                    "title_pattern": "{artwork_title}",
+                    "description_pattern": "{description_html}",
+                    "artwork_routing_family": "unknown_family",
+                    "placements": [{"placement_name": "front", "width_px": 4500, "height_px": 5400}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(TemplateValidationError, match="artwork_routing_family"):
+        load_templates(config)
+
+
 def test_active_templates_include_default_tags_for_targeted_families():
     templates = json.loads(Path("product_templates.json").read_text(encoding="utf-8"))
     required_keys = {
@@ -4144,6 +4166,37 @@ def test_process_publish_queue_resume_only_without_recreate():
     assert stats["processed"] == 1
     assert state["publish_queue"][0]["publish_status"] == "completed"
     assert state["publish_queue"][0]["publish_attempts"] == 1
+
+
+def test_process_publish_queue_marks_missing_template_as_failed():
+    state = ensure_state_shape(
+        {
+            "publish_queue": [
+                {
+                    "template_key": "missing_template",
+                    "publish_status": "pending",
+                    "shop_id": 123,
+                    "product_id": "prod-1",
+                }
+            ]
+        }
+    )
+
+    class DummyPrintify:
+        def publish_product(self, *_args, **_kwargs):
+            raise AssertionError("publish_product should not run when template lookup fails")
+
+    stats = process_publish_queue(
+        printify=DummyPrintify(),
+        state=state,
+        templates_by_key={},
+        publish_batch_size=5,
+        pause_between_publish_batches_seconds=0.0,
+    )
+
+    assert stats["failed"] == 1
+    assert state["publish_queue"][0]["publish_status"] == "failed"
+    assert state["publish_queue"][0]["last_error"] == "template_not_found_for_publish_resume"
 
 
 def test_summarize_publish_queue_counts_completed_history_as_not_pending():
@@ -8849,6 +8902,17 @@ def test_family_template_routing_maps_templates_to_family_assets(tmp_path: Path)
     assert by_template["poster_basic"].asset_path == poster_asset.path
 
 
+def test_family_template_routing_strict_contract_disables_fallback(tmp_path: Path):
+    apparel_asset = GeneratedArtworkAsset(path=tmp_path / "x-apparel-c01.png", mode="portrait", concept_index=1, family=APPAREL_FAMILY)
+    routing = route_templates_to_generated_assets(
+        template_keys=["poster_basic"],
+        assets=[apparel_asset],
+        template_family_map={"poster_basic": POSTER_FAMILY},
+        strict_family_templates=["poster_basic"],
+    )
+    assert routing == []
+
+
 def test_openai_generation_client_can_be_mocked(tmp_path: Path):
     payload = base64.b64encode(b"pngbytes").decode("ascii")
 
@@ -9053,6 +9117,47 @@ def test_prompt_family_routing_falls_back_when_poster_master_unavailable():
     assert by_template["poster_basic"].routing_reason == "fallback_to_apparel_master"
     assert by_template["poster_basic"].asset_family == APPAREL_FAMILY
     assert by_template["framed_poster_basic"].routing_strategy == "fallback"
+
+
+def test_prompt_generation_fails_fast_for_strict_family_contract_when_family_master_missing(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    template = ProductTemplate(
+        key="poster_basic",
+        printify_blueprint_id=852,
+        printify_print_provider_id=73,
+        title_pattern="{artwork_title}",
+        description_pattern="{description_html}",
+        artwork_routing_family=POSTER_FAMILY,
+        placements=[PlacementRequirement("front", 4500, 5400)],
+    )
+    generated = GeneratedArtworkAsset(
+        path=tmp_path / "prompt-apparel-c01.png",
+        mode="portrait",
+        concept_index=1,
+        width=1200,
+        height=1800,
+        family=APPAREL_FAMILY,
+    )
+    generated.path.write_bytes(b"fake")
+
+    monkeypatch.setattr(pipeline, "generate_artwork_with_openai", lambda request, plan: [generated])
+    monkeypatch.setattr(pipeline, "choose_preferred_generated_asset", lambda assets: assets)
+    monkeypatch.setattr(pipeline, "_build_prompt_derived_masters", lambda assets, family_targets, request: assets)
+
+    class _FakeImage:
+        size = (1200, 1800)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(pipeline, "Image", types.SimpleNamespace(open=lambda _path: _FakeImage()))
+    request = ArtworkGenerationRequest(prompt="poster", family_aware=True)
+    with pytest.raises(RuntimeError, match="strict family routing missing required family master"):
+        pipeline.run_prompt_artwork_generation(request=request, templates=[template])
 
 
 def test_split_family_routing_maps_high_resolution_templates_to_poster_family():
@@ -9869,6 +9974,7 @@ def test_template_metadata_defaults_are_populated_for_poster_and_tote():
     assert poster.audience == "home decor and art gift shoppers"
     assert poster.seo_keywords == ["wall art poster", "vertical art print", "giftable wall decor"]
     assert poster.tags == ["poster", "wall art", "giftable decor"]
+    assert poster.artwork_routing_family == POSTER_FAMILY
 
     tote = by_key["tote_basic"]
     assert tote.audience == "everyday carry and gift shoppers"
