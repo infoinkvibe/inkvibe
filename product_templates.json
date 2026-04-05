@@ -913,9 +913,9 @@
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],
     "enabled_sizes": [
-      "11″ x 14″ (Vertical)",
-      "12″ x 16″ (Vertical)",
-      "16″ x 20″ (Vertical)"
+      "11\u2033 x 14\u2033 (Vertical)",
+      "12\u2033 x 16\u2033 (Vertical)",
+      "16\u2033 x 20\u2033 (Vertical)"
     ],
     "placements": [
       {
@@ -969,7 +969,8 @@
     "shipping_basis_for_margin": "cost",
     "disable_variants_below_margin_floor": true,
     "reprice_variants_to_margin_floor": true,
-    "mark_template_nonviable_if_needed": true
+    "mark_template_nonviable_if_needed": true,
+    "artwork_routing_family": "poster"
   },
   {
     "key": "tote_basic",
@@ -1130,7 +1131,8 @@
       "wall-art",
       "front"
     ],
-    "preferred_featured_image_strategy": "mockup_type_then_variant_color"
+    "preferred_featured_image_strategy": "mockup_type_then_variant_color",
+    "artwork_routing_family": "poster"
   },
   {
     "key": "phone_case_basic",
@@ -1268,8 +1270,8 @@
     "mark_template_nonviable_if_needed": true,
     "enabled_variant_option_filters": {
       "size": [
-        "3\" × 3\"",
-        "4\" × 4\""
+        "3\" \u00d7 3\"",
+        "4\" \u00d7 4\""
       ],
       "quantity": [
         "10 pcs",
@@ -1296,8 +1298,8 @@
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],
     "enabled_sizes": [
-      "50\" × 60\"",
-      "60\" × 80\""
+      "50\" \u00d7 60\"",
+      "60\" \u00d7 80\""
     ],
     "max_enabled_variants": 6,
     "tags": [
@@ -1348,7 +1350,8 @@
     "shipping_basis_for_margin": "cost",
     "disable_variants_below_margin_floor": true,
     "reprice_variants_to_margin_floor": true,
-    "mark_template_nonviable_if_needed": true
+    "mark_template_nonviable_if_needed": true,
+    "artwork_routing_family": "blanket"
   },
   {
     "key": "throw_pillow_basic",
@@ -1367,7 +1370,7 @@
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],
     "enabled_sizes": [
-      "18\" × 18\""
+      "18\" \u00d7 18\""
     ],
     "max_enabled_variants": 4,
     "tags": [
@@ -1512,7 +1515,7 @@
     "description_pattern": "<p>{generated_description}</p>",
     "enabled_colors": [],
     "enabled_sizes": [
-      "11″ x 14″ (Vertical)"
+      "11\u2033 x 14\u2033 (Vertical)"
     ],
     "max_enabled_variants": 6,
     "placements": [
@@ -1583,7 +1586,8 @@
     "disable_variants_below_margin_floor": true,
     "reprice_variants_to_margin_floor": true,
     "mark_template_nonviable_if_needed": true,
-    "active": true
+    "active": true,
+    "artwork_routing_family": "poster"
   },
   {
     "key": "tumbler_20oz_basic",

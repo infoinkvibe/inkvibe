@@ -481,11 +481,13 @@ def route_templates_to_generated_assets(
     assets: Sequence[GeneratedArtworkAsset],
     template_family_map: Optional[Dict[str, str]] = None,
     mug_tote_master: str = "apparel",
+    strict_family_templates: Optional[Sequence[str]] = None,
 ) -> List[TemplateAssetRouting]:
     by_family_concept: Dict[tuple[str, int], GeneratedArtworkAsset] = {}
     for asset in assets:
         by_family_concept[(asset.family or "single", int(asset.concept_index))] = asset
     routing: List[TemplateAssetRouting] = []
+    strict_templates = {str(key) for key in (strict_family_templates or []) if str(key).strip()}
     concepts = sorted({int(asset.concept_index) for asset in assets}) or [1]
     for concept_index in concepts:
         for template_key in template_keys:
@@ -496,12 +498,13 @@ def route_templates_to_generated_assets(
             candidate = by_family_concept.get((family, concept_index))
             strategy = "exact"
             reason = "exact_family_match"
-            if candidate is None:
+            strict_family_required = template_key in strict_templates
+            if candidate is None and not strict_family_required:
                 candidate = by_family_concept.get((APPAREL_FAMILY, concept_index))
                 if candidate is not None:
                     strategy = "fallback"
                     reason = "fallback_to_apparel_master"
-            if candidate is None:
+            if candidate is None and not strict_family_required:
                 candidate = by_family_concept.get(("single", concept_index))
                 if candidate is not None:
                     strategy = "fallback"
