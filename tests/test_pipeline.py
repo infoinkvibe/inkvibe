@@ -8749,6 +8749,8 @@ def test_prompt_family_routing_includes_poster_canvas_framed_and_blanket(tmp_pat
             printify_print_provider_id=3,
             title_pattern="{title}",
             description_pattern="{description_html}",
+            high_resolution_family=True,
+            min_effective_cover_ratio=1.0,
             placements=[PlacementRequirement("front", 4500, 5400)],
         ),
         ProductTemplate(
@@ -8757,13 +8759,14 @@ def test_prompt_family_routing_includes_poster_canvas_framed_and_blanket(tmp_pat
             printify_print_provider_id=4,
             title_pattern="{title}",
             description_pattern="{description_html}",
+            high_resolution_family=True,
+            min_effective_cover_ratio=1.0,
             placements=[PlacementRequirement("front", 6000, 4800)],
         ),
     ]
     generated = [
         GeneratedArtworkAsset(path=tmp_path / "prompt-apparel-c01.png", mode="portrait", concept_index=1, width=1200, height=1800, family=APPAREL_FAMILY),
         GeneratedArtworkAsset(path=tmp_path / "prompt-poster-c01.png", mode="portrait", concept_index=1, width=1200, height=1800, family=POSTER_FAMILY),
-        GeneratedArtworkAsset(path=tmp_path / "prompt-blanket-c01.png", mode="landscape", concept_index=1, width=1536, height=1024, family=BLANKET_FAMILY),
     ]
     for row in generated:
         Image.new("RGBA", (row.width, row.height), (255, 0, 0, 255)).save(row.path)
@@ -8776,8 +8779,9 @@ def test_prompt_family_routing_includes_poster_canvas_framed_and_blanket(tmp_pat
     assert set(by_template.keys()) == {"poster_basic", "framed_poster_basic", "canvas_basic", "blanket_basic"}
     assert by_template["poster_basic"].asset_family == POSTER_FAMILY
     assert by_template["framed_poster_basic"].asset_family == POSTER_FAMILY
-    assert by_template["blanket_basic"].asset_family == BLANKET_FAMILY
-    assert by_template["canvas_basic"].asset_family in {APPAREL_FAMILY, POSTER_FAMILY}
+    assert by_template["canvas_basic"].asset_family == POSTER_FAMILY
+    assert by_template["blanket_basic"].asset_family == POSTER_FAMILY
+    assert by_template["blanket_basic"].asset_path.name.endswith("blanket-safe-derived.png")
 
 
 def test_prompt_family_routing_falls_back_when_poster_master_unavailable():
@@ -8794,6 +8798,75 @@ def test_prompt_family_routing_falls_back_when_poster_master_unavailable():
     assert by_template["framed_poster_basic"].routing_strategy == "fallback"
 
 
+def test_split_family_routing_maps_high_resolution_templates_to_poster_family():
+    import printify_shopify_sync_pipeline as pipeline
+
+    templates = [
+        ProductTemplate(
+            key="canvas_basic",
+            printify_blueprint_id=1,
+            printify_print_provider_id=1,
+            title_pattern="{title}",
+            description_pattern="{description_html}",
+            high_resolution_family=True,
+            min_effective_cover_ratio=1.0,
+        ),
+        ProductTemplate(
+            key="blanket_basic",
+            printify_blueprint_id=2,
+            printify_print_provider_id=2,
+            title_pattern="{title}",
+            description_pattern="{description_html}",
+            high_resolution_family=True,
+            min_effective_cover_ratio=1.0,
+        ),
+        ProductTemplate(
+            key="poster_basic",
+            printify_blueprint_id=3,
+            printify_print_provider_id=3,
+            title_pattern="{title}",
+            description_pattern="{description_html}",
+            high_resolution_family=True,
+            min_effective_cover_ratio=1.0,
+        ),
+        ProductTemplate(
+            key="framed_poster_basic",
+            printify_blueprint_id=4,
+            printify_print_provider_id=4,
+            title_pattern="{title}",
+            description_pattern="{description_html}",
+            high_resolution_family=True,
+            min_effective_cover_ratio=1.0,
+        ),
+        ProductTemplate(
+            key="hoodie_gildan",
+            printify_blueprint_id=5,
+            printify_print_provider_id=5,
+            title_pattern="{title}",
+            description_pattern="{description_html}",
+        ),
+    ]
+    base_map = {
+        "canvas_basic": APPAREL_FAMILY,
+        "blanket_basic": BLANKET_FAMILY,
+        "poster_basic": POSTER_FAMILY,
+        "framed_poster_basic": POSTER_FAMILY,
+        "hoodie_gildan": APPAREL_FAMILY,
+    }
+    resolved = pipeline._resolve_split_routing_family_map(
+        templates=templates,
+        base_family_map=base_map,
+        family_aware=True,
+        family_mode="split",
+        mug_tote_master="apparel",
+    )
+    assert resolved["canvas_basic"] == POSTER_FAMILY
+    assert resolved["blanket_basic"] == POSTER_FAMILY
+    assert resolved["poster_basic"] == POSTER_FAMILY
+    assert resolved["framed_poster_basic"] == POSTER_FAMILY
+    assert resolved["hoodie_gildan"] == APPAREL_FAMILY
+
+
 def test_prompt_blanket_derivation_uses_blanket_safe_composition(tmp_path: Path, monkeypatch):
     import printify_shopify_sync_pipeline as pipeline
 
@@ -8803,19 +8876,51 @@ def test_prompt_blanket_derivation_uses_blanket_safe_composition(tmp_path: Path,
         printify_print_provider_id=4,
         title_pattern="{title}",
         description_pattern="{description_html}",
+        high_resolution_family=True,
+        min_effective_cover_ratio=1.0,
         placements=[PlacementRequirement("front", 6000, 4800)],
     )
-    source = GeneratedArtworkAsset(path=tmp_path / "prompt-blanket-c01.png", mode="landscape", concept_index=1, width=1536, height=1024, family=BLANKET_FAMILY)
-    Image.new("RGBA", (1536, 1024), (255, 0, 0, 255)).save(source.path)
+    source = GeneratedArtworkAsset(path=tmp_path / "prompt-poster-c01.png", mode="portrait", concept_index=1, width=1024, height=1536, family=POSTER_FAMILY)
+    Image.new("RGBA", (1024, 1536), (255, 0, 0, 255)).save(source.path)
     monkeypatch.setattr(pipeline, "generate_artwork_with_openai", lambda **kwargs: [source])
 
-    request = ArtworkGenerationRequest(prompt="forest", output_dir=tmp_path, base_name="prompt", family_aware=True, family_mode="auto")
+    request = ArtworkGenerationRequest(prompt="forest", output_dir=tmp_path, base_name="prompt", family_aware=True, family_mode="split")
     result = pipeline.run_prompt_artwork_generation(request=request, templates=[blanket])
-    assert len(result.generated_paths) == 1
-    derived = result.generated_paths[0]
+    routing = {row.template_key: row for row in result.template_routing}
+    derived = routing["blanket_basic"].asset_path
+    assert derived.name.endswith("blanket-safe-derived.png")
     with Image.open(derived) as im:
         assert im.size == (6000, 4800)
         assert im.getpixel((10, 10))[3] == 0
+
+
+def test_split_family_routing_keeps_apparel_on_apparel_master(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    hoodie = ProductTemplate(key="hoodie_gildan", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{title}", description_pattern="{description_html}")
+    canvas = ProductTemplate(
+        key="canvas_basic",
+        printify_blueprint_id=2,
+        printify_print_provider_id=2,
+        title_pattern="{title}",
+        description_pattern="{description_html}",
+        high_resolution_family=True,
+        min_effective_cover_ratio=1.0,
+        placements=[PlacementRequirement("front", 4500, 5400)],
+    )
+    generated = [
+        GeneratedArtworkAsset(path=tmp_path / "prompt-apparel-c01.png", mode="portrait", concept_index=1, width=1200, height=1800, family=APPAREL_FAMILY),
+        GeneratedArtworkAsset(path=tmp_path / "prompt-poster-c01.png", mode="portrait", concept_index=1, width=1200, height=1800, family=POSTER_FAMILY),
+    ]
+    for row in generated:
+        Image.new("RGBA", (row.width, row.height), (255, 0, 0, 255)).save(row.path)
+    monkeypatch.setattr(pipeline, "generate_artwork_with_openai", lambda **kwargs: generated)
+
+    request = ArtworkGenerationRequest(prompt="forest", output_dir=tmp_path, base_name="prompt", family_aware=True, family_mode="split")
+    result = pipeline.run_prompt_artwork_generation(request=request, templates=[hoodie, canvas])
+    by_template = {row.template_key: row for row in result.template_routing}
+    assert by_template["hoodie_gildan"].asset_family == APPAREL_FAMILY
+    assert by_template["canvas_basic"].asset_family == POSTER_FAMILY
 
 
 def test_non_family_aware_prompt_mode_still_returns_generated_paths(tmp_path: Path, monkeypatch):
@@ -8968,6 +9073,9 @@ def test_family_routing_exports_skip_rows_for_templates_removed_after_preflight(
     by_template = {row["template_key"]: row for row in rows}
     assert by_template["poster_basic"]["status"] == "skipped"
     assert by_template["poster_basic"]["reason_code"] == "template_not_runnable_after_preflight"
+    assert by_template["poster_basic"]["eligibility_reason_code"] == "template_not_runnable_after_preflight"
+    assert by_template["poster_basic"]["eligibility_gate_stage"] == "routing_gate"
+    assert by_template["poster_basic"]["routed_asset_family"] == POSTER_FAMILY
     assert by_template["framed_poster_basic"]["status"] == "skipped"
 
 

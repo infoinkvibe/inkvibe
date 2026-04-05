@@ -44,7 +44,9 @@ from artwork_metadata_generator import (
     write_artwork_sidecar,
 )
 from artwork_generation import (
+    APPAREL_FAMILY,
     BLANKET_FAMILY,
+    POSTER_FAMILY,
     ArtworkGenerationRequest,
     GeneratedArtworkAsset,
     TemplateAssetRouting,
@@ -5522,6 +5524,97 @@ def _collect_prompt_family_target_minimums(
     return target_by_family
 
 
+def _resolve_split_routing_family_map(
+    *,
+    templates: List[ProductTemplate],
+    base_family_map: Dict[str, str],
+    family_aware: bool,
+    family_mode: str,
+    mug_tote_master: str,
+) -> Dict[str, str]:
+    resolved = dict(base_family_map or {})
+    if not family_aware or (family_mode or "").strip().lower() != "split":
+        return resolved
+    for template in templates:
+        key = template.key
+        template_family = resolved.get(key) or classify_template_family(key, mug_tote_master=mug_tote_master)
+        min_cover_ratio = float(template.min_effective_cover_ratio or 0.0)
+        requires_high_res_cover = bool(template.high_resolution_family) or min_cover_ratio >= 1.0
+        if requires_high_res_cover and template_family in {APPAREL_FAMILY, BLANKET_FAMILY, POSTER_FAMILY}:
+            resolved[key] = POSTER_FAMILY
+    return resolved
+
+
+def _build_blanket_safe_derived_asset(
+    *,
+    asset: GeneratedArtworkAsset,
+    target_width: int,
+    target_height: int,
+) -> Tuple[GeneratedArtworkAsset, str]:
+    blanket_safe_margin_ratio = 0.08
+    with Image.open(asset.path) as opened:
+        source = ImageOps.exif_transpose(opened).convert("RGBA")
+        src_w, src_h = source.size
+        target_w = max(1, int(target_width))
+        target_h = max(1, int(target_height))
+        target_ratio = target_w / target_h
+        source_ratio = (src_w / src_h) if src_h > 0 else target_ratio
+        ratio_delta = abs(source_ratio - target_ratio) / target_ratio if target_ratio > 0 else 0.0
+        if ratio_delta <= 0.08:
+            composition_mode = "subject_safe_cover_crop"
+            scale = max(target_w / src_w, target_h / src_h) if src_w > 0 and src_h > 0 else 1.0
+            resized_w = max(1, int(round(src_w * scale)))
+            resized_h = max(1, int(round(src_h * scale)))
+            resized = source.resize((resized_w, resized_h), _upscale_filter("lanczos"))
+            left = max(0, (resized_w - target_w) // 2)
+            top = max(0, (resized_h - target_h) // 2)
+            derived_image = resized.crop((left, top, left + target_w, top + target_h))
+            resized.close()
+        else:
+            composition_mode = "subject_safe_contain_padded"
+            safe_w = max(1, int(round(target_w * (1.0 - blanket_safe_margin_ratio * 2.0))))
+            safe_h = max(1, int(round(target_h * (1.0 - blanket_safe_margin_ratio * 2.0))))
+            requested_scale = min(
+                (safe_w / src_w) if src_w > 0 else 1.0,
+                (safe_h / src_h) if src_h > 0 else 1.0,
+            )
+            applied_scale = min(max(0.01, requested_scale), 2.0)
+            resized_w = max(1, int(round(src_w * applied_scale)))
+            resized_h = max(1, int(round(src_h * applied_scale)))
+            resized = source.resize((resized_w, resized_h), _upscale_filter("lanczos"))
+            derived_image = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+            offset_x = max(0, (target_w - resized_w) // 2)
+            offset_y = max(0, (target_h - resized_h) // 2)
+            derived_image.alpha_composite(resized, (offset_x, offset_y))
+            resized.close()
+    derived_path = asset.path.with_name(f"{asset.path.stem}-blanket-safe-derived.png")
+    derived_path.parent.mkdir(parents=True, exist_ok=True)
+    derived_w, derived_h = derived_image.size
+    derived_image.save(derived_path)
+    derived_image.close()
+    source.close()
+    logger.info(
+        "Prompt blanket-safe derived asset family=%s concept=%s source=%sx%s target=%sx%s mode=%s path=%s",
+        asset.family or "single",
+        asset.concept_index,
+        src_w,
+        src_h,
+        target_w,
+        target_h,
+        composition_mode,
+        derived_path,
+    )
+    return (
+        replace(
+            asset,
+            path=derived_path,
+            width=derived_w,
+            height=derived_h,
+        ),
+        composition_mode,
+    )
+
+
 def _build_prompt_derived_masters(
     *,
     assets: List[GeneratedArtworkAsset],
@@ -5548,7 +5641,7 @@ def _build_prompt_derived_masters(
                     (safe_h / src_h) if src_h > 0 else 1.0,
                 )
                 upscale_cap = 2.0
-                applied_scale = min(max(1.0, requested_scale), upscale_cap)
+                applied_scale = min(max(0.01, requested_scale), upscale_cap)
                 resized_w = max(1, int(round(src_w * applied_scale)))
                 resized_h = max(1, int(round(src_h * applied_scale)))
                 if resized_w == src_w and resized_h == src_h:
@@ -5660,6 +5753,15 @@ def run_prompt_artwork_generation(
         logger.info("Artwork generation plan: %s", reason)
     if plan.template_family_map:
         logger.info("Prompt-art family classification map=%s", json.dumps(plan.template_family_map, sort_keys=True))
+    routing_family_map = _resolve_split_routing_family_map(
+        templates=templates,
+        base_family_map=plan.template_family_map,
+        family_aware=plan.family_aware,
+        family_mode=request.family_mode,
+        mug_tote_master=request.mug_tote_master,
+    )
+    if routing_family_map and routing_family_map != plan.template_family_map:
+        logger.info("Prompt-art split routing family override map=%s", json.dumps(routing_family_map, sort_keys=True))
     for target in plan.targets:
         logger.info("Artwork generation target family=%s mode=%s openai_size=%s", target.family, target.mode, target.openai_size)
 
@@ -5692,7 +5794,7 @@ def run_prompt_artwork_generation(
     preferred_assets = choose_preferred_generated_asset(hydrated_assets)
     family_targets = _collect_prompt_family_target_minimums(
         templates=templates,
-        template_family_map=plan.template_family_map,
+        template_family_map=routing_family_map,
         family_aware=plan.family_aware,
         mug_tote_master=request.mug_tote_master,
     )
@@ -5710,9 +5812,47 @@ def run_prompt_artwork_generation(
         routing = route_templates_to_generated_assets(
             template_keys=template_keys,
             assets=preferred_assets,
-            template_family_map=plan.template_family_map,
+            template_family_map=routing_family_map,
             mug_tote_master=request.mug_tote_master,
         )
+        blanket_templates = {
+            template.key: template
+            for template in templates
+            if "blanket" in template.key.lower() or "throw" in template.key.lower()
+        }
+        blanket_derived_assets: Dict[Tuple[pathlib.Path, int, int], GeneratedArtworkAsset] = {}
+        blanket_composition_by_template: Dict[str, str] = {}
+        updated_routing: List[TemplateAssetRouting] = []
+        for row in routing:
+            blanket_template = blanket_templates.get(row.template_key)
+            if blanket_template is None:
+                updated_routing.append(row)
+                continue
+            target_w = max([int(p.width_px) for p in blanket_template.placements] or [6000])
+            target_h = max([int(p.height_px) for p in blanket_template.placements] or [4800])
+            cache_key = (row.asset_path, target_w, target_h)
+            derived_asset = blanket_derived_assets.get(cache_key)
+            if derived_asset is None:
+                source_asset = next((asset for asset in preferred_assets if asset.path == row.asset_path), None)
+                if source_asset is None:
+                    updated_routing.append(row)
+                    continue
+                derived_asset, composition_mode = _build_blanket_safe_derived_asset(
+                    asset=source_asset,
+                    target_width=target_w,
+                    target_height=target_h,
+                )
+                blanket_derived_assets[cache_key] = derived_asset
+                blanket_composition_by_template[row.template_key] = composition_mode
+            updated_routing.append(
+                replace(
+                    row,
+                    asset_path=derived_asset.path,
+                )
+            )
+        routing = updated_routing
+        for derived in blanket_derived_assets.values():
+            kept_paths.append(derived.path)
         logger.info("Family routing planned mappings=%s", len(routing))
         for row in routing:
             logger.info(
@@ -5725,6 +5865,13 @@ def run_prompt_artwork_generation(
                 row.routing_strategy,
                 row.routing_reason,
             )
+            if row.template_key in blanket_composition_by_template:
+                logger.info(
+                    "Template routing blanket composition template=%s concept=%s mode=%s",
+                    row.template_key,
+                    row.concept_index,
+                    blanket_composition_by_template[row.template_key],
+                )
     if request.family_aware:
         covered_template_keys = {row.template_key for row in routing}
         for key in template_keys:
@@ -8968,7 +9115,37 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 }
                 record["products"].append({"template": template.key, "state_key": state_key, "title_source": title_info.title_source, "rendered_title": rendered_title, "result": result})
                 if run_rows is not None:
-                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, "", "", "", "", "", "", "", "", False, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
+                    run_rows.append(
+                        RunReportRow(
+                            datetime.now(timezone.utc).isoformat(),
+                            artwork.src_path.name,
+                            artwork.slug,
+                            template.key,
+                            "skipped",
+                            "skip",
+                            resolved_template.printify_blueprint_id,
+                            resolved_template.printify_print_provider_id,
+                            upload_strategy,
+                            "",
+                            False,
+                            False,
+                            rendered_title,
+                            reason_code=runtime_diag.final_reason_code or "no_matching_variants_runtime",
+                            orientation_bucket=orientation_report,
+                            launch_plan_row=launch_plan_row,
+                            launch_plan_row_id=launch_plan_row_id,
+                            collection_handle=collection_handle,
+                            collection_title=collection_title,
+                            collection_description=collection_description,
+                            launch_name=launch_name,
+                            campaign=campaign,
+                            merch_theme=merch_theme,
+                            eligibility_outcome="ineligible",
+                            eligibility_reason_code=runtime_diag.final_reason_code or "no_matching_variants_runtime",
+                            eligibility_rule_failed="variant_selection",
+                            eligibility_gate_stage="variant_gate",
+                        )
+                    )
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
             variant_rows, variant_diagnostics = choose_variants_from_catalog_with_diagnostics(normalized_catalog_variants, resolved_template)
@@ -10788,6 +10965,10 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                                 routed_asset_family=route.asset_family or route.family,
                                 routed_asset_mode=route.routing_strategy,
                                 template_family=route.family,
+                                eligibility_outcome="ineligible",
+                                eligibility_reason_code="template_not_runnable_after_preflight",
+                                eligibility_rule_failed="asset_routing",
+                                eligibility_gate_stage="routing_gate",
                             )
                         )
                     continue
@@ -10822,6 +11003,10 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                                 routed_asset_family=route.asset_family or route.family,
                                 routed_asset_mode=route.routing_strategy,
                                 template_family=route.family,
+                                eligibility_outcome="ineligible",
+                                eligibility_reason_code="routed_asset_not_discovered",
+                                eligibility_rule_failed="asset_routing",
+                                eligibility_gate_stage="routing_gate",
                             )
                         )
                     continue
