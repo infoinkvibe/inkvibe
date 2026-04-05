@@ -6863,6 +6863,61 @@ def test_compute_placement_transform_for_poster_uses_tuned_scale():
     assert compute_placement_transform_for_artwork(placement, portrait, "poster_basic").scale == 1.0
 
 
+def _corner_alpha_values(image: Image.Image) -> Tuple[int, int, int, int]:
+    rgba = image.convert("RGBA")
+    w, h = rgba.size
+    return (
+        rgba.getpixel((0, 0))[3],
+        rgba.getpixel((w - 1, 0))[3],
+        rgba.getpixel((0, h - 1))[3],
+        rgba.getpixel((w - 1, h - 1))[3],
+    )
+
+
+def test_golden_focus_templates_transform_and_primary_placement_regression():
+    templates = {template.key: template for template in load_templates(Path("product_templates.json"))}
+    portrait = Artwork("portrait", Path("portrait.png"), "Portrait", "", [], 1200, 1800)
+    landscape = Artwork("landscape", Path("landscape.png"), "Landscape", "", [], 1800, 1200)
+
+    poster = templates["poster_basic"]
+    poster_transform = compute_placement_transform_for_artwork(poster.placements[0], landscape, poster.key)
+    assert poster_transform.scale == pytest.approx(0.97)
+    assert poster_transform.x == pytest.approx(0.5)
+    assert poster_transform.y == pytest.approx(0.5)
+    assert poster_transform.angle == 0
+
+    framed = templates["framed_poster_basic"]
+    framed_transform = compute_placement_transform_for_artwork(framed.placements[0], portrait, framed.key)
+    assert framed_transform.scale == pytest.approx(1.0)
+    assert framed_transform.x == pytest.approx(0.5)
+    assert framed_transform.y == pytest.approx(0.5)
+    assert framed_transform.angle == 0
+
+    canvas = templates["canvas_basic"]
+    canvas_transform = compute_placement_transform_for_artwork(canvas.placements[0], portrait, canvas.key)
+    assert canvas_transform.scale == pytest.approx(1.0)
+    assert canvas_transform.x == pytest.approx(0.5)
+    assert canvas_transform.y == pytest.approx(0.5)
+    assert canvas_transform.angle == 0
+
+    blanket = templates["blanket_basic"]
+    blanket_transform = compute_placement_transform_for_artwork(blanket.placements[0], landscape, blanket.key)
+    assert blanket_transform.scale == pytest.approx(1.0)
+    assert blanket_transform.x == pytest.approx(0.5)
+    assert blanket_transform.y == pytest.approx(0.5)
+    assert blanket_transform.angle == 0
+
+    tote = templates["tote_basic"]
+    tote_transform = compute_placement_transform_for_artwork(tote.placements[0], portrait, tote.key)
+    assert tote_transform.scale == pytest.approx(0.84)
+    assert tote_transform.x == pytest.approx(0.5)
+    assert tote_transform.y == pytest.approx(0.5)
+    assert tote_transform.angle == 0
+    assert tote.preferred_primary_placement == "front"
+    assert tote.publish_only_primary_placement is True
+    assert tote.active_placements == ["front"]
+
+
 def test_resolve_artwork_for_placement_uses_cover_for_eligible_poster_resolution(tmp_path: Path):
     path = tmp_path / "poster-art.png"
     image = Image.new("RGBA", (1800, 1200), (0, 0, 0, 0))
@@ -6986,6 +7041,96 @@ def test_resolve_artwork_for_blanket_undersized_cover_raises_structured_resoluti
     assert exc.source_size == (1280, 1280)
     assert exc.required_size == (6000, 4800)
     assert classify_failure(exc) == "insufficient_artwork_resolution"
+
+
+def test_golden_poster_render_paths_cover_and_bounded_contain_fallback(tmp_path: Path):
+    templates = {template.key: template for template in load_templates(Path("product_templates.json"))}
+    poster_template = templates["poster_basic"]
+    placement = poster_template.placements[0]
+    assert placement.width_px == 4500 and placement.height_px == 5400
+
+    cover_path = tmp_path / "poster-cover.png"
+    Image.new("RGBA", (5200, 7000), (12, 34, 56, 255)).save(cover_path)
+    cover_artwork = Artwork("poster-cover", cover_path, "Poster Cover", "", [], 5200, 7000)
+    cover_result = resolve_artwork_for_placement(
+        cover_artwork,
+        placement,
+        template=poster_template,
+        template_key=poster_template.key,
+        allow_upscale=False,
+        upscale_method="lanczos",
+        skip_undersized=False,
+        max_upscale_factor=None,
+    )
+    assert cover_result.action == "covered_cropped"
+    assert cover_result.final_size == (4500, 5400)
+    assert cover_result.upscaled is False
+    assert cover_result.poster_cover_eligible is True
+    assert cover_result.poster_enhancement_status == "cover_eligible"
+    assert _corner_alpha_values(cover_result.image) == (255, 255, 255, 255)
+
+    fallback_path = tmp_path / "poster-fallback.png"
+    Image.new("RGBA", (3200, 4800), (78, 90, 12, 255)).save(fallback_path)
+    fallback_artwork = Artwork("poster-fallback", fallback_path, "Poster Fallback", "", [], 3200, 4800)
+    fallback_result = resolve_artwork_for_placement(
+        fallback_artwork,
+        placement,
+        template=poster_template,
+        template_key=poster_template.key,
+        allow_upscale=False,
+        upscale_method="lanczos",
+        skip_undersized=False,
+        max_upscale_factor=None,
+    )
+    assert fallback_result.action == "contained_padded_upscale"
+    assert fallback_result.final_size == (4500, 5400)
+    assert fallback_result.upscaled is True
+    assert fallback_result.poster_cover_eligible is False
+    assert fallback_result.poster_enhancement_status == "applied"
+    assert fallback_result.poster_enhancement_tier == "bounded_standard"
+    assert fallback_result.poster_requested_upscale_factor == pytest.approx(1.125, rel=1e-3)
+    assert fallback_result.poster_applied_upscale_factor == pytest.approx(1.125, rel=1e-3)
+    assert fallback_result.poster_fill_optimization_used is True
+    assert _corner_alpha_values(fallback_result.image) == (0, 0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    ("template_key", "source_size"),
+    [
+        ("framed_poster_basic", (3000, 3000)),
+        ("canvas_basic", (3000, 3000)),
+        ("blanket_basic", (1280, 1280)),
+    ],
+)
+def test_golden_cover_templates_reject_undersized_sources_without_auto_master(
+    tmp_path: Path,
+    template_key: str,
+    source_size: Tuple[int, int],
+):
+    template = next(t for t in load_templates(Path("product_templates.json")) if t.key == template_key)
+    placement = template.placements[0]
+    assert placement.artwork_fit_mode == "cover"
+
+    art_path = tmp_path / f"{template_key}-undersized.png"
+    Image.new("RGBA", source_size, (220, 20, 20, 255)).save(art_path)
+    artwork = Artwork(f"{template_key}-undersized", art_path, "Undersized", "", [], source_size[0], source_size[1])
+
+    with pytest.raises(InsufficientArtworkResolutionError) as exc_info:
+        resolve_artwork_for_placement(
+            artwork,
+            placement,
+            template=template,
+            template_key=template_key,
+            allow_upscale=False,
+            upscale_method="lanczos",
+            skip_undersized=False,
+            max_upscale_factor=None,
+            auto_wallart_master=False,
+        )
+    exc = exc_info.value
+    assert exc.template_key == template_key
+    assert exc.placement_name == "front"
+    assert exc.required_size == (placement.width_px, placement.height_px)
 
 
 @pytest.mark.parametrize(
