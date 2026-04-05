@@ -164,6 +164,7 @@ from artwork_metadata_generator import (
 )
 from artwork_generation import (
     APPAREL_FAMILY,
+    BLANKET_FAMILY,
     POSTER_FAMILY,
     ArtworkGenerationRequest,
     GeneratedArtworkAsset,
@@ -8736,6 +8737,87 @@ def test_run_prompt_generation_family_result_routes_templates(tmp_path: Path, mo
     assert all(path.name.endswith("-derived.png") for path in result.generated_paths)
 
 
+def test_prompt_family_routing_includes_poster_canvas_framed_and_blanket(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    templates = [
+        ProductTemplate(key="poster_basic", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{title}", description_pattern="{description_html}"),
+        ProductTemplate(key="framed_poster_basic", printify_blueprint_id=2, printify_print_provider_id=2, title_pattern="{title}", description_pattern="{description_html}"),
+        ProductTemplate(
+            key="canvas_basic",
+            printify_blueprint_id=3,
+            printify_print_provider_id=3,
+            title_pattern="{title}",
+            description_pattern="{description_html}",
+            placements=[PlacementRequirement("front", 4500, 5400)],
+        ),
+        ProductTemplate(
+            key="blanket_basic",
+            printify_blueprint_id=4,
+            printify_print_provider_id=4,
+            title_pattern="{title}",
+            description_pattern="{description_html}",
+            placements=[PlacementRequirement("front", 6000, 4800)],
+        ),
+    ]
+    generated = [
+        GeneratedArtworkAsset(path=tmp_path / "prompt-apparel-c01.png", mode="portrait", concept_index=1, width=1200, height=1800, family=APPAREL_FAMILY),
+        GeneratedArtworkAsset(path=tmp_path / "prompt-poster-c01.png", mode="portrait", concept_index=1, width=1200, height=1800, family=POSTER_FAMILY),
+        GeneratedArtworkAsset(path=tmp_path / "prompt-blanket-c01.png", mode="landscape", concept_index=1, width=1536, height=1024, family=BLANKET_FAMILY),
+    ]
+    for row in generated:
+        Image.new("RGBA", (row.width, row.height), (255, 0, 0, 255)).save(row.path)
+
+    monkeypatch.setattr(pipeline, "generate_artwork_with_openai", lambda **kwargs: generated)
+
+    request = ArtworkGenerationRequest(prompt="forest", output_dir=tmp_path, base_name="prompt", family_aware=True, family_mode="split")
+    result = pipeline.run_prompt_artwork_generation(request=request, templates=templates)
+    by_template = {row.template_key: row for row in result.template_routing}
+    assert set(by_template.keys()) == {"poster_basic", "framed_poster_basic", "canvas_basic", "blanket_basic"}
+    assert by_template["poster_basic"].asset_family == POSTER_FAMILY
+    assert by_template["framed_poster_basic"].asset_family == POSTER_FAMILY
+    assert by_template["blanket_basic"].asset_family == BLANKET_FAMILY
+    assert by_template["canvas_basic"].asset_family in {APPAREL_FAMILY, POSTER_FAMILY}
+
+
+def test_prompt_family_routing_falls_back_when_poster_master_unavailable():
+    assets = [GeneratedArtworkAsset(path=Path("apparel.png"), mode="portrait", concept_index=1, family=APPAREL_FAMILY)]
+    routing = route_templates_to_generated_assets(
+        template_keys=["poster_basic", "framed_poster_basic", "canvas_basic"],
+        assets=assets,
+        template_family_map={"poster_basic": POSTER_FAMILY, "framed_poster_basic": POSTER_FAMILY, "canvas_basic": APPAREL_FAMILY},
+    )
+    by_template = {row.template_key: row for row in routing}
+    assert by_template["poster_basic"].routing_strategy == "fallback"
+    assert by_template["poster_basic"].routing_reason == "fallback_to_apparel_master"
+    assert by_template["poster_basic"].asset_family == APPAREL_FAMILY
+    assert by_template["framed_poster_basic"].routing_strategy == "fallback"
+
+
+def test_prompt_blanket_derivation_uses_blanket_safe_composition(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    blanket = ProductTemplate(
+        key="blanket_basic",
+        printify_blueprint_id=4,
+        printify_print_provider_id=4,
+        title_pattern="{title}",
+        description_pattern="{description_html}",
+        placements=[PlacementRequirement("front", 6000, 4800)],
+    )
+    source = GeneratedArtworkAsset(path=tmp_path / "prompt-blanket-c01.png", mode="landscape", concept_index=1, width=1536, height=1024, family=BLANKET_FAMILY)
+    Image.new("RGBA", (1536, 1024), (255, 0, 0, 255)).save(source.path)
+    monkeypatch.setattr(pipeline, "generate_artwork_with_openai", lambda **kwargs: [source])
+
+    request = ArtworkGenerationRequest(prompt="forest", output_dir=tmp_path, base_name="prompt", family_aware=True, family_mode="auto")
+    result = pipeline.run_prompt_artwork_generation(request=request, templates=[blanket])
+    assert len(result.generated_paths) == 1
+    derived = result.generated_paths[0]
+    with Image.open(derived) as im:
+        assert im.size == (6000, 4800)
+        assert im.getpixel((10, 10))[3] == 0
+
+
 def test_non_family_aware_prompt_mode_still_returns_generated_paths(tmp_path: Path, monkeypatch):
     import printify_shopify_sync_pipeline as pipeline
 
@@ -8811,6 +8893,82 @@ def test_family_routing_flows_into_create_publish_processing(tmp_path: Path, mon
     )
     assert ("hoodie_gildan", "prompt-apparel-c01.png") in calls
     assert ("poster_basic", "prompt-poster-c01.png") in calls
+
+
+def test_family_routing_exports_skip_rows_for_templates_removed_after_preflight(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    cfg = tmp_path / "templates.json"
+    cfg.write_text("[]", encoding="utf-8")
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    state_path = tmp_path / "state.json"
+    run_report = tmp_path / "run.csv"
+
+    templates = [
+        ProductTemplate(key="poster_basic", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{title}", description_pattern="{description_html}"),
+        ProductTemplate(key="framed_poster_basic", printify_blueprint_id=2, printify_print_provider_id=2, title_pattern="{title}", description_pattern="{description_html}"),
+        ProductTemplate(key="canvas_basic", printify_blueprint_id=3, printify_print_provider_id=3, title_pattern="{title}", description_pattern="{description_html}"),
+        ProductTemplate(key="blanket_basic", printify_blueprint_id=4, printify_print_provider_id=4, title_pattern="{title}", description_pattern="{description_html}"),
+    ]
+
+    canvas_path = img_dir / "prompt-canvas-c01.png"
+    blanket_path = img_dir / "prompt-blanket-c01.png"
+    Image.new("RGBA", (1200, 1800), (255, 0, 0, 255)).save(canvas_path)
+    Image.new("RGBA", (1600, 1200), (0, 0, 255, 255)).save(blanket_path)
+    artworks = [
+        Artwork(slug="prompt-canvas-c01", src_path=canvas_path, title="Canvas", description_html="<p>Canvas</p>", tags=["c"], image_width=1200, image_height=1800),
+        Artwork(slug="prompt-blanket-c01", src_path=blanket_path, title="Blanket", description_html="<p>Blanket</p>", tags=["b"], image_width=1600, image_height=1200),
+    ]
+
+    monkeypatch.setenv("PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "load_templates", lambda _cfg: templates)
+    monkeypatch.setattr(pipeline, "discover_artworks", lambda *_a, **_k: artworks)
+    monkeypatch.setattr(pipeline, "run_catalog_cli", lambda **kwargs: False)
+    monkeypatch.setattr(pipeline, "audit_printify_integration", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "resolve_shop_id", lambda *a, **k: 1)
+    monkeypatch.setattr(pipeline, "PrintifyClient", lambda token, dry_run=False: types.SimpleNamespace(dry_run=dry_run))
+    monkeypatch.setattr(
+        pipeline,
+        "preflight_active_templates",
+        lambda printify, templates, explicit_template_keys: (
+            [t for t in templates if t.key in {"canvas_basic", "blanket_basic"}],
+            [],
+            [],
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "run_prompt_artwork_generation",
+        lambda **kwargs: PromptArtworkGenerationResult(
+            generated_paths=[canvas_path, blanket_path],
+            template_routing=[
+                TemplateAssetRouting(template_key="poster_basic", family=POSTER_FAMILY, concept_index=1, asset_path=canvas_path),
+                TemplateAssetRouting(template_key="framed_poster_basic", family=POSTER_FAMILY, concept_index=1, asset_path=canvas_path),
+                TemplateAssetRouting(template_key="canvas_basic", family=APPAREL_FAMILY, concept_index=1, asset_path=canvas_path),
+                TemplateAssetRouting(template_key="blanket_basic", family=BLANKET_FAMILY, concept_index=1, asset_path=blanket_path),
+            ],
+        ),
+    )
+    monkeypatch.setattr(pipeline, "process_artwork", lambda **kwargs: None)
+
+    run(
+        cfg,
+        dry_run=True,
+        image_dir=img_dir,
+        state_path=state_path,
+        generate_artwork_from_prompt=True,
+        art_prompt="forest wolf",
+        art_family_aware=True,
+        create_only=True,
+        export_run_report=str(run_report),
+    )
+    rows = list(csv.DictReader(run_report.open(newline="", encoding="utf-8")))
+    by_template = {row["template_key"]: row for row in rows}
+    assert by_template["poster_basic"]["status"] == "skipped"
+    assert by_template["poster_basic"]["reason_code"] == "template_not_runnable_after_preflight"
+    assert by_template["framed_poster_basic"]["status"] == "skipped"
 
 
 def test_local_image_batch_max_artworks_processes_first_n_across_templates(tmp_path: Path, monkeypatch):

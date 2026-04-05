@@ -120,17 +120,23 @@ class TemplateAssetRouting:
     family: str
     concept_index: int
     asset_path: pathlib.Path
+    asset_family: str = ""
+    routing_strategy: str = "exact"
+    routing_reason: str = ""
 
 
 APPAREL_FAMILY = "apparel"
 POSTER_FAMILY = "poster"
 SQUARE_FAMILY = "square"
+BLANKET_FAMILY = "blanket"
 
 
 def classify_template_family(template_key: str, *, mug_tote_master: str = "apparel") -> str:
     key = (template_key or "").strip().lower()
     if "poster" in key:
         return POSTER_FAMILY
+    if "blanket" in key or "throw" in key:
+        return BLANKET_FAMILY
     if "mug" in key or "tote" in key:
         if mug_tote_master == "square":
             return SQUARE_FAMILY
@@ -190,12 +196,16 @@ def plan_family_artwork_targets(
         rationale.append("Family-aware single mode enabled; generating apparel master only.")
     elif normalized_mode == "split":
         required_families = [APPAREL_FAMILY, POSTER_FAMILY]
+        if BLANKET_FAMILY in families_in_templates:
+            required_families.append(BLANKET_FAMILY)
         if SQUARE_FAMILY in families_in_templates:
             required_families.append(SQUARE_FAMILY)
         rationale.append("Family-aware split mode enabled; generating dedicated family masters.")
     else:
         if POSTER_FAMILY in families_in_templates:
             required_families.append(POSTER_FAMILY)
+        if BLANKET_FAMILY in families_in_templates:
+            required_families.append(BLANKET_FAMILY)
         if APPAREL_FAMILY in families_in_templates:
             required_families.append(APPAREL_FAMILY)
         if SQUARE_FAMILY in families_in_templates:
@@ -220,6 +230,7 @@ def plan_family_artwork_targets(
     mode_by_family = {
         APPAREL_FAMILY: "portrait",
         POSTER_FAMILY: "portrait",
+        BLANKET_FAMILY: "landscape",
         SQUARE_FAMILY: "square",
     }
     targets = [
@@ -483,10 +494,18 @@ def route_templates_to_generated_assets(
                 mug_tote_master=mug_tote_master,
             )
             candidate = by_family_concept.get((family, concept_index))
+            strategy = "exact"
+            reason = "exact_family_match"
             if candidate is None:
                 candidate = by_family_concept.get((APPAREL_FAMILY, concept_index))
+                if candidate is not None:
+                    strategy = "fallback"
+                    reason = "fallback_to_apparel_master"
             if candidate is None:
                 candidate = by_family_concept.get(("single", concept_index))
+                if candidate is not None:
+                    strategy = "fallback"
+                    reason = "fallback_to_single_master"
             if candidate is None:
                 continue
             routing.append(
@@ -495,6 +514,9 @@ def route_templates_to_generated_assets(
                     family=family,
                     concept_index=concept_index,
                     asset_path=candidate.path,
+                    asset_family=candidate.family or "single",
+                    routing_strategy=strategy,
+                    routing_reason=reason,
                 )
             )
     return routing
