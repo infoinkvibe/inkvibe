@@ -48,6 +48,7 @@ from artwork_generation import (
     GeneratedArtworkAsset,
     TemplateAssetRouting,
     choose_preferred_generated_asset,
+    classify_template_family,
     is_preview_or_low_value_asset,
     plan_family_artwork_targets,
     plan_generated_artwork_targets,
@@ -5497,6 +5498,93 @@ def run_artwork_metadata_generation(
     )
 
 
+def _collect_prompt_family_target_minimums(
+    *,
+    templates: List[ProductTemplate],
+    template_family_map: Dict[str, str],
+    family_aware: bool,
+    mug_tote_master: str,
+) -> Dict[str, Tuple[int, int]]:
+    target_by_family: Dict[str, Tuple[int, int]] = {}
+    for template in templates:
+        if family_aware:
+            family = template_family_map.get(template.key) or classify_template_family(template.key, mug_tote_master=mug_tote_master)
+        else:
+            family = "single"
+        placement_width = max([int(p.width_px) for p in template.placements] or [0])
+        placement_height = max([int(p.height_px) for p in template.placements] or [0])
+        existing = target_by_family.get(family, (0, 0))
+        target_by_family[family] = (
+            max(existing[0], placement_width),
+            max(existing[1], placement_height),
+        )
+    return target_by_family
+
+
+def _build_prompt_derived_masters(
+    *,
+    assets: List[GeneratedArtworkAsset],
+    family_targets: Dict[str, Tuple[int, int]],
+    request: ArtworkGenerationRequest,
+) -> List[GeneratedArtworkAsset]:
+    derived_assets: List[GeneratedArtworkAsset] = []
+    for asset in assets:
+        with Image.open(asset.path) as opened:
+            source = ImageOps.exif_transpose(opened).convert("RGBA")
+            src_w, src_h = source.size
+            family = asset.family or "single"
+            target_w, target_h = family_targets.get(family, (0, 0))
+            requested_scale = max(
+                (target_w / src_w) if src_w > 0 and target_w > 0 else 1.0,
+                (target_h / src_h) if src_h > 0 and target_h > 0 else 1.0,
+            )
+            upscale_cap = WALLART_AUTO_MASTER_MAX_UPSCALE_FACTOR if family in {"poster", "single"} else 2.0
+            applied_scale = min(max(1.0, requested_scale), upscale_cap)
+            resized_w = max(1, int(round(src_w * applied_scale)))
+            resized_h = max(1, int(round(src_h * applied_scale)))
+            if resized_w == src_w and resized_h == src_h:
+                derived_image = source.copy()
+                upscaled = False
+            else:
+                derived_image = source.resize((resized_w, resized_h), _upscale_filter("lanczos"))
+                upscaled = True
+
+        derived_suffix = "derived"
+        if family and family != "single":
+            derived_suffix = f"{family}-derived"
+        derived_path = asset.path.with_name(f"{asset.path.stem}-{derived_suffix}.png")
+        derived_path.parent.mkdir(parents=True, exist_ok=True)
+        derived_image.save(derived_path)
+        derived_image.close()
+        source.close()
+
+        logger.info(
+            "Prompt derived master family=%s concept=%s raw_path=%s raw_dims=%sx%s derived_path=%s derived_dims=%sx%s upscale_applied=%s requested_scale=%.3f applied_scale=%.3f target_min=%sx%s",
+            family,
+            asset.concept_index,
+            asset.path,
+            src_w,
+            src_h,
+            derived_path,
+            resized_w,
+            resized_h,
+            str(upscaled).lower(),
+            requested_scale,
+            applied_scale,
+            target_w,
+            target_h,
+        )
+        derived_assets.append(
+            replace(
+                asset,
+                path=derived_path,
+                width=resized_w,
+                height=resized_h,
+            )
+        )
+    return derived_assets
+
+
 def run_prompt_artwork_generation(
     *,
     request: ArtworkGenerationRequest,
@@ -5510,9 +5598,20 @@ def run_prompt_artwork_generation(
             generate_poster_master=request.generate_poster_master,
             generate_apparel_master=request.generate_apparel_master,
             mug_tote_master=request.mug_tote_master,
+            openai_size=request.openai_size,
+            openai_portrait_size=request.openai_portrait_size,
+            openai_square_size=request.openai_square_size,
+            openai_landscape_size=request.openai_landscape_size,
         )
     else:
-        plan = plan_generated_artwork_targets(template_keys=template_keys, target_mode=request.target_mode)
+        plan = plan_generated_artwork_targets(
+            template_keys=template_keys,
+            target_mode=request.target_mode,
+            openai_size=request.openai_size,
+            openai_portrait_size=request.openai_portrait_size,
+            openai_square_size=request.openai_square_size,
+            openai_landscape_size=request.openai_landscape_size,
+        )
     for reason in plan.rationale:
         logger.info("Artwork generation plan: %s", reason)
     for target in plan.targets:
@@ -5521,7 +5620,10 @@ def run_prompt_artwork_generation(
     if request.dry_run_plan:
         return PromptArtworkGenerationResult()
 
-    generated_assets = generate_artwork_with_openai(request=request, plan=plan)
+    try:
+        generated_assets = generate_artwork_with_openai(request=request, plan=plan)
+    except Exception as exc:
+        raise RuntimeError(f"Prompt artwork generation failed cleanly: {exc}") from None
     hydrated_assets: List[GeneratedArtworkAsset] = []
     for asset in generated_assets:
         if not asset.path.exists():
@@ -5542,6 +5644,17 @@ def run_prompt_artwork_generation(
         hydrated_assets.append(asset)
 
     preferred_assets = choose_preferred_generated_asset(hydrated_assets)
+    family_targets = _collect_prompt_family_target_minimums(
+        templates=templates,
+        template_family_map=plan.template_family_map,
+        family_aware=plan.family_aware,
+        mug_tote_master=request.mug_tote_master,
+    )
+    preferred_assets = _build_prompt_derived_masters(
+        assets=preferred_assets,
+        family_targets=family_targets,
+        request=request,
+    )
     kept_paths = [asset.path for asset in preferred_assets]
     dropped_paths = sorted({asset.path for asset in hydrated_assets} - set(kept_paths))
     for dropped in dropped_paths:
@@ -9614,6 +9727,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--art-background", choices=["auto", "transparent", "opaque"], default="auto", help="OpenAI image background mode")
     parser.add_argument("--art-generator", choices=["openai"], default="openai", help="Artwork generation provider")
     parser.add_argument("--art-openai-model", default="", help="Optional OpenAI model override for image generation")
+    parser.add_argument("--art-openai-timeout-seconds", type=float, default=180.0, help="OpenAI image request timeout in seconds (per attempt)")
+    parser.add_argument("--art-openai-max-retries", type=int, default=4, help="Maximum OpenAI image retries for transient transport/timeout failures")
+    parser.add_argument("--art-openai-retry-backoff-seconds", type=float, default=2.0, help="Base retry backoff seconds for OpenAI image generation (exponential backoff)")
+    parser.add_argument(
+        "--art-openai-size",
+        choices=["1024x1024", "1024x1536", "1536x1024", "auto"],
+        default="",
+        help="Optional global OpenAI size override for all planned art masters",
+    )
+    parser.add_argument(
+        "--art-openai-portrait-size",
+        choices=["1024x1024", "1024x1536", "1536x1024", "auto"],
+        default="1024x1536",
+        help="OpenAI size for portrait master planning (ignored when --art-openai-size is set)",
+    )
+    parser.add_argument(
+        "--art-openai-square-size",
+        choices=["1024x1024", "1024x1536", "1536x1024", "auto"],
+        default="1024x1024",
+        help="OpenAI size for square master planning (ignored when --art-openai-size is set)",
+    )
+    parser.add_argument(
+        "--art-openai-landscape-size",
+        choices=["1024x1024", "1024x1536", "1536x1024", "auto"],
+        default="1536x1024",
+        help="OpenAI size for landscape master planning (ignored when --art-openai-size is set)",
+    )
     parser.add_argument("--art-run-metadata", action="store_true", help="Generate sidecar metadata for newly generated artwork before exiting/continuing")
     parser.add_argument("--art-run-storefront-qa", action="store_true", help="After generation, run storefront QA against generated artwork")
     parser.add_argument("--art-publish", action="store_true", help="After generation, run full create/update flow and force publish")
@@ -9960,7 +10100,7 @@ def apply_high_volume_mode_defaults(
     }
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", auto_wallart_master: bool = False, skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", export_preflight_report_path: str = "", run_free_shipping_profit_audit_only: bool = False, free_shipping_profit_min: str = "4.00", free_shipping_profit_audit_csv_path: str = "reports/free_shipping_profit_audit.csv", free_shipping_profit_audit_json_path: str = "reports/free_shipping_profit_audit.json", allow_preflight_failures: bool = False, preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, enable_ai_product_copy: Optional[bool] = None, ai_product_copy_model: str = "", generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "", max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS, interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS, catalog_cache_dir: str = CATALOG_CACHE_DIR_DEFAULT, catalog_cache_ttl_hours: int = CACHE_TTL_HOURS_DEFAULT, no_catalog_cache: bool = False, chunk_size: int = 0, pause_between_chunks_seconds: float = 0.0, catalog_request_spacing_ms: int = 0, template_spacing_ms: int = 0, artwork_spacing_ms: int = 0, resume_only_pending: bool = False, high_volume_mode: bool = False, publish_batch_size: int = 5, pause_between_publish_batches_seconds: float = 2.0, defer_publish: bool = False, resume_publish_only: bool = False, progress: Optional[bool] = None) -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", auto_wallart_master: bool = False, skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", export_preflight_report_path: str = "", run_free_shipping_profit_audit_only: bool = False, free_shipping_profit_min: str = "4.00", free_shipping_profit_audit_csv_path: str = "reports/free_shipping_profit_audit.csv", free_shipping_profit_audit_json_path: str = "reports/free_shipping_profit_audit.json", allow_preflight_failures: bool = False, preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, enable_ai_product_copy: Optional[bool] = None, ai_product_copy_model: str = "", generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_openai_timeout_seconds: float = 180.0, art_openai_max_retries: int = 4, art_openai_retry_backoff_seconds: float = 2.0, art_openai_size: str = "", art_openai_portrait_size: str = "1024x1536", art_openai_square_size: str = "1024x1024", art_openai_landscape_size: str = "1536x1024", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "", max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS, interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS, catalog_cache_dir: str = CATALOG_CACHE_DIR_DEFAULT, catalog_cache_ttl_hours: int = CACHE_TTL_HOURS_DEFAULT, no_catalog_cache: bool = False, chunk_size: int = 0, pause_between_chunks_seconds: float = 0.0, catalog_request_spacing_ms: int = 0, template_spacing_ms: int = 0, artwork_spacing_ms: int = 0, resume_only_pending: bool = False, high_volume_mode: bool = False, publish_batch_size: int = 5, pause_between_publish_batches_seconds: float = 2.0, defer_publish: bool = False, resume_publish_only: bool = False, progress: Optional[bool] = None) -> None:
     max_retry_sleep_seconds = max(0.0, float(max_retry_sleep_seconds))
     interactive_retry_cap_seconds = max(0.0, float(interactive_retry_cap_seconds))
     if resume_only_pending:
@@ -10078,6 +10218,13 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             background=art_background,
             generator=art_generator,
             openai_model=art_openai_model,
+            openai_timeout_seconds=max(1.0, float(art_openai_timeout_seconds)),
+            openai_max_retries=max(0, int(art_openai_max_retries)),
+            openai_retry_backoff_seconds=max(0.0, float(art_openai_retry_backoff_seconds)),
+            openai_size=art_openai_size,
+            openai_portrait_size=art_openai_portrait_size,
+            openai_square_size=art_openai_square_size,
+            openai_landscape_size=art_openai_landscape_size,
             base_name=slugify(art_base_name or "generated-art"),
             output_dir=output_dir,
             target_mode=art_target_mode,
@@ -10813,6 +10960,13 @@ if __name__ == "__main__":
             art_background=args.art_background,
             art_generator=args.art_generator,
             art_openai_model=args.art_openai_model,
+            art_openai_timeout_seconds=args.art_openai_timeout_seconds,
+            art_openai_max_retries=args.art_openai_max_retries,
+            art_openai_retry_backoff_seconds=args.art_openai_retry_backoff_seconds,
+            art_openai_size=args.art_openai_size,
+            art_openai_portrait_size=args.art_openai_portrait_size,
+            art_openai_square_size=args.art_openai_square_size,
+            art_openai_landscape_size=args.art_openai_landscape_size,
             art_run_metadata=args.art_run_metadata,
             art_run_storefront_qa=args.art_run_storefront_qa,
             art_publish=args.art_publish,

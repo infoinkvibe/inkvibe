@@ -175,6 +175,7 @@ from artwork_generation import (
     plan_generated_artwork_targets,
     route_templates_to_generated_assets,
     TemplateAssetRouting,
+    validate_openai_image_size,
     validate_generated_asset_for_templates,
 )
 
@@ -8478,6 +8479,46 @@ def test_parse_args_family_aware_flags(monkeypatch):
     assert args.art_mug_tote_master == "square"
 
 
+def test_parse_args_openai_art_retry_and_size_flags(monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prog",
+            "--generate-artwork-from-prompt",
+            "--art-prompt",
+            "retro tiger sunset",
+            "--art-openai-timeout-seconds",
+            "210",
+            "--art-openai-max-retries",
+            "5",
+            "--art-openai-retry-backoff-seconds",
+            "3",
+            "--art-openai-size",
+            "1024x1024",
+        ],
+    )
+    args = pipeline.parse_args()
+    assert args.art_openai_timeout_seconds == 210
+    assert args.art_openai_max_retries == 5
+    assert args.art_openai_retry_backoff_seconds == 3
+    assert args.art_openai_size == "1024x1024"
+
+
+def test_parse_args_rejects_invalid_openai_size(monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["prog", "--generate-artwork-from-prompt", "--art-prompt", "x", "--art-openai-size", "999x999"],
+    )
+    with pytest.raises(SystemExit):
+        pipeline.parse_args()
+
+
 def test_parse_args_auto_wallart_master_flag(monkeypatch):
     import printify_shopify_sync_pipeline as pipeline
 
@@ -8497,6 +8538,23 @@ def test_plan_generated_artwork_targets_multi():
     plan = plan_generated_artwork_targets(template_keys=["hoodie_unisex", "mug_11oz"], target_mode="auto")
     assert [target.mode for target in plan.targets] == ["portrait", "square"]
     assert any("Mixed template families" in reason for reason in plan.rationale)
+
+
+def test_plan_generated_artwork_targets_respects_custom_sizes():
+    plan = plan_generated_artwork_targets(
+        template_keys=["hoodie_unisex", "mug_11oz"],
+        target_mode="auto",
+        openai_portrait_size="auto",
+        openai_square_size="1024x1024",
+    )
+    by_mode = {target.mode: target.openai_size for target in plan.targets}
+    assert by_mode["portrait"] == "auto"
+    assert by_mode["square"] == "1024x1024"
+
+
+def test_validate_openai_image_size_rejects_invalid():
+    with pytest.raises(ValueError):
+        validate_openai_image_size("6000x6000")
 
 
 def test_family_plan_auto_splits_poster_and_apparel():
@@ -8551,6 +8609,84 @@ def test_openai_generation_client_can_be_mocked(tmp_path: Path):
     assert assets[0].path.read_bytes() == b"pngbytes"
 
 
+def test_openai_generation_retries_timeout_and_then_succeeds(tmp_path: Path):
+    png = base64.b64encode(b"pngbytes").decode("ascii")
+
+    class StubTimeoutError(Exception):
+        pass
+
+    class StubImagesClient:
+        def __init__(self):
+            self.images = self
+            self.calls = 0
+
+        def generate(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise StubTimeoutError("timeout")
+            return types.SimpleNamespace(data=[types.SimpleNamespace(b64_json=png)])
+
+    req = ArtworkGenerationRequest(
+        prompt="wolf",
+        output_dir=tmp_path,
+        base_name="wolf",
+        count=1,
+        openai_max_retries=2,
+        openai_retry_backoff_seconds=0,
+    )
+    plan = plan_generated_artwork_targets(template_keys=["hoodie_unisex"], target_mode="portrait")
+    client = StubImagesClient()
+
+    import artwork_generation as generation_module
+
+    original = generation_module._is_retryable_openai_error
+    generation_module._is_retryable_openai_error = lambda exc: isinstance(exc, StubTimeoutError)
+    try:
+        assets = generate_artwork_with_openai(request=req, plan=plan, client=client)
+    finally:
+        generation_module._is_retryable_openai_error = original
+    assert len(assets) == 1
+    assert client.calls == 2
+    assert assets[0].path.exists()
+
+
+def test_openai_generation_retries_exhausted_returns_actionable_error(tmp_path: Path):
+    class StubTimeoutError(Exception):
+        pass
+
+    class StubImagesClient:
+        def __init__(self):
+            self.images = self
+
+        def generate(self, **kwargs):
+            raise StubTimeoutError("still timing out")
+
+    req = ArtworkGenerationRequest(
+        prompt="wolf",
+        output_dir=tmp_path,
+        base_name="wolf",
+        count=1,
+        openai_max_retries=1,
+        openai_retry_backoff_seconds=0,
+    )
+    plan = plan_generated_artwork_targets(template_keys=["poster_basic"], target_mode="portrait")
+
+    import artwork_generation as generation_module
+
+    original = generation_module._is_retryable_openai_error
+    generation_module._is_retryable_openai_error = lambda exc: isinstance(exc, StubTimeoutError)
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            generate_artwork_with_openai(request=req, plan=plan, client=StubImagesClient())
+    finally:
+        generation_module._is_retryable_openai_error = original
+    message = str(excinfo.value)
+    assert "family=single" in message
+    assert "mode=portrait" in message
+    assert "requested_size=1024x1536" in message
+    assert "concept_index=1" in message
+
+
 def test_source_hygiene_filters_preview_and_tiny_assets(tmp_path: Path):
     preview_path = tmp_path / "my-removebg-preview.png"
     preview_path.write_bytes(b"x")
@@ -8595,8 +8731,9 @@ def test_run_prompt_generation_family_result_routes_templates(tmp_path: Path, mo
     request = ArtworkGenerationRequest(prompt="forest", output_dir=tmp_path, base_name="prompt", family_aware=True)
     result = pipeline.run_prompt_artwork_generation(request=request, templates=[hoodie, poster])
     by_template = {row.template_key: row.asset_path.name for row in result.template_routing}
-    assert by_template["hoodie_gildan"].endswith("apparel-c01.png")
-    assert by_template["poster_basic"].endswith("poster-c01.png")
+    assert by_template["hoodie_gildan"].endswith("apparel-derived.png")
+    assert by_template["poster_basic"].endswith("poster-derived.png")
+    assert all(path.name.endswith("-derived.png") for path in result.generated_paths)
 
 
 def test_non_family_aware_prompt_mode_still_returns_generated_paths(tmp_path: Path, monkeypatch):
@@ -8609,7 +8746,8 @@ def test_non_family_aware_prompt_mode_still_returns_generated_paths(tmp_path: Pa
 
     request = ArtworkGenerationRequest(prompt="forest", output_dir=tmp_path, base_name="prompt", family_aware=False)
     result = pipeline.run_prompt_artwork_generation(request=request, templates=[hoodie])
-    assert result.generated_paths == [asset.path]
+    assert len(result.generated_paths) == 1
+    assert result.generated_paths[0].name.endswith("-derived.png")
     assert result.template_routing == []
 
 
