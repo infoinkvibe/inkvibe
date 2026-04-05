@@ -3254,6 +3254,166 @@ def test_resolve_product_action_modes():
     assert resolve_product_action(existing_product_id="", create_only=False, update_only=True, rebuild_product=False) == "skip"
     assert resolve_product_action(existing_product_id="p1", create_only=False, update_only=False, rebuild_product=True) == "rebuild"
 
+
+def test_existing_product_skip_row_has_explicit_reason_code(tmp_path: Path):
+    template = ProductTemplate(
+        key="canvas_basic",
+        printify_blueprint_id=3,
+        printify_print_provider_id=3,
+        title_pattern="{artwork_title}",
+        description_pattern="{description_html}",
+    )
+    art_path = tmp_path / "canvas.png"
+    Image.new("RGBA", (1200, 1800), (255, 0, 0, 255)).save(art_path)
+    artwork = Artwork(
+        slug="canvas",
+        src_path=art_path,
+        title="Canvas",
+        description_html="<p>Canvas</p>",
+        tags=["c"],
+        image_width=1200,
+        image_height=1800,
+    )
+    state = {
+        "processed": {
+            "canvas": {
+                "products": [
+                    {
+                        "state_key": "canvas:canvas_basic",
+                        "result": {"printify": {"printify_product_id": "existing-canvas"}},
+                    }
+                ]
+            }
+        }
+    }
+    run_rows: list[RunReportRow] = []
+    process_artwork(
+        printify=types.SimpleNamespace(dry_run=True, list_blueprints=lambda: []),
+        shopify=None,
+        shop_id=None,
+        artwork=artwork,
+        templates=[template],
+        state=state,
+        force=False,
+        export_dir=tmp_path / "export",
+        state_path=tmp_path / "state.json",
+        artwork_options=ArtworkProcessingOptions(skip_undersized=True),
+        upload_strategy="auto",
+        r2_config=None,
+        create_only=True,
+        run_rows=run_rows,
+        summary=RunSummary(),
+        routed_asset_family=POSTER_FAMILY,
+        routed_asset_mode="split",
+    )
+    assert len(run_rows) == 1
+    row = run_rows[0]
+    assert row.status == "skipped"
+    assert row.reason_code == "existing_product_create_only_skip"
+    assert row.product_id == "existing-canvas"
+
+
+def test_skip_diagnostics_include_eligibility_and_existing_product_paths(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    template = ProductTemplate(
+        key="canvas_basic",
+        printify_blueprint_id=3,
+        printify_print_provider_id=3,
+        title_pattern="{artwork_title}",
+        description_pattern="{description_html}",
+        placements=[PlacementRequirement("front", 4500, 5400)],
+    )
+    art_path = tmp_path / "small.png"
+    Image.new("RGBA", (100, 100), (255, 0, 0, 255)).save(art_path)
+    artwork = Artwork(
+        slug="small",
+        src_path=art_path,
+        title="Small",
+        description_html="<p>Small</p>",
+        tags=["s"],
+        image_width=100,
+        image_height=100,
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "_resolve_template_catalog_mapping",
+        lambda **kwargs: (
+            kwargs["template"],
+            types.SimpleNamespace(
+                template_hint_blueprint_id=kwargs["template"].printify_blueprint_id,
+                template_hint_provider_id=kwargs["template"].printify_print_provider_id,
+                resolved_blueprint_id=kwargs["template"].printify_blueprint_id,
+                resolved_provider_id=kwargs["template"].printify_print_provider_id,
+                discovery_used=False,
+                pinned_attempted_first=True,
+                fallback_discovery_triggered=False,
+                fallback_discovery_reason="",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "validate_catalog_family_schema",
+        lambda **kwargs: types.SimpleNamespace(plausible=True, intended_family="poster", reason=""),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "choose_variants_from_catalog_with_diagnostics",
+        lambda variants, resolved_template: (
+            [{"id": 1}],
+            types.SimpleNamespace(
+                resolved_model_dimension="",
+                final_selected_models=[],
+                zero_selection_reason="",
+            ),
+        ),
+    )
+    monkeypatch.setattr(pipeline, "reorder_variants_for_storefront_display", lambda **kwargs: kwargs["variant_rows"])
+    monkeypatch.setattr(
+        pipeline,
+        "evaluate_artwork_eligibility_for_template",
+        lambda **kwargs: types.SimpleNamespace(
+            eligible=False,
+            reason_code="insufficient_artwork_resolution",
+            source_size=(100, 100),
+            required_size=(4500, 5400),
+            fit_mode="cover",
+            rule_failed="min_source_resolution",
+            high_resolution_family=True,
+        ),
+    )
+    run_rows: list[RunReportRow] = []
+    process_artwork(
+        printify=types.SimpleNamespace(
+            dry_run=True,
+            list_blueprints=lambda: [],
+            list_print_providers=lambda *_a, **_k: [],
+            list_variants=lambda *_a, **_k: [{"id": 1}],
+        ),
+        shopify=None,
+        shop_id=1,
+        artwork=artwork,
+        templates=[template],
+        state={"processed": {}},
+        force=False,
+        export_dir=tmp_path / "export",
+        state_path=tmp_path / "state.json",
+        artwork_options=ArtworkProcessingOptions(skip_undersized=True),
+        upload_strategy="auto",
+        r2_config=None,
+        run_rows=run_rows,
+        summary=RunSummary(),
+    )
+    assert len(run_rows) == 1
+    eligibility_row = run_rows[0]
+    assert eligibility_row.reason_code == "insufficient_artwork_resolution"
+    assert eligibility_row.eligibility_outcome == "ineligible"
+    assert eligibility_row.eligibility_reason_code == "insufficient_artwork_resolution"
+    assert eligibility_row.eligibility_rule_failed == "min_source_resolution"
+    assert eligibility_row.eligibility_gate_stage == "eligibility_gate"
+
 def test_payload_consistency_validation_detects_missing_variant_ids():
     payload = {
         "variants": [{"id": 1, "is_enabled": True}, {"id": 2, "is_enabled": True}],
@@ -8717,8 +8877,8 @@ def test_build_generation_prompt_has_family_specific_guidance():
 def test_run_prompt_generation_family_result_routes_templates(tmp_path: Path, monkeypatch):
     import printify_shopify_sync_pipeline as pipeline
 
-    hoodie = ProductTemplate(key="hoodie_gildan", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{title}", description_pattern="{description_html}")
-    poster = ProductTemplate(key="poster_basic", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{title}", description_pattern="{description_html}")
+    hoodie = ProductTemplate(key="hoodie_gildan", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{artwork_title}", description_pattern="{description_html}")
+    poster = ProductTemplate(key="poster_basic", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{artwork_title}", description_pattern="{description_html}")
 
     generated = [
         GeneratedArtworkAsset(path=tmp_path / "prompt-apparel-c01.png", mode="portrait", concept_index=1, width=1200, height=1800, family=APPAREL_FAMILY),
@@ -8741,13 +8901,13 @@ def test_prompt_family_routing_includes_poster_canvas_framed_and_blanket(tmp_pat
     import printify_shopify_sync_pipeline as pipeline
 
     templates = [
-        ProductTemplate(key="poster_basic", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{title}", description_pattern="{description_html}"),
-        ProductTemplate(key="framed_poster_basic", printify_blueprint_id=2, printify_print_provider_id=2, title_pattern="{title}", description_pattern="{description_html}"),
+        ProductTemplate(key="poster_basic", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{artwork_title}", description_pattern="{description_html}"),
+        ProductTemplate(key="framed_poster_basic", printify_blueprint_id=2, printify_print_provider_id=2, title_pattern="{artwork_title}", description_pattern="{description_html}"),
         ProductTemplate(
             key="canvas_basic",
             printify_blueprint_id=3,
             printify_print_provider_id=3,
-            title_pattern="{title}",
+            title_pattern="{artwork_title}",
             description_pattern="{description_html}",
             high_resolution_family=True,
             min_effective_cover_ratio=1.0,
@@ -8757,7 +8917,7 @@ def test_prompt_family_routing_includes_poster_canvas_framed_and_blanket(tmp_pat
             key="blanket_basic",
             printify_blueprint_id=4,
             printify_print_provider_id=4,
-            title_pattern="{title}",
+            title_pattern="{artwork_title}",
             description_pattern="{description_html}",
             high_resolution_family=True,
             min_effective_cover_ratio=1.0,
@@ -8806,7 +8966,7 @@ def test_split_family_routing_maps_high_resolution_templates_to_poster_family():
             key="canvas_basic",
             printify_blueprint_id=1,
             printify_print_provider_id=1,
-            title_pattern="{title}",
+            title_pattern="{artwork_title}",
             description_pattern="{description_html}",
             high_resolution_family=True,
             min_effective_cover_ratio=1.0,
@@ -8815,7 +8975,7 @@ def test_split_family_routing_maps_high_resolution_templates_to_poster_family():
             key="blanket_basic",
             printify_blueprint_id=2,
             printify_print_provider_id=2,
-            title_pattern="{title}",
+            title_pattern="{artwork_title}",
             description_pattern="{description_html}",
             high_resolution_family=True,
             min_effective_cover_ratio=1.0,
@@ -8824,7 +8984,7 @@ def test_split_family_routing_maps_high_resolution_templates_to_poster_family():
             key="poster_basic",
             printify_blueprint_id=3,
             printify_print_provider_id=3,
-            title_pattern="{title}",
+            title_pattern="{artwork_title}",
             description_pattern="{description_html}",
             high_resolution_family=True,
             min_effective_cover_ratio=1.0,
@@ -8833,7 +8993,7 @@ def test_split_family_routing_maps_high_resolution_templates_to_poster_family():
             key="framed_poster_basic",
             printify_blueprint_id=4,
             printify_print_provider_id=4,
-            title_pattern="{title}",
+            title_pattern="{artwork_title}",
             description_pattern="{description_html}",
             high_resolution_family=True,
             min_effective_cover_ratio=1.0,
@@ -8842,7 +9002,7 @@ def test_split_family_routing_maps_high_resolution_templates_to_poster_family():
             key="hoodie_gildan",
             printify_blueprint_id=5,
             printify_print_provider_id=5,
-            title_pattern="{title}",
+            title_pattern="{artwork_title}",
             description_pattern="{description_html}",
         ),
     ]
@@ -8867,6 +9027,40 @@ def test_split_family_routing_maps_high_resolution_templates_to_poster_family():
     assert resolved["hoodie_gildan"] == APPAREL_FAMILY
 
 
+def test_split_family_routing_forces_canvas_and_blanket_to_poster_without_high_res_flags():
+    import printify_shopify_sync_pipeline as pipeline
+
+    templates = [
+        ProductTemplate(
+            key="canvas_basic",
+            printify_blueprint_id=1,
+            printify_print_provider_id=1,
+            title_pattern="{artwork_title}",
+            description_pattern="{description_html}",
+            high_resolution_family=False,
+            min_effective_cover_ratio=0.5,
+        ),
+        ProductTemplate(
+            key="blanket_basic",
+            printify_blueprint_id=2,
+            printify_print_provider_id=2,
+            title_pattern="{artwork_title}",
+            description_pattern="{description_html}",
+            high_resolution_family=False,
+            min_effective_cover_ratio=0.5,
+        ),
+    ]
+    resolved = pipeline._resolve_split_routing_family_map(
+        templates=templates,
+        base_family_map={"canvas_basic": APPAREL_FAMILY, "blanket_basic": BLANKET_FAMILY},
+        family_aware=True,
+        family_mode="split",
+        mug_tote_master="apparel",
+    )
+    assert resolved["canvas_basic"] == POSTER_FAMILY
+    assert resolved["blanket_basic"] == POSTER_FAMILY
+
+
 def test_prompt_blanket_derivation_uses_blanket_safe_composition(tmp_path: Path, monkeypatch):
     import printify_shopify_sync_pipeline as pipeline
 
@@ -8874,7 +9068,7 @@ def test_prompt_blanket_derivation_uses_blanket_safe_composition(tmp_path: Path,
         key="blanket_basic",
         printify_blueprint_id=4,
         printify_print_provider_id=4,
-        title_pattern="{title}",
+        title_pattern="{artwork_title}",
         description_pattern="{description_html}",
         high_resolution_family=True,
         min_effective_cover_ratio=1.0,
@@ -8897,12 +9091,12 @@ def test_prompt_blanket_derivation_uses_blanket_safe_composition(tmp_path: Path,
 def test_split_family_routing_keeps_apparel_on_apparel_master(tmp_path: Path, monkeypatch):
     import printify_shopify_sync_pipeline as pipeline
 
-    hoodie = ProductTemplate(key="hoodie_gildan", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{title}", description_pattern="{description_html}")
+    hoodie = ProductTemplate(key="hoodie_gildan", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{artwork_title}", description_pattern="{description_html}")
     canvas = ProductTemplate(
         key="canvas_basic",
         printify_blueprint_id=2,
         printify_print_provider_id=2,
-        title_pattern="{title}",
+        title_pattern="{artwork_title}",
         description_pattern="{description_html}",
         high_resolution_family=True,
         min_effective_cover_ratio=1.0,
@@ -8926,7 +9120,7 @@ def test_split_family_routing_keeps_apparel_on_apparel_master(tmp_path: Path, mo
 def test_non_family_aware_prompt_mode_still_returns_generated_paths(tmp_path: Path, monkeypatch):
     import printify_shopify_sync_pipeline as pipeline
 
-    hoodie = ProductTemplate(key="hoodie_gildan", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{title}", description_pattern="{description_html}")
+    hoodie = ProductTemplate(key="hoodie_gildan", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{artwork_title}", description_pattern="{description_html}")
     asset = GeneratedArtworkAsset(path=tmp_path / "prompt-portrait-c01.png", mode="portrait", concept_index=1, width=1200, height=1800, family="single")
     Image.new("RGBA", (1200, 1800), (255, 0, 0, 255)).save(asset.path)
     monkeypatch.setattr(pipeline, "generate_artwork_with_openai", lambda **kwargs: [asset])
@@ -8947,8 +9141,8 @@ def test_family_routing_flows_into_create_publish_processing(tmp_path: Path, mon
     img_dir.mkdir()
     state_path = tmp_path / "state.json"
 
-    hoodie_template = ProductTemplate(key="hoodie_gildan", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{title}", description_pattern="{description_html}")
-    poster_template = ProductTemplate(key="poster_basic", printify_blueprint_id=2, printify_print_provider_id=2, title_pattern="{title}", description_pattern="{description_html}")
+    hoodie_template = ProductTemplate(key="hoodie_gildan", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{artwork_title}", description_pattern="{description_html}")
+    poster_template = ProductTemplate(key="poster_basic", printify_blueprint_id=2, printify_print_provider_id=2, title_pattern="{artwork_title}", description_pattern="{description_html}")
 
     apparel_path = img_dir / "prompt-apparel-c01.png"
     poster_path = img_dir / "prompt-poster-c01.png"
@@ -9011,10 +9205,10 @@ def test_family_routing_exports_skip_rows_for_templates_removed_after_preflight(
     run_report = tmp_path / "run.csv"
 
     templates = [
-        ProductTemplate(key="poster_basic", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{title}", description_pattern="{description_html}"),
-        ProductTemplate(key="framed_poster_basic", printify_blueprint_id=2, printify_print_provider_id=2, title_pattern="{title}", description_pattern="{description_html}"),
-        ProductTemplate(key="canvas_basic", printify_blueprint_id=3, printify_print_provider_id=3, title_pattern="{title}", description_pattern="{description_html}"),
-        ProductTemplate(key="blanket_basic", printify_blueprint_id=4, printify_print_provider_id=4, title_pattern="{title}", description_pattern="{description_html}"),
+        ProductTemplate(key="poster_basic", printify_blueprint_id=1, printify_print_provider_id=1, title_pattern="{artwork_title}", description_pattern="{description_html}"),
+        ProductTemplate(key="framed_poster_basic", printify_blueprint_id=2, printify_print_provider_id=2, title_pattern="{artwork_title}", description_pattern="{description_html}"),
+        ProductTemplate(key="canvas_basic", printify_blueprint_id=3, printify_print_provider_id=3, title_pattern="{artwork_title}", description_pattern="{description_html}"),
+        ProductTemplate(key="blanket_basic", printify_blueprint_id=4, printify_print_provider_id=4, title_pattern="{artwork_title}", description_pattern="{description_html}"),
     ]
 
     canvas_path = img_dir / "prompt-canvas-c01.png"
@@ -9077,6 +9271,147 @@ def test_family_routing_exports_skip_rows_for_templates_removed_after_preflight(
     assert by_template["poster_basic"]["eligibility_gate_stage"] == "routing_gate"
     assert by_template["poster_basic"]["routed_asset_family"] == POSTER_FAMILY
     assert by_template["framed_poster_basic"]["status"] == "skipped"
+
+
+def test_prompt_split_report_row_keeps_canvas_routed_asset_family(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    cfg = tmp_path / "templates.json"
+    cfg.write_text("[]", encoding="utf-8")
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    state_path = tmp_path / "state.json"
+    run_report = tmp_path / "run.csv"
+    canvas_path = img_dir / "prompt-poster-canvas-c01.png"
+    Image.new("RGBA", (1200, 1800), (255, 0, 0, 255)).save(canvas_path)
+
+    template = ProductTemplate(key="canvas_basic", printify_blueprint_id=3, printify_print_provider_id=3, title_pattern="{artwork_title}", description_pattern="{description_html}")
+    artwork = Artwork(slug="prompt-poster-canvas-c01", src_path=canvas_path, title="Canvas", description_html="<p>Canvas</p>", tags=["c"], image_width=1200, image_height=1800)
+
+    monkeypatch.setenv("PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "load_templates", lambda _cfg: [template])
+    monkeypatch.setattr(pipeline, "discover_artworks", lambda *_a, **_k: [artwork])
+    monkeypatch.setattr(pipeline, "run_catalog_cli", lambda **kwargs: False)
+    monkeypatch.setattr(pipeline, "audit_printify_integration", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "resolve_shop_id", lambda *a, **k: 1)
+    monkeypatch.setattr(
+        pipeline,
+        "PrintifyClient",
+        lambda token, dry_run=False: types.SimpleNamespace(dry_run=dry_run, list_blueprints=lambda: []),
+    )
+    monkeypatch.setattr(pipeline, "preflight_active_templates", lambda printify, templates, explicit_template_keys: (templates, [], []))
+    monkeypatch.setattr(
+        pipeline,
+        "run_prompt_artwork_generation",
+        lambda **kwargs: PromptArtworkGenerationResult(
+            generated_paths=[canvas_path],
+            template_routing=[
+                TemplateAssetRouting(template_key="canvas_basic", family=POSTER_FAMILY, concept_index=1, asset_path=canvas_path, asset_family=POSTER_FAMILY),
+            ],
+        ),
+    )
+
+    save_json_atomic(
+        state_path,
+        {
+            "processed": {
+                artwork.slug: {
+                    "products": [
+                        {
+                            "state_key": f"{artwork.slug}:canvas_basic",
+                            "result": {"printify": {"printify_product_id": "existing-canvas"}},
+                        }
+                    ]
+                }
+            }
+        },
+    )
+    run(
+        cfg,
+        dry_run=True,
+        image_dir=img_dir,
+        state_path=state_path,
+        generate_artwork_from_prompt=True,
+        art_prompt="forest wolf",
+        art_family_aware=True,
+        art_family_mode="split",
+        create_only=True,
+        export_run_report=str(run_report),
+    )
+    rows = list(csv.DictReader(run_report.open(newline="", encoding="utf-8")))
+    assert rows[0]["template_key"] == "canvas_basic"
+    assert rows[0]["routed_asset_family"] == POSTER_FAMILY
+
+
+def test_prompt_split_report_row_keeps_blanket_routed_asset_family(tmp_path: Path, monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    cfg = tmp_path / "templates.json"
+    cfg.write_text("[]", encoding="utf-8")
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    state_path = tmp_path / "state.json"
+    run_report = tmp_path / "run.csv"
+    blanket_path = img_dir / "prompt-poster-blanket-c01.png"
+    Image.new("RGBA", (1600, 1200), (0, 0, 255, 255)).save(blanket_path)
+
+    template = ProductTemplate(key="blanket_basic", printify_blueprint_id=4, printify_print_provider_id=4, title_pattern="{artwork_title}", description_pattern="{description_html}")
+    artwork = Artwork(slug="prompt-poster-blanket-c01", src_path=blanket_path, title="Blanket", description_html="<p>Blanket</p>", tags=["b"], image_width=1600, image_height=1200)
+
+    monkeypatch.setenv("PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "PRINTIFY_API_TOKEN", "token")
+    monkeypatch.setattr(pipeline, "load_templates", lambda _cfg: [template])
+    monkeypatch.setattr(pipeline, "discover_artworks", lambda *_a, **_k: [artwork])
+    monkeypatch.setattr(pipeline, "run_catalog_cli", lambda **kwargs: False)
+    monkeypatch.setattr(pipeline, "audit_printify_integration", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "resolve_shop_id", lambda *a, **k: 1)
+    monkeypatch.setattr(
+        pipeline,
+        "PrintifyClient",
+        lambda token, dry_run=False: types.SimpleNamespace(dry_run=dry_run, list_blueprints=lambda: []),
+    )
+    monkeypatch.setattr(pipeline, "preflight_active_templates", lambda printify, templates, explicit_template_keys: (templates, [], []))
+    monkeypatch.setattr(
+        pipeline,
+        "run_prompt_artwork_generation",
+        lambda **kwargs: PromptArtworkGenerationResult(
+            generated_paths=[blanket_path],
+            template_routing=[
+                TemplateAssetRouting(template_key="blanket_basic", family=POSTER_FAMILY, concept_index=1, asset_path=blanket_path, asset_family=POSTER_FAMILY),
+            ],
+        ),
+    )
+    save_json_atomic(
+        state_path,
+        {
+            "processed": {
+                artwork.slug: {
+                    "products": [
+                        {
+                            "state_key": f"{artwork.slug}:blanket_basic",
+                            "result": {"printify": {"printify_product_id": "existing-blanket"}},
+                        }
+                    ]
+                }
+            }
+        },
+    )
+    run(
+        cfg,
+        dry_run=True,
+        image_dir=img_dir,
+        state_path=state_path,
+        generate_artwork_from_prompt=True,
+        art_prompt="forest wolf",
+        art_family_aware=True,
+        art_family_mode="split",
+        create_only=True,
+        export_run_report=str(run_report),
+    )
+    rows = list(csv.DictReader(run_report.open(newline="", encoding="utf-8")))
+    assert rows[0]["template_key"] == "blanket_basic"
+    assert rows[0]["routed_asset_family"] == POSTER_FAMILY
 
 
 def test_local_image_batch_max_artworks_processes_first_n_across_templates(tmp_path: Path, monkeypatch):

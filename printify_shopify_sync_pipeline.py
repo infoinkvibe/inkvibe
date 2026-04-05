@@ -5533,10 +5533,14 @@ def _resolve_split_routing_family_map(
     mug_tote_master: str,
 ) -> Dict[str, str]:
     resolved = dict(base_family_map or {})
+    forced_poster_templates = {"canvas_basic", "blanket_basic"}
     if not family_aware or (family_mode or "").strip().lower() != "split":
         return resolved
     for template in templates:
         key = template.key
+        if key in forced_poster_templates:
+            resolved[key] = POSTER_FAMILY
+            continue
         template_family = resolved.get(key) or classify_template_family(key, mug_tote_master=mug_tote_master)
         min_cover_ratio = float(template.min_effective_cover_ratio or 0.0)
         requires_high_res_cover = bool(template.high_resolution_family) or min_cover_ratio >= 1.0
@@ -8981,6 +8985,12 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
         try:
             resolved_template = template
             if action == "skip":
+                if create_only and existing_product_id:
+                    skip_reason_code = "existing_product_create_only_skip"
+                elif update_only and not existing_product_id:
+                    skip_reason_code = "missing_existing_product_update_only_skip"
+                else:
+                    skip_reason_code = "action_resolved_skip"
                 result = {"printify": {"status": "skipped", "action": "skip", "printify_product_id": existing_product_id}}
                 if summary is not None:
                     summary.products_skipped += 1
@@ -9016,6 +9026,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                         publish_attempted=False,
                         publish_verified=False,
                         rendered_title=rendered_title,
+                        reason_code=skip_reason_code,
                         launch_plan_row=launch_plan_row,
                         launch_plan_row_id=launch_plan_row_id,
                         routed_asset_family=routed_asset_family,
@@ -9189,7 +9200,41 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                 }
                 record["products"].append({"template": template.key, "state_key": state_key, "title_source": title_info.title_source, "rendered_title": rendered_title, "result": result})
                 if run_rows is not None:
-                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, "", "", "", "", "", "", "", "", False, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
+                    run_rows.append(
+                        RunReportRow(
+                            datetime.now(timezone.utc).isoformat(),
+                            artwork.src_path.name,
+                            artwork.slug,
+                            template.key,
+                            "skipped",
+                            "skip",
+                            resolved_template.printify_blueprint_id,
+                            resolved_template.printify_print_provider_id,
+                            upload_strategy,
+                            "",
+                            False,
+                            False,
+                            rendered_title,
+                            reason_code=runtime_diag.final_reason_code or "no_matching_variants_runtime",
+                            orientation_bucket=orientation_report,
+                            launch_plan_row=launch_plan_row,
+                            launch_plan_row_id=launch_plan_row_id,
+                            collection_handle=collection_handle,
+                            collection_title=collection_title,
+                            collection_description=collection_description,
+                            launch_name=launch_name,
+                            campaign=campaign,
+                            merch_theme=merch_theme,
+                            routed_asset_family=routed_asset_family,
+                            routed_asset_mode=routed_asset_mode,
+                            template_family=template_family_report,
+                            product_family_label=family_label_report,
+                            eligibility_outcome="ineligible",
+                            eligibility_reason_code=runtime_diag.final_reason_code or "no_matching_variants_runtime",
+                            eligibility_rule_failed="variant_selection",
+                            eligibility_gate_stage="variant_gate",
+                        )
+                    )
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
@@ -9283,20 +9328,45 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     "result": result,
                 })
                 if run_rows is not None:
-                    run_rows.append(RunReportRow(
-                        datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip",
-                        resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id, upload_strategy, "", False, False,
-                        rendered_title, f"{eligibility_result.source_size[0]}x{eligibility_result.source_size[1]}", "", "", "", "", "", "", "",
-                        False, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description,
-                        launch_name, campaign, merch_theme,
-                        required_placement_size=f"{eligibility_result.required_size[0]}x{eligibility_result.required_size[1]}",
-                        required_fit_mode=eligibility_result.fit_mode,
-                        eligibility_high_resolution_family=eligibility_result.high_resolution_family,
-                        eligibility_outcome="ineligible",
-                        eligibility_reason_code=eligibility_result.reason_code or "artwork_not_eligible_for_template",
-                        eligibility_rule_failed=eligibility_result.rule_failed,
-                        eligibility_gate_stage="eligibility_gate",
-                    ))
+                    run_rows.append(
+                        RunReportRow(
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                            artwork_filename=artwork.src_path.name,
+                            artwork_slug=artwork.slug,
+                            template_key=template.key,
+                            status="skipped",
+                            action="skip",
+                            blueprint_id=resolved_template.printify_blueprint_id,
+                            provider_id=resolved_template.printify_print_provider_id,
+                            upload_strategy=upload_strategy,
+                            product_id="",
+                            publish_attempted=False,
+                            publish_verified=False,
+                            rendered_title=rendered_title,
+                            reason_code=eligibility_result.reason_code or "artwork_not_eligible_for_template",
+                            source_size=f"{eligibility_result.source_size[0]}x{eligibility_result.source_size[1]}",
+                            orientation_bucket=orientation_report,
+                            launch_plan_row=launch_plan_row,
+                            launch_plan_row_id=launch_plan_row_id,
+                            collection_handle=collection_handle,
+                            collection_title=collection_title,
+                            collection_description=collection_description,
+                            launch_name=launch_name,
+                            campaign=campaign,
+                            merch_theme=merch_theme,
+                            routed_asset_family=routed_asset_family,
+                            routed_asset_mode=routed_asset_mode,
+                            template_family=template_family_report,
+                            product_family_label=family_label_report,
+                            required_placement_size=f"{eligibility_result.required_size[0]}x{eligibility_result.required_size[1]}",
+                            required_fit_mode=eligibility_result.fit_mode,
+                            eligibility_high_resolution_family=eligibility_result.high_resolution_family,
+                            eligibility_outcome="ineligible",
+                            eligibility_reason_code=eligibility_result.reason_code or "artwork_not_eligible_for_template",
+                            eligibility_rule_failed=eligibility_result.rule_failed,
+                            eligibility_gate_stage="eligibility_gate",
+                        )
+                    )
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
@@ -9357,7 +9427,45 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     "result": result,
                 })
                 if run_rows is not None:
-                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, f"{insufficient_artwork_error.source_size[0]}x{insufficient_artwork_error.source_size[1]}", "", "", "", "", "", "", "", False, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme, required_placement_size=f"{insufficient_artwork_error.required_size[0]}x{insufficient_artwork_error.required_size[1]}", required_fit_mode=insufficient_artwork_error.fit_mode, eligibility_high_resolution_family=bool(resolved_template.high_resolution_family), eligibility_outcome="ineligible", eligibility_reason_code="insufficient_artwork_resolution", eligibility_rule_failed="runtime_resolution_check", eligibility_gate_stage="runtime_processing"))
+                    run_rows.append(
+                        RunReportRow(
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                            artwork_filename=artwork.src_path.name,
+                            artwork_slug=artwork.slug,
+                            template_key=template.key,
+                            status="skipped",
+                            action="skip",
+                            blueprint_id=resolved_template.printify_blueprint_id,
+                            provider_id=resolved_template.printify_print_provider_id,
+                            upload_strategy=upload_strategy,
+                            product_id="",
+                            publish_attempted=False,
+                            publish_verified=False,
+                            rendered_title=rendered_title,
+                            reason_code="insufficient_artwork_resolution",
+                            source_size=f"{insufficient_artwork_error.source_size[0]}x{insufficient_artwork_error.source_size[1]}",
+                            orientation_bucket=orientation_report,
+                            launch_plan_row=launch_plan_row,
+                            launch_plan_row_id=launch_plan_row_id,
+                            collection_handle=collection_handle,
+                            collection_title=collection_title,
+                            collection_description=collection_description,
+                            launch_name=launch_name,
+                            campaign=campaign,
+                            merch_theme=merch_theme,
+                            routed_asset_family=routed_asset_family,
+                            routed_asset_mode=routed_asset_mode,
+                            template_family=template_family_report,
+                            product_family_label=family_label_report,
+                            required_placement_size=f"{insufficient_artwork_error.required_size[0]}x{insufficient_artwork_error.required_size[1]}",
+                            required_fit_mode=insufficient_artwork_error.fit_mode,
+                            eligibility_high_resolution_family=bool(resolved_template.high_resolution_family),
+                            eligibility_outcome="ineligible",
+                            eligibility_reason_code="insufficient_artwork_resolution",
+                            eligibility_rule_failed="runtime_resolution_check",
+                            eligibility_gate_stage="runtime_processing",
+                        )
+                    )
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
@@ -9434,7 +9542,49 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     "result": result,
                 })
                 if run_rows is not None:
-                    run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "skipped", "skip", resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id, upload_strategy, "", False, False, rendered_title, source_size_report, trimmed_bounds_report, "", exported_canvas_report, placement_scale_report, effective_upscale_factor_report, requested_upscale_factor_report, applied_upscale_factor_report, upscale_capped_report, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
+                    run_rows.append(
+                        RunReportRow(
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                            artwork_filename=artwork.src_path.name,
+                            artwork_slug=artwork.slug,
+                            template_key=template.key,
+                            status="skipped",
+                            action="skip",
+                            blueprint_id=resolved_template.printify_blueprint_id,
+                            provider_id=resolved_template.printify_print_provider_id,
+                            upload_strategy=upload_strategy,
+                            product_id="",
+                            publish_attempted=False,
+                            publish_verified=False,
+                            rendered_title=rendered_title,
+                            reason_code=runtime_diag.final_reason_code or "placement_artwork_resolution_skipped",
+                            source_size=source_size_report,
+                            trimmed_bounds_size=trimmed_bounds_report,
+                            exported_canvas_size=exported_canvas_report,
+                            placement_scale_used=placement_scale_report,
+                            effective_upscale_factor=effective_upscale_factor_report,
+                            requested_upscale_factor=requested_upscale_factor_report,
+                            applied_upscale_factor=applied_upscale_factor_report,
+                            upscale_capped=upscale_capped_report,
+                            orientation_bucket=orientation_report,
+                            launch_plan_row=launch_plan_row,
+                            launch_plan_row_id=launch_plan_row_id,
+                            collection_handle=collection_handle,
+                            collection_title=collection_title,
+                            collection_description=collection_description,
+                            launch_name=launch_name,
+                            campaign=campaign,
+                            merch_theme=merch_theme,
+                            routed_asset_family=routed_asset_family,
+                            routed_asset_mode=routed_asset_mode,
+                            template_family=template_family_report,
+                            product_family_label=family_label_report,
+                            eligibility_outcome="ineligible",
+                            eligibility_reason_code=runtime_diag.final_reason_code or "placement_artwork_resolution_skipped",
+                            eligibility_rule_failed="placement_prepare_artwork",
+                            eligibility_gate_stage="runtime_processing",
+                        )
+                    )
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action="skip", upload_map=upload_map)
                 continue
 
