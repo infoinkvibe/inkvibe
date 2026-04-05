@@ -1112,6 +1112,20 @@ def test_sidecar_metadata_preferred_over_repo_map(tmp_path: Path):
     assert resolved["tags"] == ["sidecar"]
 
 
+def test_prompt_generated_artwork_sidecar_is_bypassed_to_prevent_stale_reuse(tmp_path: Path):
+    image = tmp_path / "generated-art-apparel-c01.png"
+    sidecar = image.with_suffix(".json")
+    Image.new("RGBA", (900, 900), (0, 0, 0, 255)).save(image)
+    sidecar.write_text(
+        json.dumps({"title": "Patriotic American Flag and Helmet Illustration", "description": "legacy", "tags": ["legacy"]}),
+        encoding="utf-8",
+    )
+    resolved, match = resolve_artwork_metadata_with_source(image, metadata_map={}, artwork_slug="generated-art-apparel-c01")
+    assert resolved == {}
+    assert match["source"] == "sidecar_bypass_prompt_generated"
+    assert match["reason"] == "prompt_generated_reused_slug_sidecar_bypassed"
+
+
 def test_artwork_metadata_alias_match_for_uuid_filename(tmp_path: Path):
     image = tmp_path / "7a90f8b0-5687-4cbf-81a5-3eba04940253.png"
     Image.new("RGBA", (900, 900), (0, 0, 0, 255)).save(image)
@@ -8185,6 +8199,43 @@ def test_preferred_featured_mockup_candidate_uses_preferred_color_and_type_when_
     assert candidate["selected_featured_mockup_type"] == "lifestyle"
 
 
+def test_hoodie_featured_mockup_prefers_centered_front_over_top_heavy_crop():
+    template = ProductTemplate(
+        key="hoodie_gildan",
+        printify_blueprint_id=77,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="<p>{artwork_title}</p>",
+        placements=[PlacementRequirement("front", 100, 100)],
+        preferred_mockup_colors=["Dark Heather", "Black"],
+        preferred_default_variant_color="Dark Heather",
+        preferred_mockup_types=["lifestyle", "flat"],
+    )
+    variants = [{"id": 202, "options": {"color": "Dark Heather"}}]
+    candidate = choose_preferred_featured_mockup_candidate(
+        template=template,
+        variant_rows=variants,
+        product_images=[
+            {
+                "src": "https://example.com/hoodie-lifestyle-top-crop-darkheather.png",
+                "type": "lifestyle",
+                "position_name": "upper_torso_closeup",
+                "tags": ["closeup", "torso", "top-heavy"],
+                "variant_ids": [202],
+            },
+            {
+                "src": "https://example.com/hoodie-front-full-darkheather.png",
+                "type": "flat",
+                "position_name": "front_center_full",
+                "tags": ["front", "full garment", "centered"],
+                "variant_ids": [202],
+            },
+        ],
+    )
+    assert candidate["selected_featured_mockup_src"].endswith("hoodie-front-full-darkheather.png")
+    assert candidate["selected_featured_mockup_type"] == "flat"
+
+
 def test_preferred_featured_mockup_candidate_falls_back_when_preferred_color_missing():
     template = ProductTemplate(
         key="tshirt_gildan",
@@ -8206,6 +8257,52 @@ def test_preferred_featured_mockup_candidate_falls_back_when_preferred_color_mis
     )
     assert candidate["selected_featured_mockup_color"] == "White"
     assert candidate["selected_featured_mockup_type"] == "flat"
+
+
+def test_non_hoodie_featured_mockup_ranking_behavior_is_unchanged():
+    template = ProductTemplate(
+        key="poster_basic",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="<p>{artwork_title}</p>",
+        placements=[PlacementRequirement("front", 100, 100)],
+        preferred_mockup_types=["lifestyle", "flat"],
+    )
+    candidate = choose_preferred_featured_mockup_candidate(
+        template=template,
+        variant_rows=[],
+        product_images=[
+            {"src": "https://example.com/poster-flat.png", "type": "flat"},
+            {"src": "https://example.com/poster-lifestyle.png", "type": "lifestyle"},
+        ],
+    )
+    assert candidate["selected_featured_mockup_src"].endswith("poster-lifestyle.png")
+
+
+def test_prompt_generated_hoodie_title_uses_artwork_relevant_fallback():
+    template = ProductTemplate(
+        key="hoodie_gildan",
+        printify_blueprint_id=77,
+        printify_print_provider_id=99,
+        title_pattern="{artwork_title}",
+        description_pattern="<p>{artwork_title}</p>",
+        placements=[PlacementRequirement("front", 100, 100)],
+        product_type_label="Hoodie",
+    )
+    artwork = Artwork(
+        slug="generated-art-apparel-c01",
+        src_path=Path("generated-art-apparel-c01.png"),
+        title="Generated Art Apparel C01",
+        description_html="<p>x</p>",
+        tags=[],
+        image_width=1200,
+        image_height=1800,
+        metadata={"tags": ["sunflower", "botanical"]},
+    )
+    result = resolve_artwork_title(template, artwork)
+    assert result.cleaned_display_title == "Sunflower Hoodie"
+    assert "Patriotic" not in result.cleaned_display_title
 
 
 def test_tote_orientation_tuning_is_conservative_and_front_safe(tmp_path: Path):
