@@ -1317,6 +1317,52 @@ def choose_preferred_featured_mockup_candidate(
     preferred_color = choose_preferred_featured_variant_color(template=template, variant_rows=variant_rows)
     preferred_types = [_normalize_color_name(v) for v in (template.preferred_mockup_types or []) if str(v).strip()]
     preferred_position = _normalize_color_name(template.preferred_mockup_position or "")
+    family = content_engine.infer_product_family(template)
+
+    def _image_signal_tokens(image: Dict[str, Any]) -> set[str]:
+        buckets: List[str] = []
+        for key in ("type", "image_type", "mockup_type", "position_name", "position", "view", "label", "name", "title"):
+            value = image.get(key)
+            if isinstance(value, str) and value.strip():
+                buckets.append(value.strip().lower())
+        for key in ("tags", "mockup_tags"):
+            values = image.get(key)
+            if isinstance(values, list):
+                buckets.extend(str(v).strip().lower() for v in values if str(v).strip())
+            elif isinstance(values, str) and values.strip():
+                buckets.append(values.strip().lower())
+        combined = " ".join(buckets)
+        return {token for token in re.findall(r"[a-z0-9]+", combined) if token}
+
+    def _hoodie_sweatshirt_framing_rank(image: Dict[str, Any], image_type: str, image_position: str) -> Tuple[int, int, int, int]:
+        """
+        Lower is better.
+        Rank tuple: (top_heavy_penalty, composition_penalty, crop_penalty, neutral_color_penalty)
+        """
+        if family not in {"hoodie", "sweatshirt"}:
+            return (0, 0, 0, 1)
+        tokens = _image_signal_tokens(image)
+        type_tokens = {token for token in re.findall(r"[a-z0-9]+", str(image_type).lower()) if token}
+        position_tokens = {token for token in re.findall(r"[a-z0-9]+", str(image_position).lower()) if token}
+        all_tokens = tokens.union(type_tokens).union(position_tokens)
+        src = str(image.get("src") or image.get("preview_url") or image.get("url") or "").lower()
+        all_tokens.update(token for token in re.findall(r"[a-z0-9]+", src) if token)
+
+        top_heavy = {"top", "upper", "closeup", "close", "crop", "cropped", "detail", "zoom", "headshot", "neck", "torso", "half"}
+        balanced = {"front", "full", "whole", "center", "centered", "straight", "studio", "flat", "catalog"}
+        neutral_dark = {"black", "navy", "charcoal", "dark", "graphite", "midnight"}
+
+        top_heavy_penalty = 1 if all_tokens.intersection(top_heavy) else 0
+        has_composition_signal = bool(all_tokens.intersection(top_heavy.union(balanced)))
+        composition_penalty = 0 if not has_composition_signal or all_tokens.intersection(balanced) else 1
+        crop_penalty = 0
+        if {"torso", "crop"}.intersection(all_tokens):
+            crop_penalty = 2
+        elif {"closeup", "close", "detail"}.intersection(all_tokens):
+            crop_penalty = 1
+        neutral_color_penalty = 0 if all_tokens.intersection(neutral_dark) else 1
+        return (top_heavy_penalty, composition_penalty, crop_penalty, neutral_color_penalty)
+
     variant_id_to_color: Dict[str, str] = {}
     for variant in variant_rows:
         vid = str(variant.get("id") or "").strip()
@@ -1348,7 +1394,8 @@ def choose_preferred_featured_mockup_candidate(
         if preferred_position and image_position and _normalize_color_name(image_position) == preferred_position:
             position_rank = 0
         default_rank = 0 if bool(image.get("is_default")) else 1
-        score = (color_rank, type_rank, position_rank, default_rank, idx)
+        framing_rank = _hoodie_sweatshirt_framing_rank(image, image_type, image_position)
+        score = (framing_rank[0], framing_rank[1], framing_rank[2], color_rank, type_rank, position_rank, default_rank, framing_rank[3], idx)
         scored_rows.append(
             (
                 score,
@@ -1692,6 +1739,30 @@ def _metadata_alias_candidates(entry: Dict[str, Any]) -> set[str]:
     return candidates
 
 
+def _is_prompt_generated_artwork_slug(value: str) -> bool:
+    normalized = slugify(value)
+    if not normalized:
+        return False
+    return (
+        normalized.startswith("generated-art")
+        or normalized.startswith("prompt-apparel-")
+        or normalized.startswith("prompt-poster-")
+        or normalized.startswith("prompt-blanket-")
+        or normalized.startswith("prompt-square-")
+    )
+
+
+def _should_bypass_sidecar_for_prompt_generated_artwork(*, path: pathlib.Path, sidecar_metadata: Dict[str, Any]) -> bool:
+    if not _is_prompt_generated_artwork_slug(path.stem):
+        return False
+    provenance = str(sidecar_metadata.get("metadata_provenance") or "").strip().lower()
+    # Generated prompt-art stems are reused across runs; without explicit fresh provenance,
+    # sidecars are treated as untrusted to avoid stale cross-artwork title leakage.
+    if provenance.startswith("prompt_art_run:"):
+        return False
+    return True
+
+
 def _resolve_unique_alias_match(
     metadata_map: Dict[str, Dict[str, Any]],
     *,
@@ -1725,6 +1796,19 @@ def resolve_artwork_metadata_with_source(
     sidecar_path = path.with_suffix(".json")
     if sidecar_path.exists() and sidecar_path.is_file():
         sidecar_metadata = load_artwork_metadata(sidecar_path)
+        if _should_bypass_sidecar_for_prompt_generated_artwork(path=path, sidecar_metadata=sidecar_metadata):
+            fallback_key = slugify(path.stem) or slugify(path.name) or "unknown"
+            logger.warning(
+                "Content metadata sidecar bypass artwork=%s reason=prompt_generated_artwork_reused_slug sidecar=%s",
+                path.name,
+                sidecar_path.name,
+            )
+            return {}, {
+                "source": "sidecar_bypass_prompt_generated",
+                "key": fallback_key,
+                "reason": "prompt_generated_reused_slug_sidecar_bypassed",
+                "weak_fallback_reason": "prompt_generated_reused_slug_sidecar_bypassed",
+            }
         normalized_stem = slugify(path.stem)
         stronger_wins = bool(normalized_stem and metadata_map.get(normalized_stem))
         if not stronger_wins and metadata_map:
@@ -2002,6 +2086,8 @@ def filename_title_quality_reason(value: str) -> str:
     lowered = value.strip().lower()
     if not lowered:
         return "empty"
+    if _is_prompt_generated_artwork_slug(lowered):
+        return "prompt_generated_slug"
     if re.fullmatch(r"[a-f0-9]{24,64}", lowered):
         return "hex_like"
     if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", lowered):
@@ -2042,6 +2128,10 @@ def _select_fallback_title_phrase(*, artwork: Artwork, quality_reason: str) -> s
         value = metadata.get(key)
         if isinstance(value, str) and value.strip():
             candidates.append(value.strip())
+    for tag in _split_keywords(metadata.get("tags")):
+        cleaned_tag = normalize_theme_tag(tag)
+        if cleaned_tag and cleaned_tag not in TAG_GENERIC_TOKENS:
+            candidates.append(cleaned_tag)
     style_keywords = _split_keywords(metadata.get("style_keywords"))
     seo_keywords = _split_keywords(metadata.get("seo_keywords"))
     if style_keywords:
@@ -2076,6 +2166,10 @@ def resolve_artwork_title(template: ProductTemplate, artwork: Artwork) -> TitleR
     product_label = (template.product_type_label or template.shopify_product_type or content_engine.family_title_suffix(template) or "Product").strip()
     base_title = _select_fallback_title_phrase(artwork=artwork, quality_reason=quality_reason)
     fallback = base_title.strip()
+    if quality_reason == "prompt_generated_slug" and _is_weak_title_phrase(fallback):
+        fallback = ""
+    if quality_reason == "prompt_generated_slug" and not fallback:
+        fallback = product_label or "Product"
     if product_label and not title_semantically_includes_product_label(fallback, product_label):
         fallback = f"{fallback} {product_label}".strip()
     return TitleResolution(filename_stem, fallback, "fallback", quality_reason)
