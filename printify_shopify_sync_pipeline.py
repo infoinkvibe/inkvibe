@@ -111,6 +111,12 @@ PRODUCTION_BASELINE_TEMPLATE_KEYS = (
     "sticker_kisscut",
 )
 
+TEMPLATE_FIT_POLICY_VALUES = {"placement_defined", "contain_required", "cover_required"}
+TEMPLATE_COVER_BEHAVIOR_VALUES = {"unspecified", "contain_preferred", "allow_safe_crop", "require_full_cover"}
+TEMPLATE_HIGH_RES_INTENT_VALUES = {"standard", "high_resolution_required"}
+TEMPLATE_CROP_TOLERANCE_VALUES = {"unspecified", "none", "safe", "moderate"}
+TEMPLATE_CERTIFICATION_STAGE_VALUES = {"none", "candidate", "production_ready"}
+
 AI_PRODUCT_COPY_MODEL_DEFAULT = os.getenv("OPENAI_MODEL", product_copy_generator.DEFAULT_COPY_MODEL)
 ENABLE_AI_PRODUCT_COPY_DEFAULT = os.getenv("ENABLE_AI_PRODUCT_COPY", "").strip().lower() in {"1", "true", "yes", "on"}
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
@@ -560,6 +566,12 @@ class ProductTemplate:
     storefront_display_color_rotation_seed: Optional[str] = None
     storefront_default_color_candidates: List[str] = field(default_factory=list)
     artwork_routing_family: Optional[str] = None
+    artwork_fit_policy: str = "placement_defined"
+    cover_behavior: str = "unspecified"
+    high_resolution_intent: str = "standard"
+    crop_tolerance: str = "unspecified"
+    requires_certification: bool = False
+    certification_stage: str = "none"
 
 
 @dataclass
@@ -7095,6 +7107,68 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
             raise TemplateValidationError(
                 f"Template[{index}] artwork_routing_family must be one of {[APPAREL_FAMILY, POSTER_FAMILY, BLANKET_FAMILY, SQUARE_FAMILY, 'single']}"
             )
+    fit_policy = str(row.get("artwork_fit_policy", "placement_defined")).strip().lower() or "placement_defined"
+    if fit_policy not in TEMPLATE_FIT_POLICY_VALUES:
+        raise TemplateValidationError(
+            f"Template[{index}] artwork_fit_policy must be one of {sorted(TEMPLATE_FIT_POLICY_VALUES)}"
+        )
+    cover_behavior = str(row.get("cover_behavior", "unspecified")).strip().lower() or "unspecified"
+    if cover_behavior not in TEMPLATE_COVER_BEHAVIOR_VALUES:
+        raise TemplateValidationError(
+            f"Template[{index}] cover_behavior must be one of {sorted(TEMPLATE_COVER_BEHAVIOR_VALUES)}"
+        )
+    high_res_intent = str(row.get("high_resolution_intent", "standard")).strip().lower() or "standard"
+    if high_res_intent not in TEMPLATE_HIGH_RES_INTENT_VALUES:
+        raise TemplateValidationError(
+            f"Template[{index}] high_resolution_intent must be one of {sorted(TEMPLATE_HIGH_RES_INTENT_VALUES)}"
+        )
+    crop_tolerance = str(row.get("crop_tolerance", "unspecified")).strip().lower() or "unspecified"
+    if crop_tolerance not in TEMPLATE_CROP_TOLERANCE_VALUES:
+        raise TemplateValidationError(
+            f"Template[{index}] crop_tolerance must be one of {sorted(TEMPLATE_CROP_TOLERANCE_VALUES)}"
+        )
+    if row.get("requires_certification") is not None and not isinstance(row.get("requires_certification"), bool):
+        raise TemplateValidationError(f"Template[{index}] requires_certification must be boolean when provided")
+    certification_stage = str(row.get("certification_stage", "none")).strip().lower() or "none"
+    if certification_stage not in TEMPLATE_CERTIFICATION_STAGE_VALUES:
+        raise TemplateValidationError(
+            f"Template[{index}] certification_stage must be one of {sorted(TEMPLATE_CERTIFICATION_STAGE_VALUES)}"
+        )
+    placement_fit_modes = {
+        str(placement.get("artwork_fit_mode", "contain")).strip().lower() or "contain"
+        for placement in row.get("placements", [])
+    }
+    if fit_policy == "contain_required" and "cover" in placement_fit_modes:
+        raise TemplateValidationError(
+            f"Template[{index}] artwork_fit_policy=contain_required is incompatible with cover placements"
+        )
+    if fit_policy == "cover_required" and "contain" in placement_fit_modes:
+        raise TemplateValidationError(
+            f"Template[{index}] artwork_fit_policy=cover_required is incompatible with contain placements"
+        )
+    has_cover_placement = "cover" in placement_fit_modes
+    if cover_behavior in {"allow_safe_crop", "require_full_cover"} and not has_cover_placement:
+        raise TemplateValidationError(
+            f"Template[{index}] cover_behavior={cover_behavior} requires at least one cover placement"
+        )
+    if cover_behavior == "require_full_cover":
+        ratio = float(row.get("min_effective_cover_ratio", 0))
+        if ratio < 1.0:
+            raise TemplateValidationError(
+                f"Template[{index}] cover_behavior=require_full_cover requires min_effective_cover_ratio >= 1.0"
+            )
+    if high_res_intent == "high_resolution_required" and not bool(row.get("high_resolution_family", False)):
+        raise TemplateValidationError(
+            f"Template[{index}] high_resolution_intent=high_resolution_required requires high_resolution_family=true"
+        )
+    if crop_tolerance == "none" and has_cover_placement:
+        raise TemplateValidationError(
+            f"Template[{index}] crop_tolerance=none is incompatible with cover placements"
+        )
+    if bool(row.get("requires_certification", False)) and certification_stage != "production_ready":
+        raise TemplateValidationError(
+            f"Template[{index}] requires_certification=true requires certification_stage=production_ready"
+        )
 
 
 def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
@@ -7198,6 +7272,12 @@ def load_templates(config_path: pathlib.Path) -> List[ProductTemplate]:
                 storefront_display_color_rotation_seed=str(row.get("storefront_display_color_rotation_seed", "")).strip() or None,
                 storefront_default_color_candidates=[str(v) for v in row.get("storefront_default_color_candidates", [])],
                 artwork_routing_family=str(row.get("artwork_routing_family", "")).strip().lower() or None,
+                artwork_fit_policy=str(row.get("artwork_fit_policy", "placement_defined")).strip().lower() or "placement_defined",
+                cover_behavior=str(row.get("cover_behavior", "unspecified")).strip().lower() or "unspecified",
+                high_resolution_intent=str(row.get("high_resolution_intent", "standard")).strip().lower() or "standard",
+                crop_tolerance=str(row.get("crop_tolerance", "unspecified")).strip().lower() or "unspecified",
+                requires_certification=bool(row.get("requires_certification", False)),
+                certification_stage=str(row.get("certification_stage", "none")).strip().lower() or "none",
                 placements=[PlacementRequirement(**p) for p in row.get("placements", [])],
             )
         )

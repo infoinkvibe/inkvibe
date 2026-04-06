@@ -57,5 +57,11 @@
   "shipping_basis_for_margin": "cost",
   "disable_variants_below_margin_floor": true,
   "reprice_variants_to_margin_floor": true,
-  "mark_template_nonviable_if_needed": true
+  "mark_template_nonviable_if_needed": true,
+  "artwork_fit_policy": "cover_required",
+  "cover_behavior": "require_full_cover",
+  "high_resolution_intent": "high_resolution_required",
+  "crop_tolerance": "safe",
+  "requires_certification": true,
+  "certification_stage": "production_ready"
 }
