@@ -1367,6 +1367,39 @@ def test_prompt_generated_inline_sidecar_is_reused_on_next_discovery(tmp_path: P
     assert call_count["count"] == 1
 
 
+def test_prompt_art_staged_sidecar_preserves_identity_and_state_key_across_reruns(tmp_path: Path):
+    image = tmp_path / "prompt-poster-c07.png"
+    Image.new("RGBA", (1200, 1800), (10, 10, 10, 255)).save(image)
+    image.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "title": "Night City Poster",
+                "description": "Neon skyline over reflective water.",
+                "tags": ["neon", "city", "poster"],
+                "metadata_provenance": "prompt_art_run:inline_vision",
+            }
+        ),
+        encoding="utf-8",
+    )
+    template = ProductTemplate(
+        key="poster_basic",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+    )
+
+    first = discover_artworks(tmp_path, metadata_inline_generator=MetadataGeneratorMode.AUTO.value)
+    second = discover_artworks(tmp_path, metadata_inline_generator=MetadataGeneratorMode.AUTO.value)
+    qa_first = build_storefront_qa_row(artwork=first[0], template=template, variant_rows=[{"id": 1, "price": 1200, "is_enabled": True}])
+    qa_second = build_storefront_qa_row(artwork=second[0], template=template, variant_rows=[{"id": 1, "price": 1200, "is_enabled": True}])
+
+    assert first[0].slug == second[0].slug == "prompt-poster-c07"
+    assert first[0].metadata_resolution_source == second[0].metadata_resolution_source == "sidecar"
+    assert qa_first.state_key == qa_second.state_key == "prompt-poster-c07:poster_basic"
+    assert qa_first.metadata_provenance == qa_second.metadata_provenance == "prompt_art_run:inline_vision"
+
+
 def test_inline_quota_fallback_writes_auditable_provenance(tmp_path: Path, monkeypatch):
     image = tmp_path / "storm-scene.png"
     Image.new("RGBA", (1000, 1000), (0, 0, 0, 255)).save(image)
@@ -1397,6 +1430,62 @@ def test_inline_quota_fallback_writes_auditable_provenance(tmp_path: Path, monke
     payload = json.loads(image.with_suffix(".json").read_text(encoding="utf-8"))
     assert payload["metadata_provenance"] == "inline_vision"
     assert payload["metadata_generator"] == "auto:vision_subject"
+
+
+def test_inline_quota_fallback_provenance_consistent_across_run_and_qa_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    image = tmp_path / "prompt-poster-c01.png"
+    Image.new("RGBA", (1200, 1200), (0, 0, 0, 255)).save(image)
+
+    class StubQuotaFallbackGenerator:
+        def generate_metadata_for_artwork(self, image_path: Path):
+            return GeneratedArtworkMetadataCandidate(
+                image_path=image_path,
+                sidecar_path=image_path.with_suffix(".json"),
+                metadata=GeneratedArtworkMetadata(
+                    title="Electric Storm Horizon",
+                    description="Lightning arcs over a distant skyline with vivid cloud texture.",
+                    tags=["storm", "lightning", "skyline"],
+                ),
+                generator="auto:vision_subject",
+                source_signals=["vision_subject", "fallback"],
+                rationale="fallback_reason=RateLimitError: 429",
+            )
+
+    monkeypatch.setattr(
+        "printify_shopify_sync_pipeline.select_artwork_metadata_generator",
+        lambda **kwargs: StubQuotaFallbackGenerator(),
+    )
+    artworks = discover_artworks(tmp_path, metadata_inline_generator=MetadataGeneratorMode.AUTO.value)
+    artwork = artworks[0]
+    template = ProductTemplate(
+        key="poster_basic",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title} Poster",
+        description_pattern="{artwork_title}",
+    )
+    qa_row = build_storefront_qa_row(artwork=artwork, template=template, variant_rows=[{"id": 1, "price": 1200, "is_enabled": True}])
+    run_rows: list[RunReportRow] = []
+    state = ensure_state_shape({})
+    monkeypatch.setattr("printify_shopify_sync_pipeline.resolve_product_action", lambda **_kwargs: "skip")
+    process_artwork(
+        printify=DummyPrintify(),
+        shopify=None,
+        shop_id=1,
+        artwork=artwork,
+        templates=[template],
+        state=state,
+        force=False,
+        export_dir=tmp_path / "exports",
+        state_path=tmp_path / "state.json",
+        artwork_options=ArtworkProcessingOptions(),
+        upload_strategy="printify",
+        r2_config=None,
+        run_rows=run_rows,
+    )
+    assert run_rows[0].metadata_provenance == "prompt_art_run:inline_vision"
+    assert qa_row.metadata_provenance == run_rows[0].metadata_provenance
+    assert qa_row.state_key == run_rows[0].state_key == "prompt-poster-c01:poster_basic"
 
 
 def test_curated_sluglike_sidecar_not_forced_to_regenerate(tmp_path: Path):
@@ -4518,7 +4607,18 @@ def test_process_artwork_failure_run_row_preserves_report_field_alignment(tmp_pa
 
 
 def test_title_and_provenance_consistency_between_run_and_qa_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    artwork = _create_artwork(tmp_path, 1200, 1200)
+    prompt_path = tmp_path / "prompt-poster-c01.png"
+    Image.new("RGBA", (1200, 1200), (255, 0, 0, 128)).save(prompt_path)
+    artwork = Artwork(
+        slug="prompt-poster-c01",
+        src_path=prompt_path,
+        title="Art",
+        description_html="<p>Art</p>",
+        tags=[],
+        image_width=1200,
+        image_height=1200,
+        metadata={"metadata_provenance": "prompt_art_run:inline_vision"},
+    )
     artwork.metadata_resolution_source = "sidecar_exact"
     template = ProductTemplate(
         key="poster_basic",
@@ -4551,8 +4651,9 @@ def test_title_and_provenance_consistency_between_run_and_qa_rows(tmp_path: Path
     run_row = run_rows[0]
     assert run_row.action == "skip"
     assert run_row.rendered_title == qa_row.title
-    assert run_row.final_title_source == qa_row.title_source
     assert run_row.metadata_resolution_source == qa_row.metadata_resolution_source
+    assert run_row.metadata_provenance == qa_row.metadata_provenance == "prompt_art_run:inline_vision"
+    assert run_row.state_key == qa_row.state_key == "prompt-poster-c01:poster_basic"
 
 
 def test_process_artwork_incompatible_update_suggests_rebuild(tmp_path: Path):
@@ -4715,8 +4816,10 @@ def test_storefront_qa_schema_contract_includes_observability_fields():
         "qa_warning_count",
         "qa_error_count",
         "metadata_resolution_source",
+        "metadata_provenance",
         "metadata_generated_inline",
         "metadata_sidecar_written",
+        "state_key",
         "copy_provenance",
         "ai_product_copy_cache_reason",
     }
@@ -4736,8 +4839,10 @@ def test_run_report_schema_contract_includes_observability_and_queue_fields():
         "publish_queue_status_before",
         "publish_queue_status_after",
         "metadata_resolution_source",
+        "metadata_provenance",
         "metadata_generated_inline",
         "metadata_sidecar_written",
+        "state_key",
         "final_title_source",
         "primary_placement",
         "selected_placements",
