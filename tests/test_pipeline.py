@@ -6874,6 +6874,75 @@ def _corner_alpha_values(image: Image.Image) -> Tuple[int, int, int, int]:
     )
 
 
+def _alpha_bbox(image: Image.Image, *, min_alpha: int = 16) -> Tuple[int, int, int, int] | None:
+    rgba = image.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    return alpha.point(lambda a: 255 if a >= min_alpha else 0).getbbox()
+
+
+def _has_color_near(image: Image.Image, rgb: Tuple[int, int, int], *, tolerance: int = 18) -> bool:
+    rgba = image.convert("RGBA")
+    target_r, target_g, target_b = rgb
+    colors = rgba.getcolors(maxcolors=4096)
+    if colors is not None:
+        for _count, (r, g, b, a) in colors:
+            if a <= 0:
+                continue
+            if (
+                abs(r - target_r) <= tolerance
+                and abs(g - target_g) <= tolerance
+                and abs(b - target_b) <= tolerance
+            ):
+                return True
+        return False
+    pixels = rgba.load()
+    width, height = rgba.size
+    for y in range(height):
+        for x in range(width):
+            r, g, b, a = pixels[x, y]
+            if a <= 0:
+                continue
+            if (
+                abs(r - target_r) <= tolerance
+                and abs(g - target_g) <= tolerance
+                and abs(b - target_b) <= tolerance
+            ):
+                return True
+    return False
+
+
+def _build_center_marker_fixture(path: Path, *, size: Tuple[int, int]) -> None:
+    width, height = size
+    image = Image.new("RGBA", size, (0, 0, 0, 0))
+    cx = width // 2
+    cy = height // 2
+    marker_half_w = max(20, width // 8)
+    marker_half_h = max(20, height // 8)
+    image.paste(
+        (230, 0, 230, 255),
+        (cx - marker_half_w, cy - marker_half_h, cx + marker_half_w, cy + marker_half_h),
+    )
+    image.save(path)
+
+
+def _build_wide_cover_crop_fixture(path: Path, *, size: Tuple[int, int]) -> None:
+    width, height = size
+    image = Image.new("RGBA", size, (0, 200, 0, 255))
+    strip = max(64, width // 12)
+    image.paste((240, 20, 20, 255), (0, 0, strip, height))
+    image.paste((20, 20, 240, 255), (width - strip, 0, width, height))
+    image.save(path)
+
+
+def _build_tall_cover_crop_fixture(path: Path, *, size: Tuple[int, int]) -> None:
+    width, height = size
+    image = Image.new("RGBA", size, (0, 200, 0, 255))
+    strip = max(64, height // 12)
+    image.paste((240, 20, 20, 255), (0, 0, width, strip))
+    image.paste((20, 20, 240, 255), (0, height - strip, width, height))
+    image.save(path)
+
+
 def test_golden_focus_templates_transform_and_primary_placement_regression():
     templates = {template.key: template for template in load_templates(Path("product_templates.json"))}
     portrait = Artwork("portrait", Path("portrait.png"), "Portrait", "", [], 1200, 1800)
@@ -6916,6 +6985,129 @@ def test_golden_focus_templates_transform_and_primary_placement_regression():
     assert tote.preferred_primary_placement == "front"
     assert tote.publish_only_primary_placement is True
     assert tote.active_placements == ["front"]
+
+
+@pytest.mark.parametrize("template_key", ["poster_basic", "tote_basic"])
+def test_pixel_fixture_contain_templates_preserve_transparent_padding_and_centering(tmp_path: Path, template_key: str):
+    template = next(t for t in load_templates(Path("product_templates.json")) if t.key == template_key)
+    placement = template.placements[0]
+    art_path = tmp_path / f"{template_key}-center-fixture.png"
+    _build_center_marker_fixture(art_path, size=(1600, 900))
+    artwork = Artwork(f"{template_key}-center-fixture", art_path, "Fixture", "", [], 1600, 900)
+
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        template=template,
+        template_key=template_key,
+        allow_upscale=False,
+        upscale_method="nearest",
+        skip_undersized=False,
+    )
+
+    assert result.final_size == (placement.width_px, placement.height_px)
+    assert result.action in {"contained_padded", "contained_padded_upscale"}
+    assert _corner_alpha_values(result.image) == (0, 0, 0, 0)
+    assert _has_color_near(result.image, (230, 0, 230))
+
+    bbox = _alpha_bbox(result.image, min_alpha=64)
+    assert bbox is not None
+    center_x = (bbox[0] + bbox[2] - 1) / 2
+    center_y = (bbox[1] + bbox[3] - 1) / 2
+    assert center_x == pytest.approx(placement.width_px / 2, abs=1.0)
+    assert center_y == pytest.approx(placement.height_px / 2, abs=1.0)
+
+
+@pytest.mark.parametrize("template_key", ["framed_poster_basic", "canvas_basic"])
+def test_pixel_fixture_cover_templates_crop_side_strips_and_fill_canvas(tmp_path: Path, template_key: str):
+    template = next(t for t in load_templates(Path("product_templates.json")) if t.key == template_key)
+    placement = template.placements[0]
+    art_path = tmp_path / f"{template_key}-wide-cover-fixture.png"
+    _build_wide_cover_crop_fixture(art_path, size=(7000, placement.height_px))
+    artwork = Artwork(f"{template_key}-wide-cover-fixture", art_path, "Fixture", "", [], 7000, placement.height_px)
+
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        template=template,
+        template_key=template_key,
+        allow_upscale=False,
+        upscale_method="nearest",
+        skip_undersized=False,
+    )
+
+    assert result.final_size == (placement.width_px, placement.height_px)
+    assert result.action == "covered_cropped"
+    assert _corner_alpha_values(result.image) == (255, 255, 255, 255)
+    assert _has_color_near(result.image, (0, 200, 0))
+    assert _has_color_near(result.image, (240, 20, 20)) is False
+    assert _has_color_near(result.image, (20, 20, 240)) is False
+
+
+def test_pixel_fixture_blanket_cover_crop_removes_top_and_bottom_markers(tmp_path: Path):
+    template = next(t for t in load_templates(Path("product_templates.json")) if t.key == "blanket_basic")
+    placement = template.placements[0]
+    art_path = tmp_path / "blanket-tall-cover-fixture.png"
+    _build_tall_cover_crop_fixture(art_path, size=(placement.width_px, 7200))
+    artwork = Artwork("blanket-tall-cover-fixture", art_path, "Fixture", "", [], placement.width_px, 7200)
+
+    result = resolve_artwork_for_placement(
+        artwork,
+        placement,
+        template=template,
+        template_key=template.key,
+        allow_upscale=False,
+        upscale_method="nearest",
+        skip_undersized=False,
+    )
+
+    assert result.final_size == (placement.width_px, placement.height_px)
+    assert result.action == "covered_cropped"
+    assert _corner_alpha_values(result.image) == (255, 255, 255, 255)
+    assert _has_color_near(result.image, (0, 200, 0))
+    assert _has_color_near(result.image, (240, 20, 20)) is False
+    assert _has_color_near(result.image, (20, 20, 240)) is False
+
+
+def test_pixel_fixture_tote_front_center_stability_across_aspect_buckets(tmp_path: Path):
+    template = next(t for t in load_templates(Path("product_templates.json")) if t.key == "tote_basic")
+    placement = template.placements[0]
+
+    buckets = {
+        "portrait": (1800, 2800),
+        "square": (2200, 2200),
+        "landscape": (2800, 1800),
+    }
+    expected_scales = {"portrait": 0.84, "square": 0.82, "landscape": 0.82}
+
+    for name, size in buckets.items():
+        art_path = tmp_path / f"tote-{name}.png"
+        _build_center_marker_fixture(art_path, size=size)
+        artwork = Artwork(f"tote-{name}", art_path, f"Tote {name}", "", [], size[0], size[1])
+        transform = compute_placement_transform_for_artwork(placement, artwork, template.key)
+        assert transform.scale == pytest.approx(expected_scales[name], abs=1e-6)
+        assert transform.x == pytest.approx(0.5)
+        assert transform.y == pytest.approx(0.5)
+
+        result = resolve_artwork_for_placement(
+            artwork,
+            placement,
+            template=template,
+            template_key=template.key,
+            allow_upscale=False,
+            upscale_method="nearest",
+            skip_undersized=False,
+        )
+        assert result.final_size == (placement.width_px, placement.height_px)
+        assert result.action == "contained_padded"
+        assert _corner_alpha_values(result.image) == (0, 0, 0, 0)
+
+        bbox = _alpha_bbox(result.image, min_alpha=64)
+        assert bbox is not None
+        center_x = (bbox[0] + bbox[2] - 1) / 2
+        center_y = (bbox[1] + bbox[3] - 1) / 2
+        assert center_x == pytest.approx(placement.width_px / 2, abs=1.0)
+        assert center_y == pytest.approx(placement.height_px / 2, abs=1.0)
 
 
 def test_resolve_artwork_for_placement_uses_cover_for_eligible_poster_resolution(tmp_path: Path):
