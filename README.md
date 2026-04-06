@@ -505,10 +505,12 @@ Bulk safety controls:
 Reporting exports:
 - `--export-failure-report <path>`: CSV report for failed combinations.
 - `--export-run-report <path>`: CSV report for all processed combinations (success/failure/skipped).
+- `--export-certification-summary-json <path>`: JSON rollup of certification proof points (routing, placement, metadata provenance, collection scope, publish/verify).
 - Run report now includes `effective_upscale_factor`, `requested_upscale_factor`, `applied_upscale_factor`, and `upscale_capped`.
 - Poster run-report fields now include `poster_cover_eligible`, `poster_enhancement_status`, `poster_requested_upscale_factor`, `poster_applied_upscale_factor`, and `poster_fill_optimization_used`.
 - Tote run-report fields now include `tote_primary_placement` and `tote_active_placements`.
 - Merch routing report fields now include `template_family` and `product_family_label` so long-sleeve and t-shirt labels remain distinct in diagnostics.
+- See `docs/production-certification-smoke.md` for a tiny live-matrix certification recipe.
 
 Examples:
 
