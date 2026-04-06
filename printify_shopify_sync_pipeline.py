@@ -746,6 +746,9 @@ class RunReportRow:
     routed_asset_mode: str = ""
     template_family: str = ""
     product_family_label: str = ""
+    primary_placement: str = ""
+    selected_placements: str = ""
+    placement_publish_scope: str = ""
     tote_primary_placement: str = ""
     tote_active_placements: str = ""
     poster_cover_eligible: str = ""
@@ -6483,10 +6486,22 @@ def _resolve_template_placements(template: ProductTemplate, *, for_publish: bool
         placements = [placement for placement in placements if placement.placement_name.lower() in active_set]
     primary = (template.preferred_primary_placement or "").strip().lower()
     if primary:
-        placements = sorted(placements, key=lambda placement: 0 if placement.placement_name.lower() == primary else 1)
+        primary_placements = [placement for placement in placements if placement.placement_name.lower() == primary]
+        secondary_placements = [placement for placement in placements if placement.placement_name.lower() != primary]
+        placements = primary_placements + secondary_placements
     if for_publish and template.publish_only_primary_placement and primary:
         placements = [placement for placement in placements if placement.placement_name.lower() == primary]
     return placements
+
+
+def _summarize_template_placement_contract(template: ProductTemplate, *, for_publish: bool) -> Tuple[str, str, str]:
+    resolved_placements = _resolve_template_placements(template, for_publish=for_publish) or list(template.placements)
+    primary_placement = str(template.preferred_primary_placement or "").strip()
+    if not primary_placement and resolved_placements:
+        primary_placement = str(resolved_placements[0].placement_name or "").strip()
+    placement_sequence = ",".join([placement.placement_name for placement in resolved_placements])
+    placement_publish_scope = "primary_only" if template.publish_only_primary_placement else "all_active"
+    return primary_placement, placement_sequence, placement_publish_scope
 
 
 def evaluate_artwork_eligibility_for_template(
@@ -7206,8 +7221,25 @@ def _validate_template_row(row: Dict[str, Any], index: int) -> None:
                 )
     if row.get("preferred_primary_placement") is not None and not str(row.get("preferred_primary_placement")).strip():
         raise TemplateValidationError(f"Template[{index}] preferred_primary_placement cannot be blank when provided")
+    if row.get("preferred_primary_placement") is not None:
+        declared = {str(p.get("placement_name", "")).strip().lower() for p in row["placements"]}
+        preferred_primary = str(row.get("preferred_primary_placement") or "").strip().lower()
+        if preferred_primary not in declared:
+            raise TemplateValidationError(
+                f"Template[{index}] preferred_primary_placement references unknown placement '{row.get('preferred_primary_placement')}'"
+            )
+        if isinstance(row.get("active_placements"), list):
+            active = {str(name).strip().lower() for name in row.get("active_placements", []) if str(name).strip()}
+            if active and preferred_primary not in active:
+                raise TemplateValidationError(
+                    f"Template[{index}] preferred_primary_placement must be included in active_placements"
+                )
     if row.get("publish_only_primary_placement") is not None and not isinstance(row.get("publish_only_primary_placement"), bool):
         raise TemplateValidationError(f"Template[{index}] publish_only_primary_placement must be boolean when provided")
+    if bool(row.get("publish_only_primary_placement")) and not str(row.get("preferred_primary_placement") or "").strip():
+        raise TemplateValidationError(
+            f"Template[{index}] publish_only_primary_placement=true requires preferred_primary_placement"
+        )
     if "trim_artwork_bounds" in row and not isinstance(row.get("trim_artwork_bounds"), bool):
         raise TemplateValidationError(f"Template[{index}] trim_artwork_bounds must be a boolean when provided")
     if "trim_artwork_bounds_for_shirts" in row and not isinstance(row.get("trim_artwork_bounds_for_shirts"), bool):
@@ -9476,6 +9508,9 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
         orientation_report = _orientation_bucket(artwork.image_width, artwork.image_height)
         template_family_report = content_engine.infer_product_family(template)
         family_label_report = content_engine.family_title_suffix(template)
+        primary_placement_report = ""
+        selected_placements_report = ""
+        placement_publish_scope_report = ""
         tote_primary_placement_report = ""
         tote_active_placements_report = ""
         poster_cover_eligible_report = ""
@@ -9487,6 +9522,14 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
         poster_fill_optimization_used_report = False
         try:
             resolved_template = template
+            (
+                primary_placement_report,
+                selected_placements_report,
+                placement_publish_scope_report,
+            ) = _summarize_template_placement_contract(resolved_template, for_publish=True)
+            if resolved_template.key == "tote_basic":
+                tote_primary_placement_report = primary_placement_report
+                tote_active_placements_report = selected_placements_report
             if action == "skip":
                 if create_only and existing_product_id:
                     skip_reason_code = "existing_product_create_only_skip"
@@ -9536,6 +9579,9 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                         routed_asset_mode=routed_asset_mode,
                         template_family=template_family_report,
                         product_family_label=family_label_report,
+                        primary_placement=primary_placement_report,
+                        selected_placements=selected_placements_report,
+                        placement_publish_scope=placement_publish_scope_report,
                         tote_primary_placement=tote_primary_placement_report,
                         tote_active_placements=tote_active_placements_report,
                         poster_cover_eligible=poster_cover_eligible_report,
@@ -9747,9 +9793,14 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
             eligibility_result: Optional[ArtworkEligibilityResult] = None
             failed_eligibility_placement_name = ""
             resolved_placements = _resolve_template_placements(resolved_template, for_publish=True) or list(resolved_template.placements)
+            (
+                primary_placement_report,
+                selected_placements_report,
+                placement_publish_scope_report,
+            ) = _summarize_template_placement_contract(resolved_template, for_publish=True)
             if resolved_template.key == "tote_basic":
-                tote_primary_placement_report = str(resolved_template.preferred_primary_placement or "")
-                tote_active_placements_report = ",".join([p.placement_name for p in resolved_placements])
+                tote_primary_placement_report = primary_placement_report
+                tote_active_placements_report = selected_placements_report
                 logger.info(
                     "Tote placement plan template=%s preferred_primary=%s active=%s publish_only_primary=%s",
                     resolved_template.key,
@@ -10297,6 +10348,9 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     routed_asset_mode=routed_asset_mode,
                     template_family=template_family_report,
                     product_family_label=family_label_report,
+                    primary_placement=primary_placement_report,
+                    selected_placements=selected_placements_report,
+                    placement_publish_scope=placement_publish_scope_report,
                     tote_primary_placement=tote_primary_placement_report,
                     tote_active_placements=tote_active_placements_report,
                     poster_cover_eligible=poster_cover_eligible_report,
@@ -10426,6 +10480,9 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                         routed_asset_mode=routed_asset_mode,
                         template_family=template_family_report,
                         product_family_label=family_label_report,
+                        primary_placement=primary_placement_report,
+                        selected_placements=selected_placements_report,
+                        placement_publish_scope=placement_publish_scope_report,
                         metadata_resolution_source=artwork.metadata_resolution_source,
                         metadata_generated_inline=artwork.metadata_generated_inline,
                         metadata_sidecar_written=artwork.metadata_sidecar_written,
