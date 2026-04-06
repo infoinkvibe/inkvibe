@@ -8749,6 +8749,121 @@ def test_sync_shopify_collection_dry_run_returns_non_mutating_status():
     assert result["collection_sync_status"] == "dry-run"
 
 
+def test_sync_shopify_collection_enforcement_routes_to_family_collection_handle():
+    class EnforcementShopify:
+        dry_run = False
+
+        def __init__(self):
+            self.created = []
+            self.collections = {}
+            self.collects = set()
+
+        def find_custom_collection(self, *, handle="", title=""):
+            return None
+
+        def create_custom_collection(self, *, handle, title, description=""):
+            self.created.append(handle)
+            row = {"id": len(self.created), "handle": handle, "title": title, "body_html": description}
+            self.collections[row["id"]] = row
+            return row
+
+        def update_custom_collection(self, *, collection_id, title, description=""):
+            return self.collections[collection_id]
+
+        def is_product_in_collection(self, *, collection_id, product_id):
+            return (collection_id, product_id) in self.collects
+
+        def add_product_to_collection(self, *, collection_id, product_id):
+            self.collects.add((collection_id, product_id))
+
+        def list_product_collects(self, *, product_id):
+            return []
+
+    shopify = EnforcementShopify()
+    result = sync_shopify_collection(
+        shopify=shopify,
+        shopify_product_id="gid://shopify/Product/555",
+        collection_handle="featured",
+        collection_title="Featured",
+        collection_description="",
+        verify_membership=False,
+        enforce_family_collection_membership=True,
+        family_collection_handle="posters",
+        allowed_family_collection_handles=["hoodies", "posters"],
+    )
+    assert result["collection_sync_status"] == "created"
+    assert result["collection_handle"] == "posters"
+    assert shopify.created == ["posters"]
+
+
+def test_sync_shopify_collection_removal_modes_obey_conservative_and_strict_rules():
+    class RemovalModeShopify:
+        dry_run = False
+
+        def __init__(self):
+            self.deleted_collects = []
+            self.collects = set()
+
+        def find_custom_collection(self, *, handle="", title=""):
+            return {"id": 10, "handle": handle, "title": title, "body_html": ""}
+
+        def create_custom_collection(self, *, handle, title, description=""):
+            raise AssertionError("create_custom_collection should not be called")
+
+        def update_custom_collection(self, *, collection_id, title, description=""):
+            return {"id": collection_id, "handle": "hoodies", "title": title, "body_html": description}
+
+        def is_product_in_collection(self, *, collection_id, product_id):
+            return (collection_id, product_id) in self.collects
+
+        def add_product_to_collection(self, *, collection_id, product_id):
+            self.collects.add((collection_id, product_id))
+
+        def list_product_collects(self, *, product_id):
+            return [
+                {"id": 2000, "collection_id": 10, "collection_handle": "hoodies"},
+                {"id": 2001, "collection_id": 11, "collection_handle": "posters"},
+                {"id": 2002, "collection_id": 12, "collection_handle": "featured"},
+            ]
+
+        def delete_collect(self, *, collect_id):
+            self.deleted_collects.append(collect_id)
+
+    conservative = RemovalModeShopify()
+    conservative_result = sync_shopify_collection(
+        shopify=conservative,
+        shopify_product_id="gid://shopify/Product/555",
+        collection_handle="hoodies",
+        collection_title="Hoodies",
+        collection_description="",
+        verify_membership=False,
+        enforce_family_collection_membership=True,
+        collection_removal_mode="conservative",
+        family_collection_handle="hoodies",
+        allowed_family_collection_handles=["hoodies", "posters"],
+    )
+    assert conservative_result["collection_sync_status"] == "synced"
+    assert conservative_result["removed_collection_ids"] == ["11"]
+    assert conservative.deleted_collects == [2001]
+
+    strict = RemovalModeShopify()
+    strict_result = sync_shopify_collection(
+        shopify=strict,
+        shopify_product_id="gid://shopify/Product/555",
+        collection_handle="hoodies",
+        collection_title="Hoodies",
+        collection_description="",
+        verify_membership=False,
+        enforce_family_collection_membership=True,
+        collection_removal_mode="strict",
+        family_collection_handle="hoodies",
+        allowed_family_collection_handles=["hoodies", "posters"],
+    )
+    assert strict_result["collection_sync_status"] == "synced"
+    assert strict_result["removed_collection_ids"] == ["11", "12"]
+    assert strict.deleted_collects == [2001, 2002]
+
+
 def test_family_collection_mapping_routes_active_families_correctly():
     templates = load_templates(Path("product_templates.json"))
     actual = {template.key: resolve_family_collection_target(template).get("handle", "") for template in templates}
@@ -8768,6 +8883,38 @@ def test_family_collection_mapping_routes_active_families_correctly():
     assert actual["travel_mug_basic"] == "travel-mugs"
     assert actual["blanket_basic"] == "blankets"
     assert actual["throw_pillow_basic"] == "throw-pillows"
+
+
+def test_collection_recommendations_keep_poster_scoped_to_wall_art(tmp_path: Path):
+    template = ProductTemplate(
+        key="poster_basic",
+        printify_blueprint_id=3,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[PlacementRequirement("front", 100, 100)],
+    )
+    org = build_normalized_shopify_organization(template, _create_artwork(tmp_path, 1200, 1800))
+    assert org["primary_collection_handle"] == "posters"
+    assert "family-poster" in org["recommended_smart_collection_tags"]
+    assert "dept-wall-art" in org["recommended_smart_collection_tags"]
+    assert "dept-home-decor" not in org["recommended_smart_collection_tags"]
+
+
+def test_collection_recommendations_prevent_apparel_leakage_into_decor(tmp_path: Path):
+    template = ProductTemplate(
+        key="hoodie_gildan",
+        printify_blueprint_id=12,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{artwork_title}",
+        placements=[PlacementRequirement("front", 100, 100)],
+    )
+    org = build_normalized_shopify_organization(template, _create_artwork(tmp_path, 1800, 1800))
+    assert org["primary_collection_handle"] == "hoodies"
+    assert "dept-apparel" in org["recommended_smart_collection_tags"]
+    assert "dept-home-decor" not in org["recommended_smart_collection_tags"]
+    assert "dept-wall-art" not in org["recommended_smart_collection_tags"]
 
 
 def test_active_taxonomy_product_type_strings_remain_consistent(tmp_path: Path):

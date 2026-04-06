@@ -4892,6 +4892,17 @@ def sync_shopify_collection(
     result["collection_sync_attempted"] = True
     resolved_handle = normalized_handle or slugify(normalized_title)
     resolved_title = normalized_title or normalized_handle.replace("-", " ").title()
+    normalized_family_handle = family_collection_handle.strip()
+    if enforce_family_collection_membership and normalized_family_handle:
+        if resolved_handle and resolved_handle != normalized_family_handle:
+            logger.info(
+                "Collection enforcement overriding requested handle=%s with family handle=%s",
+                resolved_handle,
+                normalized_family_handle,
+            )
+        resolved_handle = normalized_family_handle
+        if not resolved_title or normalized_handle != normalized_family_handle:
+            resolved_title = normalized_family_handle.replace("-", " ").title()
 
     try:
         target_handles = [resolved_handle, *secondary_handles]
