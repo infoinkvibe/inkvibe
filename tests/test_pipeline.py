@@ -5210,6 +5210,111 @@ def test_preflight_classifies_wrong_catalog_family_before_zero_variant_filtering
     assert row.fallback_discovery_reason.startswith("template_mapping_family_mismatch:")
 
 
+def test_preflight_reports_wall_art_capability_warning_for_missing_required_placement():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [{"id": 852, "title": "Matte Posters"}]
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 73, "title": "Print Provider"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [
+                {
+                    "id": 1,
+                    "is_available": True,
+                    "cost": 1400,
+                    "price": 2600,
+                    "options": {"Size": '18" x 24"'},
+                    "placeholders": [{"position": "back"}],
+                }
+            ]
+
+    template = ProductTemplate(
+        "poster_basic",
+        852,
+        73,
+        "{artwork_title}",
+        "{artwork_title}",
+        placements=[PlacementRequirement("front", 4500, 5400)],
+    )
+    passed, issues, rows = preflight_active_templates(printify=DummyPrintify(), templates=[template], explicit_template_keys=[])
+    assert issues == []
+    assert len(passed) == 1
+    row = rows[0]
+    assert row.classification == ""
+    assert row.capability_contract_status == "warning"
+    assert "required placements missing from provider schema" in row.capability_warning_reasons
+    assert '"front"' in row.required_placements
+    assert '"back"' in row.available_placements
+
+
+def test_preflight_phone_case_and_sticker_schema_mismatch_classification_stability():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [{"id": 9, "title": "Unisex Tee"}]
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 99, "title": "Provider"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [{"id": 1, "is_available": True, "options": {"Color": "Black", "Size": "M"}}]
+
+    phone_case = ProductTemplate("phone_case_basic", 9, 99, "{artwork_title}", "{artwork_title}")
+    sticker = ProductTemplate("sticker_kisscut", 9, 99, "{artwork_title}", "{artwork_title}")
+    _, issues, rows = preflight_active_templates(printify=DummyPrintify(), templates=[phone_case, sticker], explicit_template_keys=[])
+    by_key = {row.template_key: row for row in rows}
+    issue_classes = {issue.template_key: issue.classification for issue in issues}
+    assert issue_classes["phone_case_basic"] == "wrong_catalog_family"
+    assert issue_classes["sticker_kisscut"] == "wrong_catalog_family"
+    assert by_key["phone_case_basic"].classification == "wrong_catalog_family"
+    assert by_key["sticker_kisscut"].classification == "wrong_catalog_family"
+    assert "schema mismatch" in by_key["phone_case_basic"].family_mismatch_reason.lower()
+    assert "schema mismatch" in by_key["sticker_kisscut"].family_mismatch_reason.lower()
+
+
+def test_preflight_capability_contract_fields_are_visible_in_report_rows():
+    class DummyPrintify:
+        def list_blueprints(self):
+            return [{"id": 906, "title": "Kiss-Cut Stickers"}]
+
+        def list_print_providers(self, blueprint_id):
+            return [{"id": 36, "title": "SPOKE Custom Products"}]
+
+        def list_variants(self, blueprint_id, provider_id):
+            return [
+                {
+                    "id": 1,
+                    "is_available": True,
+                    "cost": 300,
+                    "price": 900,
+                    "options": {"Shape": "Kiss-Cut", "Size": '3" × 3"', "Quantity": "10 pcs"},
+                    "placeholders": [{"position": "front"}],
+                }
+            ]
+
+    template = ProductTemplate(
+        "sticker_kisscut",
+        906,
+        36,
+        "{artwork_title}",
+        "{artwork_title}",
+        placements=[PlacementRequirement("front", 1200, 1200)],
+        enabled_variant_option_filters={"size": ['3" × 3"'], "quantity": ["10 pcs"]},
+    )
+    passed, issues, rows = preflight_active_templates(printify=DummyPrintify(), templates=[template], explicit_template_keys=[])
+    assert len(passed) == 1
+    assert issues == []
+    row = rows[0]
+    assert row.capability_contract_status == "ok"
+    assert row.capability_warning_reasons == "[]"
+    assert row.required_placements == '["front"]'
+    assert row.available_placements == '["front"]'
+    assert '"quantity"' in row.required_option_dimensions.lower()
+    assert '"shape"' in row.available_option_dimensions.lower()
+    assert row.required_print_area_geometry == '["front:1200x1200"]'
+
+
 def test_select_provider_for_template_discovers_family_matched_catalog_pair():
     class DummyPrintify:
         def list_blueprints(self):
