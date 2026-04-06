@@ -93,6 +93,8 @@ from printify_shopify_sync_pipeline import (
     _is_printify_product_edit_disabled_error,
     _row_status,
     write_csv_report,
+    build_certification_summary,
+    export_certification_summary_json,
     run,
     summarize_publish_queue,
     format_run_summary,
@@ -4732,6 +4734,23 @@ def test_run_report_schema_contract_includes_observability_and_queue_fields():
         "metadata_generated_inline",
         "metadata_sidecar_written",
         "final_title_source",
+    }
+    assert expected.issubset(columns)
+
+
+def test_run_report_schema_contract_includes_certification_smoke_proof_fields():
+    columns = {field.name for field in fields(RunReportRow)}
+    expected = {
+        "template_family",
+        "routed_asset_family",
+        "placement_scale_used",
+        "required_placement_size",
+        "metadata_resolution_source",
+        "family_collection_handle",
+        "collection_membership_verified",
+        "publish_attempted",
+        "publish_verified",
+        "publish_outcome",
     }
     assert expected.issubset(columns)
 
@@ -9586,6 +9605,98 @@ def test_parse_args_auto_wallart_master_flag(monkeypatch):
     args = pipeline.parse_args()
     assert args.allow_upscale is True
     assert args.auto_wallart_master is True
+
+
+def test_parse_args_export_certification_summary_json(monkeypatch):
+    import printify_shopify_sync_pipeline as pipeline
+
+    monkeypatch.setattr(sys, "argv", ["prog", "--export-certification-summary-json", "reports/certification-summary.json"])
+    args = pipeline.parse_args()
+    assert args.export_certification_summary_json == "reports/certification-summary.json"
+
+
+def test_build_certification_summary_aggregates_core_proof_points(tmp_path: Path):
+    run_rows = [
+        RunReportRow(
+            timestamp="2026-04-01T00:00:00+00:00",
+            artwork_filename="poster.png",
+            artwork_slug="poster",
+            template_key="poster_basic",
+            status="success",
+            action="create",
+            blueprint_id=1,
+            provider_id=1,
+            upload_strategy="auto",
+            product_id="p1",
+            publish_attempted=True,
+            publish_verified=True,
+            rendered_title="Poster",
+            publish_outcome="completed",
+            publish_queue_status="completed",
+            source_size="6000x8000",
+            required_placement_size="4500x5400",
+            placement_scale_used="1.00",
+            metadata_resolution_source="sidecar_exact",
+            final_title_source="metadata_title",
+            template_family="poster",
+            routed_asset_family="poster",
+            family_collection_handle="family-poster",
+            collection_membership_verified=True,
+            collection_sync_attempted=True,
+        )
+    ]
+    qa_rows = [
+        StorefrontQaRow(
+            artwork_filename="poster.png",
+            artwork_slug="poster",
+            template_key="poster_basic",
+            title="Poster",
+            title_source="metadata_title",
+            title_quality="strong",
+            title_warnings="",
+            description_preview="desc",
+            description_warnings="",
+            tags_preview="a,b",
+            tag_count=2,
+            tag_warnings="",
+            blueprint_id=1,
+            provider_id=1,
+            enabled_variant_count=1,
+            option_names="size",
+            sale_price_min="19.99",
+            sale_price_max="19.99",
+            compare_at_min="24.99",
+            compare_at_max="24.99",
+            pricing_warnings="",
+            compare_at_valid=True,
+            publish_images=True,
+            publish_mockups="enabled",
+            mockup_warnings="",
+            placement_preview_context="poster/front",
+            qa_status="pass",
+            qa_warning_count=0,
+            qa_error_count=0,
+            recommended_action="publish_ready",
+            metadata_resolution_source="sidecar_exact",
+            copy_provenance="metadata",
+            ai_product_copy_cache_reason="",
+        )
+    ]
+    summary = build_certification_summary(
+        run_rows=run_rows,
+        qa_rows=qa_rows,
+        expected_template_keys=["poster_basic", "hoodie_gildan"],
+    )
+    assert summary["missing_template_keys"] == ["hoodie_gildan"]
+    assert summary["proof_points"]["family_routing"]["mismatch_rows"] == []
+    assert summary["proof_points"]["publish_verify"]["rows_with_publish_verified"] == 1
+    assert summary["proof_points"]["metadata_provenance"]["qa_copy_provenance_counts"]["metadata"] == 1
+
+    export_path = tmp_path / "certification-summary.json"
+    payload = export_certification_summary_json(path=export_path, run_rows=run_rows, qa_rows=qa_rows, expected_template_keys=["poster_basic"])
+    exported = json.loads(export_path.read_text(encoding="utf-8"))
+    assert exported["observed_template_keys"] == ["poster_basic"]
+    assert payload["proof_points"]["placement_behavior"]["rows_with_required_placement_size"] == 1
 
 
 def test_artwork_generation_target_planning_modes():

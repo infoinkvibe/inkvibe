@@ -4007,6 +4007,98 @@ def write_csv_report(path: pathlib.Path, rows: List[Dict[str, Any]], *, headers:
         writer.writerows(rows)
 
 
+def build_certification_summary(
+    *,
+    run_rows: Optional[List[RunReportRow]] = None,
+    qa_rows: Optional[List[StorefrontQaRow]] = None,
+    expected_template_keys: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    run_rows = run_rows or []
+    qa_rows = qa_rows or []
+    expected_template_keys = [key for key in (expected_template_keys or []) if key]
+    observed_template_keys = sorted({row.template_key for row in run_rows if row.template_key} | {row.template_key for row in qa_rows if row.template_key})
+    missing_template_keys = sorted(set(expected_template_keys) - set(observed_template_keys))
+    action_counts = Counter(row.action for row in run_rows if row.action)
+    status_counts = Counter(row.status for row in run_rows if row.status)
+    qa_status_counts = Counter(row.qa_status for row in qa_rows if row.qa_status)
+    family_mismatch_rows = [
+        f"{row.artwork_slug}:{row.template_key}"
+        for row in run_rows
+        if row.routed_asset_family and row.template_family and row.routed_asset_family != row.template_family
+    ]
+
+    def _truthy_count(values: List[Any]) -> int:
+        return sum(1 for value in values if bool(value))
+
+    summary = {
+        "generated_at": _utc_now_iso(),
+        "expected_template_keys": expected_template_keys,
+        "observed_template_keys": observed_template_keys,
+        "missing_template_keys": missing_template_keys,
+        "run_rows_count": len(run_rows),
+        "qa_rows_count": len(qa_rows),
+        "run_status_counts": dict(status_counts),
+        "run_action_counts": dict(action_counts),
+        "qa_status_counts": dict(qa_status_counts),
+        "proof_points": {
+            "family_routing": {
+                "rows_with_template_family": _truthy_count([row.template_family for row in run_rows]),
+                "rows_with_routed_asset_family": _truthy_count([row.routed_asset_family for row in run_rows]),
+                "mismatch_rows": family_mismatch_rows,
+            },
+            "placement_behavior": {
+                "rows_with_source_size": _truthy_count([row.source_size for row in run_rows]),
+                "rows_with_required_placement_size": _truthy_count([row.required_placement_size for row in run_rows]),
+                "rows_with_placement_scale_used": _truthy_count([row.placement_scale_used for row in run_rows]),
+                "rows_with_trimmed_bounds": _truthy_count([row.trimmed_bounds_size for row in run_rows]),
+            },
+            "metadata_provenance": {
+                "run_rows_with_metadata_resolution_source": _truthy_count([row.metadata_resolution_source for row in run_rows]),
+                "run_rows_with_final_title_source": _truthy_count([row.final_title_source for row in run_rows]),
+                "qa_rows_with_metadata_resolution_source": _truthy_count([row.metadata_resolution_source for row in qa_rows]),
+                "qa_copy_provenance_counts": dict(Counter(row.copy_provenance for row in qa_rows if row.copy_provenance)),
+            },
+            "collection_family_scope": {
+                "rows_with_family_collection_handle": _truthy_count([row.family_collection_handle for row in run_rows]),
+                "rows_with_collection_handle": _truthy_count([row.collection_handle for row in run_rows]),
+                "rows_with_collection_membership_verified": _truthy_count([row.collection_membership_verified for row in run_rows]),
+                "rows_with_collection_sync_attempted": _truthy_count([row.collection_sync_attempted for row in run_rows]),
+            },
+            "publish_verify": {
+                "rows_with_publish_attempted": _truthy_count([row.publish_attempted for row in run_rows]),
+                "rows_with_publish_verified": _truthy_count([row.publish_verified for row in run_rows]),
+                "publish_outcome_counts": dict(Counter(row.publish_outcome for row in run_rows if row.publish_outcome)),
+                "publish_queue_status_counts": dict(Counter(row.publish_queue_status_after or row.publish_queue_status for row in run_rows if (row.publish_queue_status_after or row.publish_queue_status))),
+            },
+        },
+    }
+    return summary
+
+
+def export_certification_summary_json(
+    *,
+    path: pathlib.Path,
+    run_rows: Optional[List[RunReportRow]] = None,
+    qa_rows: Optional[List[StorefrontQaRow]] = None,
+    expected_template_keys: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    payload = build_certification_summary(
+        run_rows=run_rows,
+        qa_rows=qa_rows,
+        expected_template_keys=expected_template_keys,
+    )
+    save_json_atomic(path, payload)
+    logger.info(
+        "Certification summary exported path=%s run_rows=%s qa_rows=%s expected_templates=%s missing_templates=%s",
+        path,
+        len(run_rows or []),
+        len(qa_rows or []),
+        len(expected_template_keys or []),
+        len(payload.get("missing_template_keys", [])),
+    )
+    return payload
+
+
 def export_preflight_report(path: pathlib.Path, rows: List[TemplatePreflightReportRow]) -> None:
     write_csv_report(path, [row.__dict__ for row in rows])
 
@@ -10478,6 +10570,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strict-storefront-qa", action="store_true", help="Return exit code 1 when storefront QA finds errors")
     parser.add_argument("--export-storefront-qa-report", default="", help="Optional CSV export path for storefront QA rows")
     parser.add_argument("--export-storefront-qa-json", default="", help="Optional JSON export path for storefront QA rows")
+    parser.add_argument(
+        "--export-certification-summary-json",
+        default="",
+        help="Optional JSON export that aggregates certification smoke proof points from run/storefront QA rows.",
+    )
     parser.add_argument("--sync-collections", action="store_true", help="Sync Shopify custom collections from launch-plan collection metadata")
     parser.add_argument("--skip-collections", action="store_true", help="Explicitly disable Shopify collection sync")
     parser.add_argument("--verify-collections", action="store_true", help="Read-only verify Shopify collection membership after sync")
@@ -10797,7 +10894,7 @@ def apply_high_volume_mode_defaults(
     }
 
 
-def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", auto_wallart_master: bool = False, skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", export_preflight_report_path: str = "", run_free_shipping_profit_audit_only: bool = False, free_shipping_profit_min: str = "4.00", free_shipping_profit_audit_csv_path: str = "reports/free_shipping_profit_audit.csv", free_shipping_profit_audit_json_path: str = "reports/free_shipping_profit_audit.json", allow_preflight_failures: bool = False, preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, enable_ai_product_copy: Optional[bool] = None, ai_product_copy_model: str = "", generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_openai_timeout_seconds: float = 180.0, art_openai_max_retries: int = 4, art_openai_retry_backoff_seconds: float = 2.0, art_openai_size: str = "", art_openai_portrait_size: str = "1024x1536", art_openai_square_size: str = "1024x1024", art_openai_landscape_size: str = "1536x1024", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "", max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS, interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS, catalog_cache_dir: str = CATALOG_CACHE_DIR_DEFAULT, catalog_cache_ttl_hours: int = CACHE_TTL_HOURS_DEFAULT, no_catalog_cache: bool = False, chunk_size: int = 0, pause_between_chunks_seconds: float = 0.0, catalog_request_spacing_ms: int = 0, template_spacing_ms: int = 0, artwork_spacing_ms: int = 0, resume_only_pending: bool = False, high_volume_mode: bool = False, publish_batch_size: int = 5, pause_between_publish_batches_seconds: float = 2.0, defer_publish: bool = False, resume_publish_only: bool = False, progress: Optional[bool] = None) -> None:
+def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False, allow_upscale: bool = False, upscale_method: str = "lanczos", auto_wallart_master: bool = False, skip_undersized: bool = False, image_dir: pathlib.Path = IMAGE_DIR, export_dir: pathlib.Path = EXPORT_DIR, state_path: pathlib.Path = STATE_PATH, skip_audit: bool = False, max_artworks: int = 0, batch_size: int = 0, stop_after_failures: int = 0, fail_fast: bool = False, resume: bool = False, upload_strategy: str = "auto", template_keys: Optional[List[str]] = None, limit_templates: int = 0, list_templates: bool = False, list_blueprints: bool = False, search_blueprints_query: str = "", limit_blueprints: int = 25, list_providers: bool = False, blueprint_id: int = 0, provider_id: int = 0, limit_providers: int = 25, inspect_variants: bool = False, recommend_provider: bool = False, template_file: str = "", generate_template_snippet_flag: bool = False, auto_provider: bool = False, snippet_key: str = "", template_output_file: str = "", create_only: bool = False, update_only: bool = False, rebuild_product: bool = False, publish_mode: str = "default", verify_publish: bool = False, auto_rebuild_on_incompatible_update: bool = False, sync_collections: bool = False, skip_collections: bool = False, verify_collections: bool = False, enforce_family_collection_membership: bool = False, collection_removal_mode: str = "conservative", inspect_state_key_value: str = "", list_state_keys_only: bool = False, list_failures_only: bool = False, list_pending_only: bool = False, export_failure_report: str = "", export_run_report: str = "", export_preflight_report_path: str = "", export_certification_summary_json_path: str = "", run_free_shipping_profit_audit_only: bool = False, free_shipping_profit_min: str = "4.00", free_shipping_profit_audit_csv_path: str = "reports/free_shipping_profit_audit.csv", free_shipping_profit_audit_json_path: str = "reports/free_shipping_profit_audit.json", allow_preflight_failures: bool = False, preview_listing_copy_only: bool = False, generate_artwork_metadata: bool = False, metadata_preview: bool = False, write_sidecars: bool = False, overwrite_sidecars: bool = False, metadata_max_artworks: int = 0, metadata_output_dir: str = "", metadata_only_missing: bool = True, metadata_generator: str = MetadataGeneratorMode.HEURISTIC.value, metadata_openai_model: str = "", metadata_openai_timeout: float = 30.0, metadata_auto_approve: bool = False, metadata_min_confidence: float = 0.9, metadata_review_report: str = "", metadata_review_json: str = "", metadata_write_auto_approved_only: bool = False, metadata_allow_review_writes: bool = False, auto_generate_missing_metadata: bool = True, auto_write_generated_sidecars: bool = True, metadata_inline_generator: str = MetadataGeneratorMode.AUTO.value, metadata_inline_only_when_weak: bool = True, metadata_inline_overwrite_weak_sidecars: bool = False, enable_ai_product_copy: Optional[bool] = None, ai_product_copy_model: str = "", generate_artwork_from_prompt: bool = False, art_prompt: str = "", art_count: int = 1, art_style: str = "", art_negative_prompt: str = "", art_visible_text: str = "", art_output_dir: str = "", art_base_name: str = "generated-art", art_quality: str = "high", art_background: str = "auto", art_generator: str = "openai", art_openai_model: str = "", art_openai_timeout_seconds: float = 180.0, art_openai_max_retries: int = 4, art_openai_retry_backoff_seconds: float = 2.0, art_openai_size: str = "", art_openai_portrait_size: str = "1024x1536", art_openai_square_size: str = "1024x1024", art_openai_landscape_size: str = "1536x1024", art_run_metadata: bool = False, art_run_storefront_qa: bool = False, art_publish: bool = False, art_verify_publish: bool = False, art_target_mode: str = "auto", art_family_aware: bool = False, art_family_mode: str = "auto", art_generate_poster_master: bool = False, art_generate_apparel_master: bool = False, art_mug_tote_master: str = "apparel", art_apparel_style: str = "", art_poster_style: str = "", art_skip_existing_generated: bool = False, art_dry_run_plan: bool = False, source_min_width: int = 1, source_min_height: int = 1, include_preview_assets: bool = False, launch_plan_path: str = "", export_launch_plan_template: str = "", export_launch_plan_from_images_path: str = "", include_disabled_template_rows: bool = False, launch_plan_default_enabled: bool = True, placement_preview: bool = False, storefront_qa: bool = False, strict_storefront_qa: bool = False, export_storefront_qa_report: str = "", export_storefront_qa_json: str = "", max_retry_sleep_seconds: float = MAX_RETRY_SLEEP_SECONDS, interactive_retry_cap_seconds: float = INTERACTIVE_RETRY_CAP_SECONDS, catalog_cache_dir: str = CATALOG_CACHE_DIR_DEFAULT, catalog_cache_ttl_hours: int = CACHE_TTL_HOURS_DEFAULT, no_catalog_cache: bool = False, chunk_size: int = 0, pause_between_chunks_seconds: float = 0.0, catalog_request_spacing_ms: int = 0, template_spacing_ms: int = 0, artwork_spacing_ms: int = 0, resume_only_pending: bool = False, high_volume_mode: bool = False, publish_batch_size: int = 5, pause_between_publish_batches_seconds: float = 2.0, defer_publish: bool = False, resume_publish_only: bool = False, progress: Optional[bool] = None) -> None:
     max_retry_sleep_seconds = max(0.0, float(max_retry_sleep_seconds))
     interactive_retry_cap_seconds = max(0.0, float(interactive_retry_cap_seconds))
     if resume_only_pending:
@@ -11145,6 +11242,12 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         )
         if strict_storefront_qa and any(row.qa_error_count > 0 for row in qa_rows):
             raise RuntimeError("Strict storefront QA failed due to one or more QA errors")
+        if export_certification_summary_json_path:
+            export_certification_summary_json(
+                path=pathlib.Path(export_certification_summary_json_path),
+                qa_rows=qa_rows,
+                expected_template_keys=[template.key for template in templates],
+            )
         return
 
     logger.info("Loaded %s template(s) and %s artwork file(s)", len(templates), len(artworks))
@@ -11255,6 +11358,12 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                 headers=[field.name for field in fields(RunReportRow)],
             )
             logger.info("Run report exported path=%s rows=%s", export_run_report, len(run_rows))
+        if export_certification_summary_json_path:
+            export_certification_summary_json(
+                path=pathlib.Path(export_certification_summary_json_path),
+                run_rows=run_rows,
+                expected_template_keys=[template.key for template in templates],
+            )
         save_json_atomic(state_path, state)
         log_run_summary(summary)
         return
@@ -11633,6 +11742,12 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
             headers=[field.name for field in fields(RunReportRow)],
         )
         logger.info("Run report exported path=%s rows=%s", export_run_report, len(run_rows))
+    if export_certification_summary_json_path:
+        export_certification_summary_json(
+            path=pathlib.Path(export_certification_summary_json_path),
+            run_rows=run_rows,
+            expected_template_keys=[template.key for template in templates],
+        )
 
     save_json_atomic(state_path, state)
     log_run_summary(summary)
@@ -11711,6 +11826,7 @@ if __name__ == "__main__":
             list_pending_only=args.list_pending,
             export_failure_report=args.export_failure_report,
             export_run_report=args.export_run_report,
+            export_certification_summary_json_path=args.export_certification_summary_json,
             export_preflight_report_path=args.export_preflight_report,
             run_free_shipping_profit_audit_only=args.run_free_shipping_profit_audit,
             free_shipping_profit_min=args.free_shipping_profit_min,
