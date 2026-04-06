@@ -7,14 +7,14 @@
     "description_pattern": "<p>{artwork_title}</p>",
     "enabled_colors": [],
     "enabled_sizes": [
-      "11\u2033 x 14\u2033 (Vertical)",
-      "11\u2033 x 17\u2033 (Vertical)",
-      "11\u2033 x 9\u2033 (Horizontal)",
-      "12\u2033 x 16\u2033 (Vertical)",
-      "12\u2033 x 18\u2033 (Vertical)",
-      "14\u2033 x 11\u2033 (Horizontal)",
-      "16\u2033 x 12\u2033 (Horizontal)",
-      "16\u2033 x 20\u2033 (Vertical)"
+      "11″ x 14″ (Vertical)",
+      "11″ x 17″ (Vertical)",
+      "11″ x 9″ (Horizontal)",
+      "12″ x 16″ (Vertical)",
+      "12″ x 18″ (Vertical)",
+      "14″ x 11″ (Horizontal)",
+      "16″ x 12″ (Horizontal)",
+      "16″ x 20″ (Vertical)"
     ],
     "placements": [
       {
@@ -38,6 +38,12 @@
     "style_keywords": [
       "minimal",
       "giftable"
-    ]
+    ],
+    "artwork_fit_policy": "contain_required",
+    "cover_behavior": "contain_preferred",
+    "high_resolution_intent": "standard",
+    "crop_tolerance": "none",
+    "requires_certification": false,
+    "certification_stage": "none"
   }
 ]

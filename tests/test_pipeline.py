@@ -8377,6 +8377,68 @@ def test_template_validation_rejects_invalid_max_upscale_factor(tmp_path: Path):
         load_templates(config)
 
 
+def test_template_validation_rejects_cover_required_policy_with_contain_placement(tmp_path: Path):
+    config = tmp_path / "product_templates.json"
+    config.write_text(
+        json.dumps(
+            [
+                {
+                    "key": "t1",
+                    "printify_blueprint_id": 6,
+                    "printify_print_provider_id": 99,
+                    "artwork_fit_policy": "cover_required",
+                    "placements": [{"placement_name": "front", "width_px": 1000, "height_px": 1000, "artwork_fit_mode": "contain"}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(TemplateValidationError, match=r"artwork_fit_policy=cover_required"):
+        load_templates(config)
+
+
+def test_template_validation_rejects_full_cover_contract_without_cover_ratio(tmp_path: Path):
+    config = tmp_path / "product_templates.json"
+    config.write_text(
+        json.dumps(
+            [
+                {
+                    "key": "t1",
+                    "printify_blueprint_id": 6,
+                    "printify_print_provider_id": 99,
+                    "cover_behavior": "require_full_cover",
+                    "placements": [{"placement_name": "front", "width_px": 1000, "height_px": 1000, "artwork_fit_mode": "cover"}],
+                    "min_effective_cover_ratio": 0.75,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(TemplateValidationError, match=r"cover_behavior=require_full_cover requires min_effective_cover_ratio >= 1.0"):
+        load_templates(config)
+
+
+def test_template_validation_rejects_certification_gate_without_production_ready_stage(tmp_path: Path):
+    config = tmp_path / "product_templates.json"
+    config.write_text(
+        json.dumps(
+            [
+                {
+                    "key": "t1",
+                    "printify_blueprint_id": 6,
+                    "printify_print_provider_id": 99,
+                    "requires_certification": True,
+                    "certification_stage": "candidate",
+                    "placements": [{"placement_name": "front", "width_px": 1000, "height_px": 1000}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(TemplateValidationError, match=r"requires_certification=true requires certification_stage=production_ready"):
+        load_templates(config)
+
+
 def test_filename_slug_to_title_handles_ugly_flat_tokens():
     assert filename_slug_to_title("flat,750x,075,f-pad,750x1000,f8f8f8") == "Untitled Design"
 
@@ -10422,9 +10484,27 @@ def test_template_metadata_defaults_are_populated_for_poster_and_tote():
     assert poster.seo_keywords == ["wall art poster", "vertical art print", "giftable wall decor"]
     assert poster.tags == ["poster", "wall art", "giftable decor"]
     assert poster.artwork_routing_family == POSTER_FAMILY
+    assert poster.artwork_fit_policy == "contain_required"
+    assert poster.cover_behavior == "contain_preferred"
+    assert poster.high_resolution_intent == "standard"
+    assert poster.crop_tolerance == "none"
 
     tote = by_key["tote_basic"]
     assert tote.audience == "everyday carry and gift shoppers"
+
+
+def test_cover_family_templates_have_explicit_contract_certification_fields():
+    templates = load_templates(Path("product_templates.json"))
+    by_key = {template.key: template for template in templates}
+
+    for key in ("framed_poster_basic", "canvas_basic", "blanket_basic"):
+        template = by_key[key]
+        assert template.artwork_fit_policy == "cover_required"
+        assert template.cover_behavior == "require_full_cover"
+        assert template.high_resolution_intent == "high_resolution_required"
+        assert template.crop_tolerance == "safe"
+        assert template.requires_certification is True
+        assert template.certification_stage == "production_ready"
 
 
 def test_template_audience_regression_for_mug_canvas_and_framed_poster():
