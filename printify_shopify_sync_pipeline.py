@@ -15,7 +15,7 @@ import re
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -3994,12 +3994,13 @@ def summarize_publish_queue(state: Dict[str, Any]) -> Dict[str, int]:
     return counts
 
 
-def write_csv_report(path: pathlib.Path, rows: List[Dict[str, Any]]) -> None:
+def write_csv_report(path: pathlib.Path, rows: List[Dict[str, Any]], *, headers: Optional[List[str]] = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not rows:
+    if not rows and not headers:
         path.write_text("", encoding="utf-8")
         return
-    headers = list(rows[0].keys())
+    if not headers:
+        headers = list(rows[0].keys())
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=headers)
         writer.writeheader()
@@ -8590,7 +8591,11 @@ def run_storefront_qa(
 
     _log_storefront_qa_summary(qa_rows)
     if export_csv_path:
-        write_csv_report(pathlib.Path(export_csv_path), [row.__dict__ for row in qa_rows])
+        write_csv_report(
+            pathlib.Path(export_csv_path),
+            [row.__dict__ for row in qa_rows],
+            headers=[field.name for field in fields(StorefrontQaRow)],
+        )
         logger.info("Storefront QA CSV exported path=%s rows=%s", export_csv_path, len(qa_rows))
     if export_json_path:
         save_json_atomic(pathlib.Path(export_json_path), [row.__dict__ for row in qa_rows])
@@ -10139,7 +10144,50 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     source_size=source_size_report,
                 ))
             if run_rows is not None:
-                run_rows.append(RunReportRow(datetime.now(timezone.utc).isoformat(), artwork.src_path.name, artwork.slug, template.key, "failure", action, resolved_template.printify_blueprint_id, resolved_template.printify_print_provider_id, summarize_upload_strategy(upload_map), "", False, False, rendered_title, source_size_report, trimmed_bounds_report, "", exported_canvas_report, placement_scale_report, effective_upscale_factor_report, requested_upscale_factor_report, applied_upscale_factor_report, upscale_capped_report, orientation_report, launch_plan_row, launch_plan_row_id, collection_handle, collection_title, collection_description, launch_name, campaign, merch_theme))
+                run_rows.append(
+                    RunReportRow(
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        artwork_filename=artwork.src_path.name,
+                        artwork_slug=artwork.slug,
+                        template_key=template.key,
+                        status="failure",
+                        action=action,
+                        blueprint_id=resolved_template.printify_blueprint_id,
+                        provider_id=resolved_template.printify_print_provider_id,
+                        upload_strategy=summarize_upload_strategy(upload_map),
+                        product_id="",
+                        publish_attempted=False,
+                        publish_verified=False,
+                        rendered_title=rendered_title,
+                        source_size=source_size_report,
+                        trimmed_bounds_size=trimmed_bounds_report,
+                        exported_canvas_size=exported_canvas_report,
+                        placement_scale_used=placement_scale_report,
+                        effective_upscale_factor=effective_upscale_factor_report,
+                        requested_upscale_factor=requested_upscale_factor_report,
+                        applied_upscale_factor=applied_upscale_factor_report,
+                        upscale_capped=upscale_capped_report,
+                        orientation_bucket=orientation_report,
+                        launch_plan_row=launch_plan_row,
+                        launch_plan_row_id=launch_plan_row_id,
+                        collection_handle=collection_handle,
+                        collection_title=collection_title,
+                        collection_description=collection_description,
+                        launch_name=launch_name,
+                        campaign=campaign,
+                        merch_theme=merch_theme,
+                        reason_code=_failure_reason_code(exc),
+                        routed_asset_family=routed_asset_family,
+                        routed_asset_mode=routed_asset_mode,
+                        template_family=template_family_report,
+                        product_family_label=family_label_report,
+                        metadata_resolution_source=artwork.metadata_resolution_source,
+                        metadata_generated_inline=artwork.metadata_generated_inline,
+                        metadata_sidecar_written=artwork.metadata_sidecar_written,
+                        weak_metadata_detected="|".join(artwork.weak_metadata_detected),
+                        final_title_source=title_info.title_source,
+                    )
+                )
             log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": error_result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action=action, upload_map=upload_map)
         if progress is not None:
             progress.complete_one()
@@ -11183,10 +11231,18 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
         summary.publish_rate_limit_events = publish_stats["rate_limited"]
         summary.rate_limit_events = dict(getattr(printify, "rate_limit_events", {}))
         if export_failure_report:
-            write_csv_report(pathlib.Path(export_failure_report), [row.__dict__ for row in failure_rows])
+            write_csv_report(
+                pathlib.Path(export_failure_report),
+                [row.__dict__ for row in failure_rows],
+                headers=[field.name for field in fields(FailureReportRow)],
+            )
             logger.info("Failure report exported path=%s rows=%s", export_failure_report, len(failure_rows))
         if export_run_report:
-            write_csv_report(pathlib.Path(export_run_report), [row.__dict__ for row in run_rows])
+            write_csv_report(
+                pathlib.Path(export_run_report),
+                [row.__dict__ for row in run_rows],
+                headers=[field.name for field in fields(RunReportRow)],
+            )
             logger.info("Run report exported path=%s rows=%s", export_run_report, len(run_rows))
         save_json_atomic(state_path, state)
         log_run_summary(summary)
@@ -11553,10 +11609,18 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
     progress_tracker.finish()
 
     if export_failure_report:
-        write_csv_report(pathlib.Path(export_failure_report), [row.__dict__ for row in failure_rows])
+        write_csv_report(
+            pathlib.Path(export_failure_report),
+            [row.__dict__ for row in failure_rows],
+            headers=[field.name for field in fields(FailureReportRow)],
+        )
         logger.info("Failure report exported path=%s rows=%s", export_failure_report, len(failure_rows))
     if export_run_report:
-        write_csv_report(pathlib.Path(export_run_report), [row.__dict__ for row in run_rows])
+        write_csv_report(
+            pathlib.Path(export_run_report),
+            [row.__dict__ for row in run_rows],
+            headers=[field.name for field in fields(RunReportRow)],
+        )
         logger.info("Run report exported path=%s rows=%s", export_run_report, len(run_rows))
 
     save_json_atomic(state_path, state)

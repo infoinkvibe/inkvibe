@@ -4452,7 +4452,100 @@ def test_run_resume_publish_only_empty_queue_reports_zero_processed(tmp_path: Pa
     assert summary.publish_queue_completed_count == 1
     assert summary.publish_attempts == 0
     assert summary.resumed_combinations == 0
-    assert run_report.read_text(encoding="utf-8") == ""
+    with run_report.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows == []
+
+
+def test_write_csv_report_writes_header_for_zero_rows_when_headers_provided(tmp_path: Path):
+    out = tmp_path / "zero.csv"
+    write_csv_report(out, [], headers=["col_a", "col_b"])
+    with out.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows == []
+    assert out.read_text(encoding="utf-8").strip() == "col_a,col_b"
+
+
+def test_process_artwork_failure_run_row_preserves_report_field_alignment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    class FailingPrintify(DummyPrintify):
+        dry_run = False
+
+        def upload_image(self, file_path):
+            return {"id": "upload-1"}
+
+    artwork = _create_artwork(tmp_path, 1200, 1200)
+    template = ProductTemplate(
+        key="poster_basic",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title} Poster",
+        description_pattern="{artwork_title}",
+    )
+    state = ensure_state_shape({})
+    run_rows: list[RunReportRow] = []
+    failure_rows: list[FailureReportRow] = []
+    monkeypatch.setattr("printify_shopify_sync_pipeline.upsert_in_printify", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
+    process_artwork(
+        printify=FailingPrintify(),
+        shopify=None,
+        shop_id=1,
+        artwork=artwork,
+        templates=[template],
+        state=state,
+        force=False,
+        export_dir=tmp_path / "exports",
+        state_path=tmp_path / "state.json",
+        artwork_options=ArtworkProcessingOptions(),
+        upload_strategy="printify",
+        r2_config=None,
+        run_rows=run_rows,
+        failure_rows=failure_rows,
+    )
+    assert len(run_rows) == 1
+    row = run_rows[0]
+    assert row.status == "failure"
+    assert row.source_size in {"", "1200x1200"}
+    assert row.publish_outcome == ""
+    assert row.reason_code == "runtime_api_failure"
+    assert row.final_title_source
+
+
+def test_title_and_provenance_consistency_between_run_and_qa_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    artwork = _create_artwork(tmp_path, 1200, 1200)
+    artwork.metadata_resolution_source = "sidecar_exact"
+    template = ProductTemplate(
+        key="poster_basic",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title} Poster",
+        description_pattern="{artwork_title}",
+    )
+    qa_row = build_storefront_qa_row(artwork=artwork, template=template, variant_rows=[{"id": 1, "price": 1200, "is_enabled": True}])
+
+    state = ensure_state_shape({})
+    run_rows: list[RunReportRow] = []
+    monkeypatch.setattr("printify_shopify_sync_pipeline.resolve_product_action", lambda **_kwargs: "skip")
+    process_artwork(
+        printify=DummyPrintify(),
+        shopify=None,
+        shop_id=1,
+        artwork=artwork,
+        templates=[template],
+        state=state,
+        force=False,
+        export_dir=tmp_path / "exports",
+        state_path=tmp_path / "state.json",
+        artwork_options=ArtworkProcessingOptions(),
+        upload_strategy="printify",
+        r2_config=None,
+        run_rows=run_rows,
+    )
+    assert len(run_rows) == 1
+    run_row = run_rows[0]
+    assert run_row.action == "skip"
+    assert run_row.rendered_title == qa_row.title
+    assert run_row.final_title_source == qa_row.title_source
+    assert run_row.metadata_resolution_source == qa_row.metadata_resolution_source
 
 
 def test_process_artwork_incompatible_update_suggests_rebuild(tmp_path: Path):
