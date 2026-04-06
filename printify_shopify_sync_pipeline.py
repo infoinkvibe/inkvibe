@@ -764,8 +764,10 @@ class RunReportRow:
     preferred_featured_variant_color: str = ""
     selected_featured_mockup_color: str = ""
     metadata_resolution_source: str = ""
+    metadata_provenance: str = ""
     metadata_generated_inline: bool = False
     metadata_sidecar_written: bool = False
+    state_key: str = ""
     weak_metadata_detected: str = ""
     final_title_source: str = ""
     featured_image_strategy: str = ""
@@ -836,8 +838,10 @@ class StorefrontQaRow:
     normalized_audience_keys: str = ""
     normalized_season_keys: str = ""
     metadata_resolution_source: str = ""
+    metadata_provenance: str = ""
     metadata_generated_inline: bool = False
     metadata_sidecar_written: bool = False
+    state_key: str = ""
     copy_provenance: str = ""
     ai_product_copy_cache_reason: str = ""
 
@@ -5594,6 +5598,10 @@ def _apply_inline_metadata_generation(
     elif "vision" in candidate.generator:
         inline_resolution_source = "inline_vision"
     artwork.metadata_resolution_source = inline_resolution_source
+    inline_metadata_provenance = inline_resolution_source
+    if _is_prompt_generated_artwork_slug(artwork.slug or artwork.src_path.stem):
+        inline_metadata_provenance = f"prompt_art_run:{inline_metadata_provenance}"
+    artwork.metadata["metadata_provenance"] = inline_metadata_provenance
 
     wrote_sidecar = False
     sidecar_reason = "auto_write_disabled"
@@ -6037,13 +6045,15 @@ def _build_prompt_derived_masters(
         source.close()
 
         logger.info(
-            "Prompt derived master family=%s concept=%s raw_path=%s raw_dims=%sx%s derived_path=%s derived_dims=%sx%s upscale_applied=%s requested_scale=%.3f applied_scale=%.3f target_min=%sx%s",
+            "Prompt derived master family=%s concept=%s raw_path=%s raw_slug=%s raw_dims=%sx%s derived_path=%s derived_slug=%s derived_dims=%sx%s upscale_applied=%s requested_scale=%.3f applied_scale=%.3f target_min=%sx%s",
             family,
             asset.concept_index,
             asset.path,
+            slugify(asset.path.stem),
             src_w,
             src_h,
             derived_path,
+            slugify(derived_path.stem),
             derived_w,
             derived_h,
             str(upscaled).lower(),
@@ -8665,6 +8675,17 @@ def _derive_copy_provenance_for_qa(*, artwork: Artwork, template: ProductTemplat
     return "ai_product_copy_cache_other_template", configured_reason or "cache_entry_not_template_scoped"
 
 
+def _artwork_metadata_provenance(artwork: Artwork) -> str:
+    metadata = artwork.metadata if isinstance(artwork.metadata, dict) else {}
+    return str(metadata.get("metadata_provenance") or "").strip().lower()
+
+
+def _compose_state_key(*, artwork_slug: str, template_key: str) -> str:
+    if not artwork_slug or not template_key:
+        return ""
+    return f"{artwork_slug}:{template_key}"
+
+
 def build_storefront_qa_row(
     *,
     artwork: Artwork,
@@ -8776,8 +8797,10 @@ def build_storefront_qa_row(
         normalized_audience_keys=", ".join(organization.get("normalized_audience_keys", [])),
         normalized_season_keys=", ".join(organization.get("normalized_season_keys", [])),
         metadata_resolution_source=artwork.metadata_resolution_source,
+        metadata_provenance=_artwork_metadata_provenance(artwork),
         metadata_generated_inline=artwork.metadata_generated_inline,
         metadata_sidecar_written=artwork.metadata_sidecar_written,
+        state_key=_compose_state_key(artwork_slug=artwork.slug, template_key=template.key),
         copy_provenance=copy_provenance,
         ai_product_copy_cache_reason=copy_cache_reason,
     )
@@ -9469,6 +9492,7 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
         artwork.final_title_source = title_info.title_source
         rendered_title = render_product_title(template, artwork)
         state_key = f"{artwork.slug}:{template.key}"
+        metadata_provenance = _artwork_metadata_provenance(artwork)
         matching_rows = [row for row in record["products"] if isinstance(row, dict) and row.get("state_key") == state_key]
         existing_product_id = ""
         latest_success_row: Optional[Dict[str, Any]] = None
@@ -9592,8 +9616,10 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                         poster_applied_upscale_factor=poster_applied_upscale_factor_report,
                         poster_fill_optimization_used=poster_fill_optimization_used_report,
                         metadata_resolution_source=artwork.metadata_resolution_source,
+                        metadata_provenance=metadata_provenance,
                         metadata_generated_inline=artwork.metadata_generated_inline,
                         metadata_sidecar_written=artwork.metadata_sidecar_written,
+                        state_key=state_key,
                         weak_metadata_detected="|".join(artwork.weak_metadata_detected),
                         final_title_source=title_info.title_source,
                     ))
@@ -9704,6 +9730,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                             eligibility_reason_code=runtime_diag.final_reason_code or "no_matching_variants_runtime",
                             eligibility_rule_failed="variant_selection",
                             eligibility_gate_stage="variant_gate",
+                            metadata_provenance=metadata_provenance,
+                            state_key=state_key,
                         )
                     )
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action="skip", upload_map=upload_map)
@@ -9782,6 +9810,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                             eligibility_reason_code=runtime_diag.final_reason_code or "no_matching_variants_runtime",
                             eligibility_rule_failed="variant_selection",
                             eligibility_gate_stage="variant_gate",
+                            metadata_provenance=metadata_provenance,
+                            state_key=state_key,
                         )
                     )
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action="skip", upload_map=upload_map)
@@ -9919,6 +9949,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                             eligibility_reason_code=eligibility_result.reason_code or "artwork_not_eligible_for_template",
                             eligibility_rule_failed=eligibility_result.rule_failed,
                             eligibility_gate_stage="eligibility_gate",
+                            metadata_provenance=metadata_provenance,
+                            state_key=state_key,
                         )
                     )
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action="skip", upload_map=upload_map)
@@ -10018,6 +10050,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                             eligibility_reason_code="insufficient_artwork_resolution",
                             eligibility_rule_failed="runtime_resolution_check",
                             eligibility_gate_stage="runtime_processing",
+                            metadata_provenance=metadata_provenance,
+                            state_key=state_key,
                         )
                     )
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action="skip", upload_map=upload_map)
@@ -10137,6 +10171,8 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                             eligibility_reason_code=runtime_diag.final_reason_code or "placement_artwork_resolution_skipped",
                             eligibility_rule_failed="placement_prepare_artwork",
                             eligibility_gate_stage="runtime_processing",
+                            metadata_provenance=metadata_provenance,
+                            state_key=state_key,
                         )
                     )
                 log_template_summary(artwork_slug=artwork.slug, template_key=template.key, success=False, result={"printify": result}, blueprint_id=resolved_template.printify_blueprint_id, provider_id=resolved_template.printify_print_provider_id, action="skip", upload_map=upload_map)
@@ -10369,8 +10405,10 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                     featured_image_source="verified_product_image_preference" if preferred_featured_candidate.get("selected_featured_mockup_src") else "printify_mockup_recommendation",
                     tote_scale_strategy="front_fill_boost_orientation_tuned" if resolved_template.key == "tote_basic" else "",
                     metadata_resolution_source=artwork.metadata_resolution_source,
+                    metadata_provenance=metadata_provenance,
                     metadata_generated_inline=artwork.metadata_generated_inline,
                     metadata_sidecar_written=artwork.metadata_sidecar_written,
+                    state_key=state_key,
                     weak_metadata_detected="|".join(artwork.weak_metadata_detected),
                     final_title_source=title_info.title_source,
                 ))
@@ -10484,8 +10522,10 @@ def process_artwork(*, printify: PrintifyClient, shopify: Optional[ShopifyClient
                         selected_placements=selected_placements_report,
                         placement_publish_scope=placement_publish_scope_report,
                         metadata_resolution_source=artwork.metadata_resolution_source,
+                        metadata_provenance=metadata_provenance,
                         metadata_generated_inline=artwork.metadata_generated_inline,
                         metadata_sidecar_written=artwork.metadata_sidecar_written,
+                        state_key=state_key,
                         weak_metadata_detected="|".join(artwork.weak_metadata_detected),
                         final_title_source=title_info.title_source,
                     )
@@ -11512,6 +11552,10 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                     publish_queue_status_after=after_status,
                     reason_code=reason_code,
                     resume_only_queue_processing=True,
+                    state_key=_compose_state_key(
+                        artwork_slug=str(after_row.get("artwork_key") or ""),
+                        template_key=str(after_row.get("template_key") or ""),
+                    ),
                 )
             )
             if row_status == "failure":
@@ -11747,6 +11791,10 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                                 eligibility_reason_code="template_not_runnable_after_preflight",
                                 eligibility_rule_failed="asset_routing",
                                 eligibility_gate_stage="routing_gate",
+                                state_key=_compose_state_key(
+                                    artwork_slug=slugify(route.asset_path.stem),
+                                    template_key=route.template_key,
+                                ),
                             )
                         )
                     continue
@@ -11785,6 +11833,10 @@ def run(config_path: pathlib.Path, *, dry_run: bool = False, force: bool = False
                                 eligibility_reason_code="routed_asset_not_discovered",
                                 eligibility_rule_failed="asset_routing",
                                 eligibility_gate_stage="routing_gate",
+                                state_key=_compose_state_key(
+                                    artwork_slug=slugify(route.asset_path.stem),
+                                    template_key=route.template_key,
+                                ),
                             )
                         )
                     continue
