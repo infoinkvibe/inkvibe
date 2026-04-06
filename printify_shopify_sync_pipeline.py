@@ -332,6 +332,13 @@ class TemplatePreflightReportRow:
     fallback_model_set_applied: bool = False
     final_selected_models: str = ""
     high_resolution_family: bool = False
+    capability_contract_status: str = ""
+    capability_warning_reasons: str = ""
+    required_placements: str = ""
+    available_placements: str = ""
+    required_option_dimensions: str = ""
+    available_option_dimensions: str = ""
+    required_print_area_geometry: str = ""
 
 
 @dataclass
@@ -385,6 +392,17 @@ class CatalogFamilyValidationResult:
     intended_family: str
     plausible: bool
     reason: str = ""
+
+
+@dataclass
+class TemplateCapabilityContractResult:
+    status: str
+    warning_reasons: List[str] = field(default_factory=list)
+    required_placements: List[str] = field(default_factory=list)
+    available_placements: List[str] = field(default_factory=list)
+    required_option_dimensions: List[str] = field(default_factory=list)
+    available_option_dimensions: List[str] = field(default_factory=list)
+    required_print_area_geometry: List[str] = field(default_factory=list)
 
 
 def classify_failure(exc: Exception) -> str:
@@ -2617,6 +2635,84 @@ def validate_catalog_family_schema(
         return CatalogFamilyValidationResult(intended_family=intended_family, plausible=True)
 
     return CatalogFamilyValidationResult(intended_family=intended_family, plausible=True)
+
+
+def evaluate_template_capability_contract(
+    *,
+    template: ProductTemplate,
+    variants: List[Dict[str, Any]],
+) -> TemplateCapabilityContractResult:
+    required_placements = sorted(
+        {
+            placement.placement_name.strip()
+            for placement in (template.placements or [])
+            if str(placement.placement_name or "").strip()
+        }
+    )
+    placement_summary = summarize_variant_options(variants)
+    available_placements = sorted(
+        {
+            str(name or "").strip()
+            for name in (placement_summary.get("placements") or [])
+            if str(name or "").strip()
+        }
+    )
+
+    option_names, _ = _collect_option_names_and_values(variants)
+    available_option_dimensions = sorted({str(name or "").strip() for name in option_names if str(name or "").strip()})
+    required_option_dimensions: set[str] = set()
+    for key in (template.enabled_variant_option_filters or {}).keys():
+        if str(key or "").strip():
+            required_option_dimensions.add(str(key).strip())
+    if template.enabled_colors or template.expanded_enabled_colors:
+        required_option_dimensions.add("color")
+    if template.enabled_sizes:
+        required_option_dimensions.add("size")
+
+    required_print_area_geometry = sorted(
+        {
+            f"{placement.placement_name}:{int(placement.width_px)}x{int(placement.height_px)}"
+            for placement in (template.placements or [])
+            if str(placement.placement_name or "").strip() and int(placement.width_px or 0) > 0 and int(placement.height_px or 0) > 0
+        }
+    )
+
+    warning_reasons: List[str] = []
+    if required_placements and available_placements:
+        missing_placements = sorted({placement.lower() for placement in required_placements} - {placement.lower() for placement in available_placements})
+        if missing_placements:
+            warning_reasons.append(
+                f"required placements missing from provider schema: missing={missing_placements}"
+            )
+    elif required_placements and not available_placements:
+        warning_reasons.append("provider schema returned no placement data; required placements could not be validated")
+
+    if required_option_dimensions and available_option_dimensions:
+        available_dimension_tokens = {_canonical_option_token(name) for name in available_option_dimensions}
+        missing_dimensions = sorted(
+            {
+                dimension
+                for dimension in required_option_dimensions
+                if _canonical_option_token(dimension) not in available_dimension_tokens
+            }
+        )
+        if missing_dimensions:
+            warning_reasons.append(
+                f"required option dimensions missing from provider schema: missing={missing_dimensions}"
+            )
+    elif required_option_dimensions and not available_option_dimensions:
+        warning_reasons.append("provider schema returned no option dimensions; filter expectations could not be validated")
+
+    status = "warning" if warning_reasons else "ok"
+    return TemplateCapabilityContractResult(
+        status=status,
+        warning_reasons=warning_reasons,
+        required_placements=required_placements,
+        available_placements=available_placements,
+        required_option_dimensions=sorted(required_option_dimensions),
+        available_option_dimensions=available_option_dimensions,
+        required_print_area_geometry=required_print_area_geometry,
+    )
 
 
 def filter_providers(providers: List[Dict[str, Any]], query: str) -> List[Dict[str, Any]]:
@@ -7612,6 +7708,13 @@ def _preflight_template(
         resolved_blueprint_title: str = "",
         resolved_provider_title: str = "",
         family_mismatch_reason: str = "",
+        capability_contract_status: str = "",
+        capability_warning_reasons: str = "",
+        required_placements: str = "",
+        available_placements: str = "",
+        required_option_dimensions: str = "",
+        available_option_dimensions: str = "",
+        required_print_area_geometry: str = "",
     ) -> Tuple[TemplatePreflightIssue, TemplatePreflightReportRow]:
         tote_diag = tote_diag or {}
         apparel_diag = apparel_diag or {}
@@ -7687,6 +7790,13 @@ def _preflight_template(
             fallback_model_set_applied=bool(option_diagnostics.fallback_model_set_applied),
             final_selected_models=json.dumps(option_diagnostics.final_selected_models, sort_keys=True),
             high_resolution_family=bool(template.high_resolution_family),
+            capability_contract_status=capability_contract_status,
+            capability_warning_reasons=capability_warning_reasons,
+            required_placements=required_placements,
+            available_placements=available_placements,
+            required_option_dimensions=required_option_dimensions,
+            available_option_dimensions=available_option_dimensions,
+            required_print_area_geometry=required_print_area_geometry,
         )
         return issue, row
 
@@ -7708,6 +7818,10 @@ def _preflight_template(
         normalized_variants = normalize_catalog_variants_response(variants)
         resolved_blueprint_title = str((blueprint_titles or {}).get(blueprint_id, ""))
         resolved_provider_title = str(provider_titles.get(provider_id, ""))
+        capability_contract = evaluate_template_capability_contract(
+            template=resolved_template,
+            variants=normalized_variants,
+        )
         family_validation = validate_catalog_family_schema(
             template=resolved_template,
             variants=normalized_variants,
@@ -7731,6 +7845,13 @@ def _preflight_template(
                 resolved_blueprint_title=resolved_blueprint_title,
                 resolved_provider_title=resolved_provider_title,
                 family_mismatch_reason=family_validation.reason,
+                capability_contract_status=capability_contract.status,
+                capability_warning_reasons=json.dumps(capability_contract.warning_reasons, sort_keys=True),
+                required_placements=json.dumps(capability_contract.required_placements, sort_keys=True),
+                available_placements=json.dumps(capability_contract.available_placements, sort_keys=True),
+                required_option_dimensions=json.dumps(capability_contract.required_option_dimensions, sort_keys=True),
+                available_option_dimensions=json.dumps(capability_contract.available_option_dimensions, sort_keys=True),
+                required_print_area_geometry=json.dumps(capability_contract.required_print_area_geometry, sort_keys=True),
             )
 
         selected, option_diagnostics = _analyze_variant_filtering(normalized_variants, resolved_template)
@@ -7756,6 +7877,13 @@ def _preflight_template(
                 intended_family=family_validation.intended_family,
                 resolved_blueprint_title=resolved_blueprint_title,
                 resolved_provider_title=resolved_provider_title,
+                capability_contract_status=capability_contract.status,
+                capability_warning_reasons=json.dumps(capability_contract.warning_reasons, sort_keys=True),
+                required_placements=json.dumps(capability_contract.required_placements, sort_keys=True),
+                available_placements=json.dumps(capability_contract.available_placements, sort_keys=True),
+                required_option_dimensions=json.dumps(capability_contract.required_option_dimensions, sort_keys=True),
+                available_option_dimensions=json.dumps(capability_contract.available_option_dimensions, sort_keys=True),
+                required_print_area_geometry=json.dumps(capability_contract.required_print_area_geometry, sort_keys=True),
             )
         guarded, report = apply_variant_margin_guardrails(resolved_template, selected)
         tote_diag = (report.get("variant_diagnostics") or [])[0] if template.key == "tote_basic" else {}
@@ -7814,6 +7942,13 @@ def _preflight_template(
                 intended_family=family_validation.intended_family,
                 resolved_blueprint_title=resolved_blueprint_title,
                 resolved_provider_title=resolved_provider_title,
+                capability_contract_status=capability_contract.status,
+                capability_warning_reasons=json.dumps(capability_contract.warning_reasons, sort_keys=True),
+                required_placements=json.dumps(capability_contract.required_placements, sort_keys=True),
+                available_placements=json.dumps(capability_contract.available_placements, sort_keys=True),
+                required_option_dimensions=json.dumps(capability_contract.required_option_dimensions, sort_keys=True),
+                available_option_dimensions=json.dumps(capability_contract.available_option_dimensions, sort_keys=True),
+                required_print_area_geometry=json.dumps(capability_contract.required_print_area_geometry, sort_keys=True),
             )
         return None, TemplatePreflightReportRow(
             template_key=template.key,
@@ -7871,6 +8006,13 @@ def _preflight_template(
             fallback_model_set_applied=bool(option_diagnostics.fallback_model_set_applied),
             final_selected_models=json.dumps(option_diagnostics.final_selected_models, sort_keys=True),
             high_resolution_family=bool(template.high_resolution_family),
+            capability_contract_status=capability_contract.status,
+            capability_warning_reasons=json.dumps(capability_contract.warning_reasons, sort_keys=True),
+            required_placements=json.dumps(capability_contract.required_placements, sort_keys=True),
+            available_placements=json.dumps(capability_contract.available_placements, sort_keys=True),
+            required_option_dimensions=json.dumps(capability_contract.required_option_dimensions, sort_keys=True),
+            available_option_dimensions=json.dumps(capability_contract.available_option_dimensions, sort_keys=True),
+            required_print_area_geometry=json.dumps(capability_contract.required_print_area_geometry, sort_keys=True),
         )
     except TemplateValidationError as exc:
         return _failure("invalid_template_config", str(exc))
