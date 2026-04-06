@@ -1766,6 +1766,13 @@ def _should_bypass_sidecar_for_prompt_generated_artwork(*, path: pathlib.Path, s
     return True
 
 
+def _normalize_metadata_provenance(value: Any) -> str:
+    provenance = str(value or "").strip().lower()
+    if provenance.startswith("prompt_art_run:"):
+        return provenance.split(":", 1)[1].strip().lower()
+    return provenance
+
+
 def _resolve_unique_alias_match(
     metadata_map: Dict[str, Dict[str, Any]],
     *,
@@ -1963,7 +1970,7 @@ def metadata_is_missing_or_weak(
     if not metadata:
         return True, ["metadata_missing"]
     reasons: List[str] = []
-    provenance = str(metadata.get("metadata_provenance") or "").strip().lower()
+    provenance = _normalize_metadata_provenance(metadata.get("metadata_provenance"))
     upgrade_fingerprint = str(metadata.get("inline_upgrade_fingerprint") or "").strip()
     title = str(metadata.get("title") or "").strip()
     if not title:
@@ -2051,6 +2058,7 @@ def persist_inline_metadata_sidecar(
     generator_name: str,
     weak_reasons: List[str],
     metadata_source: str,
+    inline_resolution_source: str = "",
 ) -> Tuple[bool, str]:
     sidecar_path = artwork.src_path.with_suffix(".json")
     existing_raw = load_json(sidecar_path, {}) if sidecar_path.exists() else {}
@@ -2077,7 +2085,12 @@ def persist_inline_metadata_sidecar(
         return False, "not_materially_better"
     payload = dict(existing)
     payload.update(sanitized_candidate)
-    payload["metadata_provenance"] = f"inline_{generator_name}"
+    normalized_source = _normalize_metadata_provenance(inline_resolution_source)
+    provenance = normalized_source if normalized_source.startswith("inline_") else f"inline_{generator_name}"
+    if _is_prompt_generated_artwork_slug(artwork.slug or artwork.src_path.stem):
+        provenance = f"prompt_art_run:{provenance}"
+    payload["metadata_provenance"] = provenance
+    payload["metadata_generator"] = str(generator_name or "").strip()
     payload["inline_upgrade_fingerprint"] = generated_fp
     payload["inline_upgrade_timestamp"] = datetime.now(timezone.utc).isoformat()
     payload["inline_upgrade_reasons"] = sorted(set(weak_reasons))
@@ -5360,12 +5373,12 @@ def _apply_inline_metadata_generation(
     artwork.metadata = generated_payload
     artwork.title = str(generated_payload.get("title") or artwork.title).strip() or artwork.title
     artwork.metadata_generated_inline = True
+    inline_resolution_source = "inline_heuristic"
     if "openai" in candidate.generator:
-        artwork.metadata_resolution_source = "inline_openai"
+        inline_resolution_source = "inline_openai"
     elif "vision" in candidate.generator:
-        artwork.metadata_resolution_source = "inline_vision"
-    else:
-        artwork.metadata_resolution_source = "inline_heuristic"
+        inline_resolution_source = "inline_vision"
+    artwork.metadata_resolution_source = inline_resolution_source
 
     wrote_sidecar = False
     sidecar_reason = "auto_write_disabled"
@@ -5376,6 +5389,7 @@ def _apply_inline_metadata_generation(
             generator_name=candidate.generator,
             weak_reasons=weak_reasons,
             metadata_source=metadata_source,
+            inline_resolution_source=inline_resolution_source,
         )
     artwork.metadata_sidecar_written = wrote_sidecar
     logger.info(

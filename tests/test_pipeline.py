@@ -1331,6 +1331,71 @@ def test_inline_generation_does_not_rewrite_same_upgraded_sidecar(tmp_path: Path
     assert reason_again == "unchanged_fingerprint"
 
 
+def test_prompt_generated_inline_sidecar_is_reused_on_next_discovery(tmp_path: Path, monkeypatch):
+    image = tmp_path / "generated-art-apparel-c01.png"
+    Image.new("RGBA", (1000, 1000), (0, 0, 0, 255)).save(image)
+    call_count = {"count": 0}
+
+    class StubInlineGenerator:
+        def generate_metadata_for_artwork(self, image_path: Path):
+            call_count["count"] += 1
+            return GeneratedArtworkMetadataCandidate(
+                image_path=image_path,
+                sidecar_path=image_path.with_suffix(".json"),
+                metadata=GeneratedArtworkMetadata(
+                    title="Prompt Wolf Eclipse",
+                    description="A dramatic wolf silhouette against a moonlit eclipse sky.",
+                    tags=["wolf", "eclipse"],
+                ),
+                generator="auto:vision_subject",
+                source_signals=["vision_subject", "fallback"],
+            )
+
+    monkeypatch.setattr("printify_shopify_sync_pipeline.select_artwork_metadata_generator", lambda **kwargs: StubInlineGenerator())
+    first = discover_artworks(tmp_path, metadata_inline_generator=MetadataGeneratorMode.AUTO.value)
+    assert first[0].metadata_generated_inline is True
+    assert first[0].metadata_sidecar_written is True
+    payload = json.loads(image.with_suffix(".json").read_text(encoding="utf-8"))
+    assert payload["metadata_provenance"] == "prompt_art_run:inline_vision"
+
+    second = discover_artworks(tmp_path, metadata_inline_generator=MetadataGeneratorMode.AUTO.value)
+    assert second[0].metadata_generated_inline is False
+    assert second[0].metadata_resolution_source == "sidecar"
+    assert call_count["count"] == 1
+
+
+def test_inline_quota_fallback_writes_auditable_provenance(tmp_path: Path, monkeypatch):
+    image = tmp_path / "storm-scene.png"
+    Image.new("RGBA", (1000, 1000), (0, 0, 0, 255)).save(image)
+
+    class StubQuotaFallbackGenerator:
+        def generate_metadata_for_artwork(self, image_path: Path):
+            return GeneratedArtworkMetadataCandidate(
+                image_path=image_path,
+                sidecar_path=image_path.with_suffix(".json"),
+                metadata=GeneratedArtworkMetadata(
+                    title="Electric Storm Horizon",
+                    description="Lightning arcs over a distant skyline with vivid cloud texture.",
+                    tags=["storm", "lightning", "skyline"],
+                ),
+                generator="auto:vision_subject",
+                source_signals=["vision_subject", "fallback"],
+                rationale="fallback_reason=RateLimitError: 429",
+            )
+
+    monkeypatch.setattr(
+        "printify_shopify_sync_pipeline.select_artwork_metadata_generator",
+        lambda **kwargs: StubQuotaFallbackGenerator(),
+    )
+    artworks = discover_artworks(tmp_path, metadata_inline_generator=MetadataGeneratorMode.AUTO.value)
+    assert artworks[0].metadata_generated_inline is True
+    assert artworks[0].metadata_resolution_source == "inline_vision"
+    assert artworks[0].metadata_sidecar_written is True
+    payload = json.loads(image.with_suffix(".json").read_text(encoding="utf-8"))
+    assert payload["metadata_provenance"] == "inline_vision"
+    assert payload["metadata_generator"] == "auto:vision_subject"
+
+
 def test_curated_sluglike_sidecar_not_forced_to_regenerate(tmp_path: Path):
     image = tmp_path / "sunset-over-lake.png"
     Image.new("RGBA", (1000, 1000), (0, 0, 0, 255)).save(image)
