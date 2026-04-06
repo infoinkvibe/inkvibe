@@ -111,6 +111,7 @@ from printify_shopify_sync_pipeline import (
     resolve_artwork_for_placement,
     evaluate_artwork_eligibility_for_template,
     list_eligible_templates_for_artwork,
+    _resolve_template_placements,
     _resolve_trim_bounds_settings,
     build_shopify_product_options,
     validate_storefront_title,
@@ -3382,6 +3383,7 @@ def test_existing_product_skip_row_has_explicit_reason_code(tmp_path: Path):
         printify_print_provider_id=3,
         title_pattern="{artwork_title}",
         description_pattern="{description_html}",
+        placements=[PlacementRequirement("front", 4500, 5400)],
     )
     art_path = tmp_path / "canvas.png"
     Image.new("RGBA", (1200, 1800), (255, 0, 0, 255)).save(art_path)
@@ -3431,6 +3433,9 @@ def test_existing_product_skip_row_has_explicit_reason_code(tmp_path: Path):
     assert row.status == "skipped"
     assert row.reason_code == "existing_product_create_only_skip"
     assert row.product_id == "existing-canvas"
+    assert row.primary_placement == "front"
+    assert row.selected_placements == "front"
+    assert row.placement_publish_scope == "all_active"
 
 
 def test_skip_diagnostics_include_eligibility_and_existing_product_paths(tmp_path: Path, monkeypatch):
@@ -4734,6 +4739,9 @@ def test_run_report_schema_contract_includes_observability_and_queue_fields():
         "metadata_generated_inline",
         "metadata_sidecar_written",
         "final_title_source",
+        "primary_placement",
+        "selected_placements",
+        "placement_publish_scope",
     }
     assert expected.issubset(columns)
 
@@ -8594,6 +8602,70 @@ def test_template_validation_rejects_invalid_max_upscale_factor(tmp_path: Path):
         load_templates(config)
 
 
+def test_template_validation_rejects_unknown_preferred_primary_placement(tmp_path: Path):
+    config = tmp_path / "product_templates.json"
+    config.write_text(
+        json.dumps(
+            [
+                {
+                    "key": "t1",
+                    "printify_blueprint_id": 6,
+                    "printify_print_provider_id": 99,
+                    "preferred_primary_placement": "back",
+                    "placements": [{"placement_name": "front", "width_px": 1000, "height_px": 1000}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(TemplateValidationError, match=r"preferred_primary_placement references unknown placement"):
+        load_templates(config)
+
+
+def test_template_validation_rejects_publish_only_primary_without_primary_placement(tmp_path: Path):
+    config = tmp_path / "product_templates.json"
+    config.write_text(
+        json.dumps(
+            [
+                {
+                    "key": "t1",
+                    "printify_blueprint_id": 6,
+                    "printify_print_provider_id": 99,
+                    "publish_only_primary_placement": True,
+                    "placements": [{"placement_name": "front", "width_px": 1000, "height_px": 1000}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(TemplateValidationError, match=r"publish_only_primary_placement=true requires preferred_primary_placement"):
+        load_templates(config)
+
+
+def test_template_validation_rejects_primary_placement_not_in_active_placements(tmp_path: Path):
+    config = tmp_path / "product_templates.json"
+    config.write_text(
+        json.dumps(
+            [
+                {
+                    "key": "t1",
+                    "printify_blueprint_id": 6,
+                    "printify_print_provider_id": 99,
+                    "active_placements": ["back"],
+                    "preferred_primary_placement": "front",
+                    "placements": [
+                        {"placement_name": "front", "width_px": 1000, "height_px": 1000},
+                        {"placement_name": "back", "width_px": 1000, "height_px": 1000},
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(TemplateValidationError, match=r"preferred_primary_placement must be included in active_placements"):
+        load_templates(config)
+
+
 def test_template_validation_rejects_cover_required_policy_with_contain_placement(tmp_path: Path):
     config = tmp_path / "product_templates.json"
     config.write_text(
@@ -10750,6 +10822,46 @@ def test_tote_front_primary_publish_only_primary_side():
     assert tote.publish_only_primary_placement is True
     assert len(payload["print_areas"]) == 1
     assert payload["print_areas"][0]["placeholders"][0]["position"] == "front"
+
+
+def test_resolve_template_placements_promotes_primary_and_keeps_secondary_order_stable():
+    template = ProductTemplate(
+        key="multi",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{description_html}",
+        placements=[
+            PlacementRequirement("back", 1000, 1000),
+            PlacementRequirement("sleeve", 1000, 1000),
+            PlacementRequirement("front", 1000, 1000),
+        ],
+        active_placements=["front", "back", "sleeve"],
+        preferred_primary_placement="front",
+    )
+    resolved = _resolve_template_placements(template, for_publish=False)
+    assert [placement.placement_name for placement in resolved] == ["front", "back", "sleeve"]
+
+
+def test_resolve_template_placements_publish_only_primary_excludes_secondary():
+    template = ProductTemplate(
+        key="multi",
+        printify_blueprint_id=1,
+        printify_print_provider_id=1,
+        title_pattern="{artwork_title}",
+        description_pattern="{description_html}",
+        placements=[
+            PlacementRequirement("back", 1000, 1000),
+            PlacementRequirement("front", 1000, 1000),
+        ],
+        active_placements=["front", "back"],
+        preferred_primary_placement="front",
+        publish_only_primary_placement=True,
+    )
+    preview_placements = _resolve_template_placements(template, for_publish=False)
+    publish_placements = _resolve_template_placements(template, for_publish=True)
+    assert [placement.placement_name for placement in preview_placements] == ["front", "back"]
+    assert [placement.placement_name for placement in publish_placements] == ["front"]
 
 
 def test_tshirt_template_added_and_longsleeve_copy_is_distinct(tmp_path: Path):
